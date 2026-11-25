@@ -239,6 +239,118 @@ macro_rules! once {
     }};
 }
 
+/// A dispatch counted in threads, as the host runs it.
+struct CountedDispatch {
+    counted: crate::threads::Counted,
+    /// The program's count words to set: root parameter, dword, count.
+    words: Vec<(u32, u32, u32)>,
+}
+
+/// What the dispatch of `counts` with `DispatchX`'s `flags` is on the
+/// host, if the flags say the counts are threads and that is followed
+/// (`crate::threads::on`); else `None`: the counts are groups. Says once
+/// per program (diagnostics) what such a dispatch became, and once per
+/// program in any build that its last group runs whole where the program
+/// has no word for a count that does not fill its groups.
+fn counted_dispatch(p: &HostPipeline, counts: [u32; 3], flags: u32) -> Option<CountedDispatch> {
+    use crate::threads::{THREAD_DIMENSIONS, counted};
+    #[cfg(feature = "diagnostics")]
+    note_dispatch_flags(p, counts, flags);
+    if flags & THREAD_DIMENSIONS == 0 {
+        return None;
+    }
+    let stage = p.stages.first()?;
+    let t = stage.translated();
+    let Some(size) = t.threads else {
+        once!(name = p.name, "a dispatch counted in threads of a program without a thread-group size: taken for groups");
+        return None;
+    };
+    let c = counted(counts, size);
+    // The axes the program takes a count for.
+    let mut has = [false; 3];
+    let mut words = Vec::new();
+    for u in t.host.user_data.iter().filter(|u| u.root == victory_shader::emit::DISPATCH_THREADS) {
+        let axis = (u.dword as usize).min(2);
+        has[axis] = true;
+        if let Some((param, _)) = stage.user_data
+            && c.limits[axis] != 0
+        {
+            words.push((param, u.index, c.limits[axis]));
+        }
+    }
+    let uncut = c.uncut(has);
+    let on = crate::threads::on();
+    #[cfg(feature = "diagnostics")]
+    if first_of(&COUNTED_SEEN, &stage.shader.hash) {
+        tracing::info!(
+            hash = %stage.shader.hash,
+            name = p.name,
+            flags = format_args!("{flags:#x}"),
+            threads = ?counts,
+            numthreads = ?size,
+            groups = ?if on { c.groups } else { counts },
+            cut_axes = ?has,
+            limits = ?c.limits,
+            uncut = ?uncut,
+            followed = on,
+            "a dispatch counted in threads"
+        );
+    }
+    if !on {
+        return None;
+    }
+    if uncut.contains(&true) && first_of(&UNCUT_SEEN, &stage.shader.hash) {
+        tracing::warn!(
+            hash = %stage.shader.hash,
+            name = p.name,
+            threads = ?counts,
+            numthreads = ?size,
+            groups = ?c.groups,
+            uncut = ?uncut,
+            "a dispatch counted in threads whose program is not made to leave out the threads past the count: its last group runs whole"
+        );
+    }
+    Some(CountedDispatch { counted: c, words })
+}
+
+/// Programs [`counted_dispatch`] has said are dispatched in threads, and
+/// those it has said run their last group whole.
+#[cfg(feature = "diagnostics")]
+static COUNTED_SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static UNCUT_SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether `hash` is new to `seen` (the first 256 are remembered; later
+/// ones are never new).
+fn first_of(seen: &std::sync::Mutex<Vec<String>>, hash: &str) -> bool {
+    let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() >= 256 || seen.iter().any(|h| h == hash) {
+        return false;
+    }
+    seen.push(hash.to_owned());
+    true
+}
+
+/// Diagnostics: each value of `DispatchX`'s flags the title passes, once,
+/// with the first program and counts it came with (what the flags are is
+/// inferred, `crate::threads`).
+#[cfg(feature = "diagnostics")]
+fn note_dispatch_flags(p: &HostPipeline, counts: [u32; 3], flags: u32) {
+    static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+    if flags == 0 {
+        return;
+    }
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 64 && !seen.contains(&flags) {
+        seen.push(flags);
+        tracing::info!(
+            flags = format_args!("{flags:#x}"),
+            name = p.name,
+            counts = ?counts,
+            "DispatchX flags"
+        );
+    }
+}
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -500,6 +612,11 @@ impl State {
     /// it: a table's byte offset in its heap, a constant's value, a root
     /// view's address (title memory).
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
+        // Not the title's: all threads of every group run, unless a
+        // dispatch counted in threads says otherwise ([`State::dispatch`]).
+        if root == victory_shader::emit::DISPATCH_THREADS {
+            return 0;
+        }
         match (self.roots_ref(compute).get(usize::from(slot)), root) {
             (Some(Root::View(address)), RootType::Descriptor) if dword < 2 => {
                 (address >> (32 * dword)) as u32
@@ -1167,8 +1284,10 @@ impl State {
         }
     }
 
-    /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    /// Runs a dispatch on the host. `flags`: the console's, of
+    /// `DispatchX` (0 for a plain dispatch); with
+    /// [`crate::threads::THREAD_DIMENSIONS`] `x`, `y` and `z` count threads.
+    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // Left out on purpose (`VICTORY_BVH_BUILDS=0`): not counted as dropped.
         if crate::pipeline::is_left_out(self.pipeline as This) {
             return;
@@ -1193,6 +1312,10 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // Counted in threads: whole groups of the program's size, and the
+        // program is told where the last one ends (`crate::threads`).
+        let counts = counted_dispatch(p, [x, y, z], flags);
+        let [x, y, z] = counts.as_ref().map_or([x, y, z], |c| c.counted.groups);
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -1205,8 +1328,18 @@ impl State {
         self.probe_small(list, true);
         #[cfg(feature = "diagnostics")]
         self.probe_constants(list, true, "dispatch");
+        // After `bind`, which left the counts 0 (every thread).
+        for &(param, index, limit) in counts.iter().flat_map(|c| &c.words) {
+            // SAFETY: an open list; a dword of the program's user data.
+            unsafe { list.list.SetComputeRoot32BitConstant(param, limit, index) };
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        for &(param, index, _) in counts.iter().flat_map(|c| &c.words) {
+            // SAFETY: as above. Whatever runs next with these root
+            // arguments runs every thread.
+            unsafe { list.list.SetComputeRoot32BitConstant(param, 0, index) };
+        }
         list.count_write();
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);

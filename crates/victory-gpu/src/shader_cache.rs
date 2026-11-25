@@ -180,15 +180,17 @@ fn warn_kept_wide() {
 }
 
 /// [`build`] for translations with host workarounds (atomic locks, bias
-/// as gradients, mesh stores last, mesh outputs packed, narrow waves): their own cache
-/// entries, one per combination.
+/// as gradients, mesh stores last, mesh outputs packed, narrow waves) or
+/// made for dispatches counted in threads: their own cache entries, one
+/// per combination.
 fn options_build(o: &victory_shader::emit::Options) -> &'static [u8; 32] {
-    static BUILDS: [OnceLock<[u8; 32]>; 32] = [const { OnceLock::new() }; 32];
+    static BUILDS: [OnceLock<[u8; 32]>; 64] = [const { OnceLock::new() }; 64];
     let i = usize::from(o.atomic_locks)
         | usize::from(o.bias_as_gradients) << 1
         | usize::from(o.mesh_stores_last) << 2
         | usize::from(o.mesh_pack_outputs) << 3
-        | usize::from(o.narrow_waves) << 4;
+        | usize::from(o.narrow_waves) << 4
+        | usize::from(o.thread_counts) << 5;
     BUILDS[i].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -206,6 +208,9 @@ fn options_build(o: &victory_shader::emit::Options) -> &'static [u8; 32] {
         }
         if o.narrow_waves {
             h.update(b"narrow waves");
+        }
+        if o.thread_counts {
+            h.update(b"thread counts");
         }
         *h.finalize().as_bytes()
     })
@@ -253,6 +258,9 @@ pub fn host_shader_keeping(
         mesh_stores_last: mesh_stores_last(),
         mesh_pack_outputs: mesh_pack_outputs(),
         narrow_waves: narrow_waves(),
+        // `VICTORY_THREAD_CUT=0` (or `VICTORY_THREAD_DIMENSIONS=0`): as
+        // before (`crate::threads::cut`).
+        thread_counts: crate::threads::cut(),
     };
     let translate = |c: &[u8]| {
         let r =
@@ -267,6 +275,7 @@ pub fn host_shader_keeping(
         || options.mesh_stores_last
         || options.mesh_pack_outputs
         || options.narrow_waves
+        || options.thread_counts
     {
         options_build(&options)
     } else {

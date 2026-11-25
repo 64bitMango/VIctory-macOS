@@ -145,6 +145,10 @@ impl Shader {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    /// A compute program's threads in a group (`numthreads`), which the
+    /// host's groups are too: a dispatch counted in threads is so many
+    /// groups of it (`crate::threads`).
+    pub(crate) threads: Option<[u32; 3]>,
 }
 
 #[cfg(windows)]
@@ -286,7 +290,7 @@ fn with_resources(
 ) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
+    let program = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
         Some(part) => victory_shader::native_programs(part.data)
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -295,12 +299,15 @@ fn with_resources(
                     p.stage,
                     HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
                 )
-            })
-            .map(|p| p.used)
-            .unwrap_or_default(),
-        None => Vec::new(),
+            }),
+        None => None,
     };
-    Ok(Translated { host, used })
+    let threads = program.as_ref().and_then(|p| match p.io {
+        victory_shader::native::StageIo::Cs(cs) if p.stage == HwStage::Cs => Some(cs.threads),
+        _ => None,
+    });
+    let used = program.map(|p| p.used).unwrap_or_default();
+    Ok(Translated { host, used, threads })
 }
 
 #[repr(C)]

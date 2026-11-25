@@ -83,6 +83,9 @@ mod ambient;
 mod tdr;
 #[cfg(windows)]
 mod texture;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod threads;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]

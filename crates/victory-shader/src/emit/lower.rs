@@ -21,6 +21,8 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
 mod bvh;
+mod counted;
+pub(crate) use counted::{Extra, by_address};
 
 type Why = &'static str;
 
@@ -121,7 +123,7 @@ enum Stop {
 
 #[cfg(any(test, windows))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_with_layout(parts, false, false, false)
+    lower_with_layout(parts, false, false, false, Extra::default())
 }
 
 /// [`lower`], with the trial interface layout and the mesh store order
@@ -134,6 +136,7 @@ pub(crate) fn lower_with_layout(
     compact: bool,
     mesh_stores_last: bool,
     barycentrics: bool,
+    extra: Extra,
 ) -> Result<Lowered, ShaderError> {
     // A wave64 compute program for narrow host waves is first made as
     // halves of console waves; one that form is not exact for is made as
@@ -147,6 +150,7 @@ pub(crate) fn lower_with_layout(
             let halves = l.halves.is_some();
             l.mesh_stores_last = mesh_stores_last;
             l.barycentrics = barycentrics;
+            l.extra = extra;
             match l.run(compact) {
                 Ok(l) => break (Ok(l), halves),
                 Err(Stop::Retry(v, why)) => {
@@ -329,6 +333,11 @@ struct Lower<'a> {
     split_barriers: Set<(usize, usize)>,
     /// The program runs as halves of console waves ([`Halves`]).
     halves: Option<Halves>,
+    /// See [`Extra`].
+    extra: Extra,
+    /// The threads past a dispatch's counts of threads leave at the end of
+    /// the entry block ([`Lower::leave_past_counts`]).
+    counted: Option<counted::Counted>,
     /// Why the halves form is not the console's program, once it is known.
     refused: &'a std::cell::Cell<Option<Why>>,
     /// Guarded regions open ([`Self::begin_guarded`]): not every lane is
@@ -838,6 +847,8 @@ impl<'a> Lower<'a> {
             no_barrier,
             split_barriers,
             halves,
+            extra: Extra::default(),
+            counted: None,
             refused,
             guarded: 0,
             half_outputs: half_outputs(&x.native.io),
@@ -1776,6 +1787,7 @@ impl<'a> Lower<'a> {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
         }
+        self.leave_past_counts(order[0]);
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
@@ -1838,6 +1850,7 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        debug_assert!(self.counts_kept());
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -2412,8 +2425,9 @@ impl<'a> Lower<'a> {
             Some(&xy) => xy,
             None => {
                 let at = match self.def_block.get(&lo) {
-                    // Program inputs (EXEC on entry).
-                    None => self.s.entry,
+                    // Program inputs (EXEC on entry): the lanes that
+                    // start, not those a count of threads leaves out.
+                    None => self.counted.as_ref().map_or(self.s.entry, |c| c.start),
                     Some(&b) if b == self.cur_ir => self.cur,
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
@@ -3780,7 +3794,9 @@ impl<'a> Lower<'a> {
         let g = self.s.m.global(&format!("halves{n}"), arr, 3);
         let f = self.halves_flat();
         let (five, one) = (self.s.m.i32(5), self.s.m.i32(1));
-        if !full {
+        // (Past a count of threads a half may have none even where every
+        // thread that started is: `counted`.)
+        if !full || self.counted.is_some() && matches!(absent, V::Const(_)) {
             let e = self.s.entry;
             let half = self.s.m.bin(e, Bin::LShr, f, five);
             let own = self.s.m.element(e, g, half);
