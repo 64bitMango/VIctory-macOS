@@ -57,6 +57,36 @@ pub(crate) struct Shadow {
     asked: [AtomicU64; 2],
     /// Lists recorded and not yet run that use it ([`Flight`]).
     flights: AtomicU64,
+    /// Parts of its memory (title addresses, in order, apart) a copy found
+    /// with nothing committed, and whether too many were found to remember:
+    /// see [`Shadow::copy`].
+    gaps: Mutex<(Vec<(usize, usize)>, bool)>,
+}
+
+/// Whether a snapshot takes only the bytes no segment of its copy holds
+/// yet (`crate::segments`), instead of rebuilding one segment over every
+/// range that overlaps or touches: on unless `VICTORY_SNAPSHOTS_APART=0`.
+fn snapshots_apart() -> bool {
+    #[cfg(test)]
+    if tests::JOINED.with(|joined| joined.get()) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_SNAPSHOTS_APART"))
+}
+
+/// Gaps remembered per copy at most: past it the copy remembers none.
+const GAPS: usize = 256;
+
+/// Whether copies remember where their memory has nothing committed
+/// ([`Shadow::copy`]): on unless `VICTORY_GAP_MEMO=0`.
+fn gap_memo() -> bool {
+    #[cfg(test)]
+    if tests::NO_GAP_MEMO.with(|off| off.get()) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_GAP_MEMO"))
 }
 
 /// A list's use of a copy from its recording until it has run (or is
@@ -71,8 +101,9 @@ impl Drop for Flight {
     }
 }
 
-/// Snapshot segments (offset, bytes) and the pieces compared.
-type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
+/// Snapshot segments (offset, bytes; `crate::segments`) and the pieces
+/// compared.
+type Snapshot = (Vec<crate::segments::Segment>, std::collections::HashSet<usize>);
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
@@ -106,10 +137,14 @@ fn give_back(v: Vec<u8>) {
         total += v.capacity();
         total <= POOL_BYTES
     });
+    // The largest: small ones cost the allocator no page faults, and each
+    // kept is looked at whenever a buffer is taken or given back.
+    pool.truncate(POOL_BUFFERS);
 }
 
-/// Snapshot memory kept for reuse.
+/// Snapshot memory kept for reuse, and how many buffers at most.
 const POOL_BYTES: usize = 512 << 20;
+const POOL_BUFFERS: usize = 256;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
@@ -261,6 +296,7 @@ impl Shadow {
             slice,
             asked: [0, 1].map(|i| AtomicU64::new(NOW[i].load(Relaxed))),
             flights: AtomicU64::new(0),
+            gaps: Mutex::default(),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -338,34 +374,25 @@ impl Shadow {
             |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let segments = &mut before.0;
-        // The segments the range overlaps or touches.
-        let first = segments.partition_point(|(at, bytes)| at + bytes.len() < from);
-        let last = first + segments[first..].iter().take_while(|(at, _)| *at <= to).count();
-        if let [(at, bytes)] = &segments[first..last]
-            && *at <= from
-            && to <= at + bytes.len()
-        {
-            return;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        // The bytes no segment holds yet, or (`VICTORY_SNAPSHOTS_APART=0`)
+        // one segment with those the range overlaps or touches, rebuilt.
+        let (taken, again) = if snapshots_apart() {
+            (crate::segments::cover_apart(segments, from, to, host, pooled), 0)
+        } else {
+            crate::segments::cover_joined(segments, from, to, host, pooled, give_back)
+        };
+        #[cfg(feature = "diagnostics")]
+        if taken > 0 {
+            use crate::copystat::{C, add};
+            add(C::SnapshotUs, started.elapsed().as_micros() as u64);
+            add(C::SnapshotBytes, taken as u64);
+            add(C::SnapshotAgain, again as u64);
+            crate::copystat::snapshot(self.start, self.len, taken as u64);
         }
-        let start = segments.get(first).filter(|_| first < last).map_or(from, |s| s.0.min(from));
-        let end = segments[first..last].last().map_or(to, |(at, bytes)| (at + bytes.len()).max(to));
-        #[cfg(feature = "diagnostics")]
-        let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SnapshotUs);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::SnapshotBytes, (end - start) as u64);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::snapshot(self.start, self.len, (end - start) as u64);
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        let mut at = start;
-        for (taken, bytes) in segments.drain(first..last) {
-            grown.extend_from_slice(host(at, taken));
-            grown.extend_from_slice(&bytes);
-            at = taken + bytes.len();
-            give_back(bytes);
-        }
-        grown.extend_from_slice(host(at, end));
-        segments.insert(first, (start, grown));
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = (taken, again);
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -392,11 +419,12 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
-            && back
+        // Joined segments never touch: the range is held if one holds it.
+        if back
             && from < to
+            && crate::segments::covered(segments, from, to)
         {
-            let before = &before[from - taken..to - taken];
+            let mut gathered = Vec::new();
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
             // By 64 KiB piece: the copy compared with its bytes before the
@@ -410,7 +438,6 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
                 // A whole piece is compared once per submission, whichever
                 // declared ranges overlap it: then what the GPU wrote there
@@ -419,6 +446,8 @@ impl Shadow {
                     at += n;
                     continue;
                 }
+                // The piece as it was taken, from the segments holding it.
+                let old = crate::segments::held(segments, at, at + n, &mut gathered);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
@@ -708,12 +737,85 @@ impl Shadow {
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
+    ///
+    /// Where a copy found nothing committed (free or reserved address
+    /// space) it is remembered, and the next copy asks about each such gap
+    /// with one query instead of reading into it: a copy that meets an
+    /// unreadable page is done again piece by piece, each failed read a
+    /// fault (the window at address 0, which shaders reach with null
+    /// addresses, is copied whole three times a frame, memory that is not
+    /// the runtime's between unmapped stretches: 10-100 ms a frame, run 22).
+    /// A gap still uncommitted throughout reads as zeros, as the read
+    /// would have found it; one where anything was committed or mapped
+    /// since is forgotten and copied as before. Asked at every copy:
+    /// the runtime reports only its page mappings, not what the title or
+    /// the host heap commits. Zeros are written each time (shaders may have
+    /// written the copy there).
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-        let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        let host = |at: usize| unsafe { self.data.add(at - start) };
+        #[cfg(feature = "diagnostics")]
+        let plain = crate::copystat::mode() != 0;
+        #[cfg(not(feature = "diagnostics"))]
+        let plain = false;
+        if plain || !gap_memo() {
+            crate::host::copy_mapped(host(from), from as *const u8, to - from, false);
+            return to - from;
+        }
+        let mut memo = self.gaps.lock().unwrap_or_else(|e| e.into_inner());
+        let (gaps, full) = &mut *memo;
+        let known: Vec<(usize, usize)> = gaps.iter().copied().filter(|&(a, b)| a < to && from < b).collect();
+        let mut found = Vec::new();
+        let mut note = |at: usize, until: usize| {
+            let list = (!*full).then_some(&mut found);
+            crate::host::copy_mapped_noting(host(at), at as *const u8, until - at, false, list);
+        };
+        let mut at = from;
+        for (a, b) in known {
+            let (cut_a, cut_b) = (a.max(from), b.min(to));
+            if !crate::host::uncommitted(cut_a, cut_b) {
+                // Copied with what follows it, which finds what is left of it.
+                gaps.retain(|&g| g != (a, b));
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::GapsDropped, 1);
+                continue;
+            }
+            if at < cut_a {
+                note(at, cut_a);
+            }
+            // SAFETY: inside the mapping.
+            unsafe { host(cut_a).write_bytes(0, cut_b - cut_a) };
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::GapsKept, 1);
+                add(C::GapBytes, (cut_b - cut_a) as u64);
+                add(C::Unmapped, (cut_b - cut_a) as u64);
+            }
+            at = cut_b;
+        }
+        if at < to {
+            note(at, to);
+        }
+        if !found.is_empty() {
+            gaps.extend(found);
+            gaps.sort_unstable();
+            // Joined where they touch or overlap (a gap kept in part).
+            let mut joined: Vec<(usize, usize)> = Vec::with_capacity(gaps.len());
+            for &(a, b) in gaps.iter() {
+                match joined.last_mut() {
+                    Some((_, end)) if *end >= a => *end = (*end).max(b),
+                    _ => joined.push((a, b)),
+                }
+            }
+            *gaps = joined;
+            if gaps.len() > GAPS {
+                gaps.clear();
+                *full = true;
+            }
+        }
         to - from
     }
 }
@@ -1046,6 +1148,7 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
+#[track_caller]
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
@@ -1097,6 +1200,7 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+#[track_caller]
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
@@ -1115,6 +1219,20 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         len,
         "loose memory copied to the host"
     );
+    // A null or near-null address something took for title memory: which
+    // lookup (the window is then refreshed with every other, run 22).
+    if start == 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let by = std::panic::Location::caller();
+        ONCE.call_once(|| {
+            tracing::info!(
+                address = format_args!("{address:#x}"),
+                bytes = end - address,
+                by = format_args!("{}:{}", by.file(), by.line()),
+                "a copy of title memory at address 0 was asked for (logged once)"
+            )
+        });
+    }
     let shadow = Shadow::new(buffer, data, gpu, start, len);
     map.insert((start, len), shadow.clone());
     changed();
@@ -1349,6 +1467,7 @@ pub(crate) fn log_idle() {
 /// culled). Such a view gets a copy of its own bytes, starting at its
 /// address (`true` with it), which lives while a heap slot made from the
 /// view or a list holds it.
+#[track_caller]
 pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shadow>, bool)> {
     let shadow = find(address, len)?;
     if element == 0 || shadow.offset(address).is_multiple_of(element) {
@@ -1563,6 +1682,13 @@ pub(crate) fn near(va: u64) -> String {
 pub(crate) mod tests {
     use super::*;
 
+    thread_local! {
+        /// This thread's copies remember no gaps (as `VICTORY_GAP_MEMO=0`).
+        pub(super) static NO_GAP_MEMO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// This thread's snapshots are joined (as `VICTORY_SNAPSHOTS_APART=0`).
+        pub(super) static JOINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.
     pub(crate) fn mark_read(memory: bool, slot: u32) {
@@ -1714,6 +1840,172 @@ pub(crate) mod tests {
         // page table still holds must not name memory reused meanwhile.
     }
 
+    /// Four 64 KiB blocks of plain memory with holes: the first committed
+    /// whole, 8 KiB of the second, 4 KiB of the third and the last 4 KiB of
+    /// the fourth, the rest reserved; what is committed filled with `fill`.
+    /// No block is the runtime's memory, so nothing of it is tracked.
+    fn holed(fill: u8) -> usize {
+        use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc};
+        // SAFETY: a fresh reservation, released by the test.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert!(p != 0);
+        for (at, len) in [(0, PAGE), (PAGE, 8 << 10), (2 * PAGE, 4 << 10), (4 * PAGE - (4 << 10), 4 << 10)] {
+            commit(p + at, len, fill);
+        }
+        p
+    }
+
+    /// Commits `len` bytes at `at` (in a reservation of ours), filled with
+    /// `fill`.
+    fn commit(at: usize, len: usize, fill: u8) {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+        // SAFETY: inside a reservation of the test's, ours to fill.
+        unsafe {
+            assert!(!VirtualAlloc(at as *const _, len, MEM_COMMIT, PAGE_READWRITE).is_null());
+            (at as *mut u8).write_bytes(fill, len);
+        }
+    }
+
+    /// The whole copy's bytes.
+    fn held(copy: &Shadow) -> Vec<u8> {
+        let (start, len) = copy.range();
+        copy.read_host(start, len as usize / 4).iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// What title memory `[p, p + len)` reads as: its bytes, zeros where
+    /// nothing is committed.
+    fn read_as(p: usize, len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; len];
+        for (i, page) in out.chunks_mut(4096).enumerate() {
+            crate::host::read_into((p + i * 4096) as *const u8, page);
+        }
+        out
+    }
+
+    /// The steps of the tests below on a copy of [`holed`] memory, the
+    /// copy's bytes after each refresh: the title commits a page in a gap
+    /// and fills it, a shader writes the copy where nothing is committed,
+    /// the title decommits a page, and commits all that was left.
+    fn through_the_holes(mut after: impl FnMut(&Arc<Shadow>, usize, Vec<u8>)) -> bool {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+        let p = holed(7);
+        let len = 4 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return false; // no host GPU here
+        };
+        assert!(copy.tracked.is_none(), "plain memory is not tracked");
+        let mut step = |copy: &Arc<Shadow>| {
+            copy.update(p, len);
+            let bytes = held(copy);
+            assert_eq!(bytes, read_as(p, len), "the copy holds what title memory reads as");
+            after(copy, p, bytes);
+        };
+        step(&copy);
+        step(&copy);
+        // The title commits a page where nothing was and fills it: nobody
+        // is told (the runtime reports only its page mappings).
+        commit(p + PAGE + (8 << 10), 4 << 10, 0x5a);
+        step(&copy);
+        // A shader writes the copy where title memory has nothing.
+        copy.write_host((p + 3 * PAGE + 64) as u64, &[1, 2, 3, 4]);
+        step(&copy);
+        // SAFETY: a page of our reservation.
+        assert_ne!(unsafe { VirtualFree((p + 4096) as *mut _, 4096, MEM_DECOMMIT) }, 0);
+        step(&copy);
+        commit(p + PAGE, 3 * PAGE, 0x33);
+        step(&copy);
+        // Part of a range only.
+        commit(p + 4096, 4096, 0x44);
+        copy.update(p + 100, 3 * 4096);
+        assert_eq!(held(&copy)[100..100 + 3 * 4096], read_as(p, len)[100..100 + 3 * 4096]);
+        drop(copy);
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+        true
+    }
+
+    /// Where a copy found nothing committed it does not read again: it asks
+    /// whether that is still so. Memory committed in a gap since reaches
+    /// the copy at the next refresh (it would not if gaps were kept without
+    /// asking), zeros come back where a shader wrote the copy, and a page
+    /// decommitted reads as zeros.
+    #[test]
+    fn gaps_in_a_copys_memory_are_remembered_and_asked_about_again() {
+        let fallbacks = || crate::host::FALLBACKS.with(|n| n.get());
+        let k = 4 << 10;
+        let (mut n, mut before) = (0, fallbacks());
+        let ran = through_the_holes(|copy, p, bytes| {
+            let gaps = copy.gaps.lock().unwrap().0.clone();
+            let took = fallbacks() - std::mem::replace(&mut before, fallbacks());
+            match n {
+                0 => {
+                    assert_eq!(gaps, [(p + PAGE + 2 * k, p + 2 * PAGE), (p + 2 * PAGE + k, p + 4 * PAGE - k)]);
+                    assert!(took > 0, "found piece by piece");
+                }
+                1 => assert_eq!(took, 0, "no read tried where nothing was committed"),
+                2 => {
+                    assert!(bytes[PAGE + 2 * k..PAGE + 3 * k].iter().all(|&b| b == 0x5a), "the page committed since");
+                    assert_eq!(gaps[0], (p + PAGE + 3 * k, p + 2 * PAGE), "what is left of the gap");
+                }
+                3 => {
+                    assert_eq!(bytes[3 * PAGE + 64..3 * PAGE + 68], [0; 4], "zeros again");
+                    assert_eq!(took, 0);
+                }
+                4 => assert_eq!(gaps[0], (p + k, p + 2 * k), "the page decommitted"),
+                5 => assert_eq!(gaps, [(p + k, p + 2 * k)], "all else committed"),
+                _ => unreachable!(),
+            }
+            n += 1;
+        });
+        assert!(!ran || n == 6);
+    }
+
+    /// With and without remembering gaps (`VICTORY_GAP_MEMO=0`) the copy
+    /// holds the same bytes after every refresh.
+    #[test]
+    fn remembering_gaps_changes_no_byte_of_a_copy() {
+        let run = |off: bool| {
+            NO_GAP_MEMO.with(|o| o.set(off));
+            let mut all = Vec::new();
+            through_the_holes(|copy, _, bytes| {
+                assert!(!off || copy.gaps.lock().unwrap().0.is_empty());
+                all.push(bytes);
+            });
+            NO_GAP_MEMO.with(|o| o.set(false));
+            all
+        };
+        let (with, without) = (run(false), run(true));
+        assert!(with == without, "the same bytes at each of {} steps", with.len());
+    }
+
+    /// A copy whose memory has more gaps than are remembered remembers
+    /// none, and is copied as before.
+    #[test]
+    fn a_copy_with_too_many_gaps_remembers_none() {
+        use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc};
+        let pages = 2 * (GAPS + 2);
+        let len = pages * 4096;
+        // SAFETY: a fresh reservation, released below.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert!(p != 0);
+        // Every other page committed.
+        (0..pages).step_by(2).for_each(|i| commit(p + i * 4096, 4096, 9));
+        register(p, p as u64, len as u64);
+        if let Some(copy) = find(p as u64, len as u64) {
+            for _ in 0..2 {
+                copy.update(p, len);
+                assert!(held(&copy) == read_as(p, len));
+                let memo = copy.gaps.lock().unwrap();
+                assert!(memo.0.is_empty() && memo.1);
+            }
+        }
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
     /// Runs of the shared buffers start a whole number of elements (and of
     /// 256 bytes) in, do not overlap, and join again when given back.
     #[test]
@@ -1759,7 +2051,7 @@ pub(crate) mod tests {
         copy.writing(p + PAGE, 2 * PAGE, false);
         copy.writing(p + PAGE, PAGE, false);
         copy.writing(p + 80, 8, false);
-        assert_eq!(bytes(&copy), 72 + 2 * PAGE + 100, "merged where they overlap or touch");
+        assert_eq!(bytes(&copy), 72 + 2 * PAGE + 100, "each byte once where they overlap or touch");
         // The GPU writes inside two ranges.
         copy.write_host((p + 20) as u64, &[1, 2, 3]);
         copy.write_host((p + PAGE + 5) as u64, &[9]);
@@ -1773,6 +2065,81 @@ pub(crate) mod tests {
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
         assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
         unregister(p, p as u64);
+    }
+
+    /// Ranges each reaching past the last (root views at rising addresses)
+    /// and one apart, a title write under them refreshed, shaders' writes
+    /// across the ranges' ends: the bytes each copy-back wrote, title
+    /// memory and the copy after, and the snapshot's segments and bytes at
+    /// its largest. None without a host GPU.
+    #[allow(clippy::type_complexity)]
+    fn rising_ranges() -> Option<(Vec<usize>, Vec<u8>, Vec<u8>, (usize, usize))> {
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return None;
+        };
+        // SAFETY: (all title reads and writes below) bytes of our pool.
+        let title = |at: usize, byte: u8| unsafe { ((p + at) as *mut u8).write_volatile(byte) };
+        (0..len).step_by(7).for_each(|at| title(at, (at % 251) as u8));
+        copy.update(p, len);
+        let mut ranges: Vec<(usize, usize)> = (0..6).map(|k| (1000 + k * 5000, 20_000)).collect();
+        ranges.push((3 * PAGE - 100, 200));
+        ranges.push((6000, 3000));
+        for &(at, n) in &ranges {
+            copy.writing(p + at, n, false);
+        }
+        let taken = {
+            let before = copy.before.lock().unwrap();
+            (before.0.len(), before.0.iter().map(|(_, b)| b.len()).sum())
+        };
+        // The title writes under the ranges; a refresh takes it for the
+        // copy and the snapshot.
+        title(12_000, 0x77);
+        copy.update(p + 8192, 8192);
+        // Shaders write across the ranges' ends, and beside the title's byte.
+        copy.write_host((p + 20_990) as u64, &[0xa1; 20]);
+        copy.write_host((p + 25_996) as u64, &[0xa2; 8]);
+        copy.write_host((p + 12_001) as u64, &[0xa3]);
+        copy.write_host((p + 3 * PAGE - 2) as u64, &[0xa4; 4]);
+        // The title writes again while they run.
+        title(30_000, 0x78);
+        let written: Vec<usize> = ranges.iter().map(|&(at, n)| copy.copy_back(p + at, n)).collect();
+        assert!(copy.before.lock().unwrap().0.is_empty(), "the snapshot goes with the last range");
+        let memory = read_as(p, len);
+        let copied = held(&copy);
+        unregister(p, p as u64);
+        Some((written, memory, copied, taken))
+    }
+
+    /// Snapshots take each declared byte once, as segments of their own,
+    /// and what shaders wrote goes back as it does with one segment rebuilt
+    /// over the ranges that touch (`VICTORY_SNAPSHOTS_APART=0`): the same
+    /// bytes written, title memory and copy.
+    #[test]
+    fn snapshots_apart_copy_back_what_joined_ones_do() {
+        let run = |joined: bool| {
+            JOINED.with(|j| j.set(joined));
+            let out = rising_ranges();
+            JOINED.with(|j| j.set(false));
+            out
+        };
+        let (Some(apart), Some(joined)) = (run(false), run(true)) else {
+            return; // no host GPU here
+        };
+        // 1000 to 46000, and 200 bytes apart.
+        assert_eq!(apart.3, (7, 45_200), "each byte once, a segment per range that added some");
+        assert_eq!(joined.3, (2, 45_200), "one segment over the ranges that touch");
+        assert_eq!(apart.0, joined.0, "bytes written back per range");
+        assert!(apart.1 == joined.1, "title memory");
+        assert!(apart.2 == joined.2, "the copy");
+        // The shaders' bytes and the title's are all in title memory.
+        let m = &apart.1;
+        assert!(m[20_990..21_010].iter().all(|&b| b == 0xa1) && m[25_996..26_004].iter().all(|&b| b == 0xa2));
+        assert_eq!([m[12_000], m[12_001], m[30_000]], [0x77, 0xa3, 0x78]);
+        assert_eq!(m[3 * PAGE - 2..3 * PAGE + 2], [0xa4; 4]);
     }
 
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`

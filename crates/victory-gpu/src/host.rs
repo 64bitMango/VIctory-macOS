@@ -2804,6 +2804,21 @@ fn taken(from: usize, to: usize, memory: (usize, usize)) -> (usize, usize) {
 /// its copy has failed (asked before each, the world's 80 copies per frame
 /// cost 60 ms).
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    copy_mapped_noting(dst, src, len, title_dst, None);
+}
+
+/// [`copy_mapped`], also listing in `gaps` the parts of the source it found
+/// with nothing committed (free or reserved address space, read as zeros),
+/// in order and joined where they touch: what `crate::shadow` remembers of a
+/// copy's memory ([`uncommitted`] asks again). Pages that are committed and
+/// cannot be read (no access, guard pages) are not listed.
+pub(crate) fn copy_mapped_noting(
+    dst: *mut u8,
+    src: *const u8,
+    len: usize,
+    title_dst: bool,
+    mut gaps: Option<&mut Vec<(usize, usize)>>,
+) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -2838,6 +2853,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
+    #[cfg(test)]
+    FALLBACKS.with(|n| n.set(n.get() + 1));
     #[cfg(feature = "diagnostics")]
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FallbackUs);
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
@@ -2855,12 +2872,15 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
             at = next;
             continue;
         }
-        if let Some(gap) = unreadable_until(at) {
+        if let Some((gap, uncommitted)) = unreadable_region(at) {
             let gap = gap.min(end);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, (gap - at) as u64);
             // SAFETY: inside the destination, which is mapped.
             unsafe { to.write_bytes(0, gap - at) };
+            if uncommitted && let Some(gaps) = gaps.as_deref_mut() {
+                note_gap(gaps, at, gap);
+            }
             at = gap;
             continue;
         }
@@ -2871,15 +2891,40 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
                 crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
                 // SAFETY: inside the destination, which is mapped.
                 unsafe { to.write_bytes(0, n) };
+                // Only asked about when listing: the piece is zeros either way.
+                if let Some(gaps) = gaps.as_deref_mut()
+                    && let Some((gap, true)) = unreadable_region(at)
+                    && gap >= at + n
+                {
+                    note_gap(gaps, at, at + n);
+                }
             }
         });
         at = next;
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Copies of this thread that met an unmapped page and went piece by
+    /// piece.
+    pub(crate) static FALLBACKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Adds `[from, to)` to `gaps` (in order), joined to the last where they
+/// touch.
+fn note_gap(gaps: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    match gaps.last_mut() {
+        Some((_, end)) if *end == from => *end = to,
+        _ => gaps.push((from, to)),
+    }
+}
+
 /// Where the unreadable region holding `at` ends (none: the page at `at` is
-/// readable); at least the end of its page.
-fn unreadable_until(at: usize) -> Option<usize> {
+/// readable), at least the end of its page, and whether nothing is committed
+/// there (free or reserved address space: no read of it can succeed, and
+/// only committing or mapping memory there changes that).
+fn unreadable_region(at: usize) -> Option<(usize, bool)> {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
@@ -2888,16 +2933,31 @@ fn unreadable_until(at: usize) -> Option<usize> {
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
-        return Some(page_end);
+        return Some((page_end, false));
     }
     let readable = info.State == MEM_COMMIT
         && info.Protect != 0
         && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0;
     (!readable).then(|| {
-        (info.BaseAddress as usize)
+        let end = (info.BaseAddress as usize)
             .saturating_add(info.RegionSize)
-            .max(page_end)
+            .max(page_end);
+        (end, info.State != MEM_COMMIT)
     })
+}
+
+/// Whether nothing is committed anywhere in `[from, to)` now: every region
+/// of it free or reserved, so a copy of it reads zeros throughout. One query
+/// per region (a remembered gap is one or two).
+pub(crate) fn uncommitted(from: usize, to: usize) -> bool {
+    let mut at = from;
+    while at < to {
+        match unreadable_region(at) {
+            Some((end, true)) => at = end,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not

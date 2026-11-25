@@ -107,8 +107,22 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
+    /// Copies' remembered gaps (memory with nothing committed,
+    /// `crate::shadow::Shadow::copy`): gaps found still uncommitted and
+    /// zeroed with no read tried, their bytes; gaps forgotten because
+    /// something was committed there.
+    GapsKept,
+    GapBytes,
+    GapsDropped,
+    /// Of the snapshot bytes: those copied again from an older snapshot of
+    /// the same submission (a segment rebuilt as a range grew it).
+    SnapshotAgain,
+    /// Heap syncs: time reading the records of the pages written and
+    /// finding those whose slot is to be made again, and how many were.
+    SyncLookUs,
+    SyncMade,
 }
-const COUNTERS: usize = 62;
+const COUNTERS: usize = 68;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -315,6 +329,18 @@ pub(crate) fn log(frames: f64) {
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
         .collect();
     tracing::info!("  guard lock held per frame: {}", held.join(", "));
+    tracing::info!(
+        "  prepare waste per frame: uncommitted gaps of copies passed with one query {:.1} ({:.2} MB zeroed, no read tried), {:.1} forgotten (committed since); snapshots {:.1} MB, {:.1} MB of them copied again as their segment grew; heap syncs (the heaps' lock held throughout, {:.1} ms) looked at {:.0} slots in {:.1} ms and made {:.0}",
+        c[C::GapsKept as usize],
+        mb(c[C::GapBytes as usize]),
+        c[C::GapsDropped as usize],
+        mb(c[C::SnapshotBytes as usize]),
+        mb(c[C::SnapshotAgain as usize]),
+        ms(c[C::SyncHeapsUs as usize]),
+        c[C::SyncSlots as usize],
+        ms(c[C::SyncLookUs as usize]),
+        c[C::SyncMade as usize],
+    );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
     snapshots.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
