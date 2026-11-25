@@ -1950,6 +1950,8 @@ impl HostList {
         // give it up meanwhile; this list then holds it).
         let copy = crate::resource::host_copy(resource)?;
         let texture = copy.texture.clone();
+        // Unordered access through the twin skips `track` below.
+        copy.note_state(wanted);
         if let Some(Some(twin)) = copy.twin.get()
             && crate::twin::route(self, &copy, twin, wanted)
         {
@@ -1963,6 +1965,7 @@ impl HostList {
     /// one): the state it leaves, if that is a change. Nothing for the
     /// list's first use (its prelude moves the texture there).
     fn track(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<u32> {
+        copy.note_state(wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -3311,6 +3314,13 @@ impl Meter {
                     "host texture MB (used by lists, viewed by heap slots only, neither): GPU-written {:.0} {:.0} {:.0}, \
                      from title memory {:.0} {:.0} {:.0}",
                     gpu[0], gpu[1], gpu[2], title[0], title[1], title[2]
+                );
+                let [given, given_bytes, remade, soon] =
+                    [0, 1, 2, 3].map(|i| crate::resource::EVICTIONS[i].swap(0, Ordering::Relaxed));
+                tracing::info!(
+                    "host textures given up: {given} ({:.0} MB); made again after being given up: {remade}, {soon} of them within {} frames",
+                    given_bytes as f64 / 1e6,
+                    crate::resource::SOON_FRAMES,
                 );
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
                 crate::frame::log();

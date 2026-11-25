@@ -409,6 +409,11 @@ pub struct Options {
     /// the stages, so the pixel shaders stay as they are. Meshes within
     /// the limit are made as without it.
     pub mesh_pack_outputs: bool,
+    /// The host runs wave64 programs in 32-lane waves whatever `WaveSize`
+    /// says (D3DMetal): a compute group that is one console wave of more
+    /// than 32 lanes gets group barriers where its lanes read LDS other
+    /// lanes may have written, which the console's lockstep made safe.
+    pub narrow_waves: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -674,6 +679,7 @@ fn emit_keeping(
         view_marks: options.view_marks,
         atomic_locks: options.atomic_locks,
         bias_as_gradients: options.bias_as_gradients,
+        narrow_waves: options.narrow_waves,
     };
     // Most programs only interpolate with the barycentric VGPRs, or join
     // them in a former use no lane reads; one that cannot do without them

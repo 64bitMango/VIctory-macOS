@@ -132,6 +132,18 @@ fn mesh_pack_outputs() -> bool {
     })
 }
 
+/// Whether translations take wave64 programs to run in 32-lane host waves:
+/// under Wine, whose D3DMetal reports 32 lanes and ignores `WaveSize(64)`.
+/// `VICTORY_NARROW_WAVES=0` or `1` overrides.
+fn narrow_waves() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_NARROW_WAVES").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => under_wine(),
+    })
+}
+
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
 pub(crate) fn under_wine() -> bool {
@@ -152,14 +164,15 @@ pub(crate) fn under_wine() -> bool {
 }
 
 /// [`build`] for translations with host workarounds (atomic locks, bias
-/// as gradients, mesh stores last, mesh outputs packed): their own cache
+/// as gradients, mesh stores last, mesh outputs packed, narrow waves): their own cache
 /// entries, one per combination.
 fn options_build(o: &victory_shader::emit::Options) -> &'static [u8; 32] {
-    static BUILDS: [OnceLock<[u8; 32]>; 16] = [const { OnceLock::new() }; 16];
+    static BUILDS: [OnceLock<[u8; 32]>; 32] = [const { OnceLock::new() }; 32];
     let i = usize::from(o.atomic_locks)
         | usize::from(o.bias_as_gradients) << 1
         | usize::from(o.mesh_stores_last) << 2
-        | usize::from(o.mesh_pack_outputs) << 3;
+        | usize::from(o.mesh_pack_outputs) << 3
+        | usize::from(o.narrow_waves) << 4;
     BUILDS[i].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -174,6 +187,9 @@ fn options_build(o: &victory_shader::emit::Options) -> &'static [u8; 32] {
         }
         if o.mesh_pack_outputs {
             h.update(b"mesh outputs packed");
+        }
+        if o.narrow_waves {
+            h.update(b"narrow waves");
         }
         *h.finalize().as_bytes()
     })
@@ -217,6 +233,7 @@ pub fn host_shader_keeping(
         compact_mesh_interface: false,
         mesh_stores_last: mesh_stores_last(),
         mesh_pack_outputs: mesh_pack_outputs(),
+        narrow_waves: narrow_waves(),
     };
     let translate = |c: &[u8]| {
         victory_shader::emit::translate_keeping(c, options, kept).map_err(|e| e.to_string())
@@ -225,6 +242,7 @@ pub fn host_shader_keeping(
         || options.bias_as_gradients
         || options.mesh_stores_last
         || options.mesh_pack_outputs
+        || options.narrow_waves
     {
         options_build(&options)
     } else {
