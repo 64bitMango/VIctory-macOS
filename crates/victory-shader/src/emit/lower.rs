@@ -940,9 +940,17 @@ impl<'a> Lower<'a> {
         let Some(&src) = self.descriptors.get(&(site, false)) else {
             return false;
         };
+        // (a root view other than of constants is title memory in a program
+        // that uses it, which the program may write)
+        let memory = self.root_memory
+            && matches!(src, Source::Built { address, .. }
+                if self.x.native.layout.get(address.param)
+                    .is_some_and(|p| p.root == RootType::Descriptor));
         matches!(src, Source::Built { address, .. } if address.param == CODE)
-            || matches!(self.used_kind(src), Some(u)
-                if matches!(u.kind, ResourceType::Cbv | ResourceType::Srv))
+            || match self.used_kind(src) {
+                Some(u) => u.kind == ResourceType::Cbv || u.kind == ResourceType::Srv && !memory,
+                None => false,
+            }
     }
 
     /// The blocks all threads of a compute group run once, or none does: no
