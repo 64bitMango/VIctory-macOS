@@ -690,6 +690,8 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             view_marks: true,
             atomic_locks: false,
             bias_as_gradients: false,
+            psv: None,
+            dropped_rows: Vec::new(),
         })
         .expect("lower")
     };
