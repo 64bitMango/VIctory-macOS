@@ -72,6 +72,19 @@ bool unfilled(uint at) {
     }
     return first > 65535u;
 }
+// Whether the record at `at` is a dispatch of at most GROUPS groups that
+// asks for more than 65,535 on an axis: it runs 65,535 there (counted in
+// the budget's third word; such a record is no garbage).
+bool cut(uint at) {
+    if (kind != 2) {
+        return false;
+    }
+    uint3 g = args.Load3(at);
+    if (max(g.x, max(g.y, g.z)) <= 65535u || g.x == 0 || g.y == 0 || g.z == 0) {
+        return false;
+    }
+    return g.x <= GROUPS && g.y <= GROUPS / g.x && g.z <= GROUPS / (g.x * g.y);
+}
 // Clamps the record at `at` into `dest`; its cost.
 uint clamped(uint at) {
     uint cost;
@@ -144,6 +157,10 @@ void main(uint lane : SV_GroupIndex) {
             if (unfilled(at)) {
                 uint was;
                 budget.InterlockedAdd(4, 1u, was);
+            }
+            if (cut(at)) {
+                uint were;
+                budget.InterlockedAdd(8, 1u, were);
             }
         }
         costs[lane] = cost;
@@ -231,6 +248,16 @@ bool unfilled(uint at) {
     }
     return first > 65535u;
 }
+bool cut(uint at) {
+    if (kind != 2) {
+        return false;
+    }
+    uint3 g = load3(at);
+    if (max(g.x, max(g.y, g.z)) <= 65535u || g.x == 0 || g.y == 0 || g.z == 0) {
+        return false;
+    }
+    return g.x <= GROUPS && g.y <= GROUPS / g.x && g.z <= GROUPS / (g.x * g.y);
+}
 uint clamped(uint at) {
     uint cost;
     if (kind <= 1) {
@@ -269,6 +296,7 @@ uint clamped(uint at) {
 void main() {
     uint left = BUDGET - min(budgetWords[0], BUDGET);
     uint emptied = budgetWords[1];
+    uint cuts = budgetWords[2];
     uint walked = records;
     if ((flags & 1) != 0) {
         walked = min(records, countWords[0]);
@@ -278,6 +306,9 @@ void main() {
         uint cost = clamped(at);
         if (unfilled(at)) {
             emptied = emptied + 1u;
+        }
+        if (cut(at)) {
+            cuts = cuts + 1u;
         }
         if (cost > left) {
             // The first record that does not fit takes what is left, so
@@ -290,6 +321,7 @@ void main() {
     }
     budget.Store(0, BUDGET - left);
     budget.Store(4, emptied);
+    budget.Store(8, cuts);
 }
 "#;
 
@@ -461,11 +493,25 @@ fn unfilled_empty() -> bool {
     *ON.get_or_init(|| !crate::switch::off("VICTORY_INDIRECT_UNFILLED"))
 }
 
-/// Counts the unfilled records a list's clamps ran empty (the second word
-/// of its budget, once it has run).
-pub(crate) fn note_unfilled(records: u32) {
-    UNFILLED.fetch_add(u64::from(records), Ordering::Relaxed);
+/// Counts the unfilled records a list's clamps ran empty and the indirect
+/// dispatches they cut at 65,535 groups on an axis (the second and third
+/// word of its budget, once it has run).
+pub(crate) fn note_counts(unfilled: u32, cut: u32) {
+    UNFILLED.fetch_add(u64::from(unfilled), Ordering::Relaxed);
+    CUT.fetch_add(u64::from(cut), Ordering::Relaxed);
 }
+
+/// Indirect dispatches of no more than 2^20 groups that asked for more
+/// than 65,535 on an axis and ran 65,535 there, since the last call (the
+/// frame-rate line): groups of the title's that did not run.
+// shortcut: D3D12 names 65,535 groups an axis as the most, and whether
+// D3DMetal runs more is not known; such a dispatch could run in parts (a
+// command signature with a constant for the first group of each part,
+// which the program adds to its group's number) if a title needs them.
+pub(crate) fn take_cut() -> u64 {
+    CUT.swap(0, Ordering::Relaxed)
+}
+static CUT: AtomicU64 = AtomicU64::new(0);
 
 /// Unfilled records run empty since the last call (the frame-rate line).
 pub(crate) fn take_unfilled() -> u64 {
@@ -681,9 +727,12 @@ mod tests {
         assert_eq!(most, [MOST; 4]);
         let meshes = clamped(10, &[u32::MAX, u32::MAX, u32::MAX, 5, 1, 1, 65_536, 1, 1, 65_535, 1, 1], 8, 1).unwrap();
         assert_eq!(meshes, [0, 5, 0, 65_535, 0, 5, 0, 65_535]);
-        // Indirect dispatches are not told apart: clamped as before.
-        let dispatches = clamped(2, &[70_000, 1, 1], 2, 1).unwrap();
-        assert_eq!(dispatches, [65_535, 65_535]);
+        // Indirect dispatches are not told apart: clamped as before, and
+        // counted as cut where they are no garbage.
+        let cut = super::CUT.load(super::Ordering::Relaxed);
+        let dispatches = clamped(2, &[70_000, 1, 1, u32::MAX, u32::MAX, u32::MAX, 65_535, 2, 1], 3, 1).unwrap();
+        assert_eq!(dispatches, [65_535, 0, 65_535]);
+        assert!(super::CUT.load(super::Ordering::Relaxed) > cut);
 
         UNFILLED.set(Some(false));
         let draws = clamped(0, &words, 64, 1);
