@@ -9,7 +9,7 @@
 //! such shaders first brings all of them up to date (what changed since,
 //! `crate::watch`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
@@ -381,7 +381,7 @@ pub(crate) fn log(frames: f64) {
         let mut left = [0u32; KINDS.len()];
         let (mut buffers, mut textures) = (0u32, 0u32);
         // Placed textures left null: the largest at each address.
-        let mut placed = HashMap::new();
+        let mut placed = std::collections::HashMap::new();
         for seen in inner.slots.values() {
             match seen {
                 Seen::Buffer(..) => buffers += 1,
