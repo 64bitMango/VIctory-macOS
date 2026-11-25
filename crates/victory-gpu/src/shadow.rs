@@ -127,7 +127,7 @@ struct Card {
 /// compares each declared range, by 64 KiB piece, with the card side's
 /// bytes from before (`Card::before`), and only the pieces that differ are
 /// fetched and merged into title memory, byte by byte as
-/// [`Shadow::copy_back`] does (`Host::card_back`, [`Shadow::card_merge`]).
+/// [`Shadow::copy_back_with`] does (`Host::card_back`, [`Shadow::card_merge`]).
 /// No snapshot is taken and nothing is compared on the CPU for such a copy.
 ///
 /// What it assumes is what [`keeps`] assumes: shaders write a copy only in
@@ -1459,7 +1459,7 @@ impl Drop for Shadow {
 /// 100 MB changed. Kept, a piece of it is taken again only after something
 /// changed the copy there: a refresh from title memory ([`Shadow::copy`]),
 /// shader writes found after a submission, or the bytes put back then
-/// ([`Shadow::copy_back`]).
+/// ([`Shadow::copy_back_with`]).
 ///
 /// What it assumes, and why it is not on by default: that nothing else
 /// writes a copy. A shader that writes a buffer through a view we did not
@@ -1912,13 +1912,14 @@ impl Shadow {
     /// [`Shadow::writing`] and not yet done: `Host::execute` passes the
     /// union of a submission's ranges, each byte once, then calls
     /// [`Shadow::copy_back_done`].
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        self.copy_back_with(address, len, None)
-    }
-
-    /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
-    /// that differ from the snapshot, found beforehand ([`find_all`]).
-    pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
+    /// `found`, if given, contains the pieces which differ from the snapshot.
+    pub(crate) fn copy_back_with(
+        &self,
+        address: usize,
+        len: usize,
+        found: Option<Vec<(usize, usize)>>,
+        owners: &crate::writeback::Owners,
+    ) -> usize {
         if self.place.is_some() {
             return 0;
         }
@@ -1989,9 +1990,7 @@ impl Shadow {
                     *h = merged;
                 }
                 if differs != 0 {
-                    crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                    written += n;
+                    written += owners.publish(self.id, start + at, title);
                 }
             }
             // Our write shows as a title write at the copy's next refresh,
@@ -2039,7 +2038,14 @@ impl Shadow {
     /// and puts the title's bytes into the copy and the snapshot: the two
     /// never see each other half done. `now` and `title` are scratch
     /// memory. Returns the bytes written to title memory.
-    pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
+    pub(crate) fn relay_merge(
+        &self,
+        at: usize,
+        n: usize,
+        now: &mut Vec<u8>,
+        title: &mut Vec<u8>,
+        owners: &crate::writeback::Owners,
+    ) -> usize {
         let start = self.start as usize;
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
@@ -2078,9 +2084,7 @@ impl Shadow {
         if !merge_piece(now, held, title) {
             return 0;
         }
-        crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        owners.publish(self.id, start + at, title)
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -2135,7 +2139,7 @@ impl Shadow {
         })
     }
 
-    /// After [`Shadow::copy_back`] of a submission's ranges: every submitted
+    /// After [`Shadow::copy_back_with`] of a submission's ranges: every submitted
     /// step that declared one of `ranges` (`(address, end)`, as declared) is
     /// done with it (one submission runs at a time), and the snapshot with
     /// the last range.
@@ -2665,10 +2669,16 @@ impl Shadow {
     /// found differing. The bytes shaders wrote (those that differ from the
     /// CPU's side, which is what the card's side held when they started)
     /// go into title memory, from the first to the last of them, as
-    /// [`Shadow::copy_back`] puts them; the CPU's side takes the result and
+    /// [`Shadow::copy_back_with`] puts them; the CPU's side takes the result and
     /// sends it up before the next submission. `title` is scratch memory.
     /// Returns the bytes written to title memory.
-    pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
+    pub(crate) fn card_merge(
+        &self,
+        at: usize,
+        gpu: &[u8],
+        title: &mut Vec<u8>,
+        owners: &crate::writeback::Owners,
+    ) -> usize {
         let start = self.start as usize;
         if self.card.is_none() || at + gpu.len() > self.len as usize {
             return 0;
@@ -2697,9 +2707,7 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
-                crate::watch::writing(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                written = n;
+                written = owners.publish(self.id, start + at, title);
             }
         } else {
             // Title memory is not mapped there: the copy keeps what the
@@ -2729,7 +2737,14 @@ impl Shadow {
     /// a copy has no other use for), as [`Shadow::merge_under_writes`].
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
-    pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+    pub(crate) fn card_merge_relay(
+        &self,
+        at: usize,
+        gpu: &[u8],
+        fetched_after: u64,
+        title: &mut Vec<u8>,
+        owners: &crate::writeback::Owners,
+    ) -> usize {
         let start = self.start as usize;
         let Some(card) = &self.card else {
             return 0;
@@ -2772,9 +2787,7 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
-        crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        owners.publish(self.id, start + at, title)
     }
 }
 
@@ -2798,19 +2811,21 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let old = buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    crate::memory::ownership_changed(start, old.map_or(len, |e| len.max(e.end - start)));
     BUFFER_GENERATION.fetch_add(1, Ordering::Release);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers().remove(&(start, resource)).is_some() {
+    if let Some(old) = buffers().remove(&(start, resource)) {
+        crate::memory::ownership_changed(start, old.end - start);
         BUFFER_GENERATION.fetch_add(1, Ordering::Release);
     }
 }
@@ -2854,6 +2869,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     }
     let n = gone.len() as u64;
     if n != 0 {
+        crate::memory::ownership_changed(at, len);
         BUFFER_GENERATION.fetch_add(1, Ordering::Release);
     }
     for shadow in gone {

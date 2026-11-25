@@ -213,6 +213,8 @@ mod tests {
             root_cbvs: lowered.root_cbvs,
             root_srvs: lowered.root_srvs,
             root_uavs: lowered.root_uavs,
+            written_root_uavs: lowered.written_root_uavs,
+            writes_guest_memory: lowered.writes_guest_memory,
             root_indexed_views: Vec::new(),
         };
         assert_eq!(shader.root_srvs, [crate::emit::SLOT_VIEW_ADDRESSES]);

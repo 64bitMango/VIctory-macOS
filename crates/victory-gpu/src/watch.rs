@@ -816,7 +816,11 @@ impl Mapping {
 }
 
 /// The only active change of physical mappings.
-pub struct Remapping(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+pub struct Remapping {
+    _writer: std::sync::MutexGuard<'static, ()>,
+    range: Range<usize>,
+    previous: Vec<crate::inplace::PhysicalSpan>,
+}
 
 /// Protects a mapping change whose extent is unknown.
 pub fn title_memory_remapping() -> Remapping {
@@ -834,11 +838,18 @@ pub fn title_memory_remapping_range(range: Range<usize>) -> Remapping {
             .wait_while(state, |s| s.readers.iter().any(|r| overlaps(r, &range)))
             .unwrap_or_else(|e| e.into_inner()),
     );
-    Remapping(writer)
+    let previous = crate::inplace::physical_spans(&range);
+    Remapping {
+        _writer: writer,
+        range,
+        previous,
+    }
 }
 
 impl Drop for Remapping {
     fn drop(&mut self) {
+        let current = crate::inplace::physical_spans(&self.range);
+        crate::inplace::physical_changes(&self.previous, &current, crate::writeback::remapped);
         MAPPING.lock().unwrap_or_else(|e| e.into_inner()).changing = None;
         MAPPING_CHANGED.notify_all();
     }

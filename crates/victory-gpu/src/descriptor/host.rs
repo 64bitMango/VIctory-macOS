@@ -5,7 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -101,6 +101,7 @@ pub(crate) struct HostHeap {
 struct BufferSlots {
     indices: std::collections::BTreeSet<u32>,
     acceleration: std::collections::BTreeMap<u32, u64>,
+    acceleration_locations: Option<Arc<[u64]>>,
 }
 
 /// Refresh ranges belong to the heap that owns the corresponding slots.
@@ -1068,11 +1069,16 @@ impl HostHeap {
         self.addresses.get().map(|v| &v.0)
     }
 
-    pub(crate) fn acceleration_addresses(&self) -> Vec<u64> {
-        let views = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+    pub(crate) fn acceleration_addresses(&self) -> Arc<[u64]> {
+        let mut views = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(locations) = &views.acceleration_locations {
+            return locations.clone();
+        }
         let mut locations: Vec<u64> = views.acceleration.values().copied().collect();
         locations.sort_unstable();
         locations.dedup();
+        let locations: Arc<[u64]> = locations.into();
+        views.acceleration_locations = Some(locations.clone());
         locations
     }
 
@@ -1555,10 +1561,14 @@ impl HostHeap {
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(location) = view.and_then(acceleration_location) {
-            buffers.acceleration.insert(index, location);
+        let location = view.and_then(acceleration_location);
+        let previous = if let Some(location) = location {
+            buffers.acceleration.insert(index, location)
         } else {
-            buffers.acceleration.remove(&index);
+            buffers.acceleration.remove(&index)
+        };
+        if previous != location {
+            buffers.acceleration_locations = None;
         }
         let was = if stride.is_some() {
             buffers.indices.insert(index);

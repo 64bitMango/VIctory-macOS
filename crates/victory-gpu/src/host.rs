@@ -1825,6 +1825,8 @@ struct Deferred {
 
 #[derive(Default)]
 struct RawCopyCoverage {
+    directory: usize,
+    revision: u64,
     read: usize,
     written: usize,
 }
@@ -2198,6 +2200,21 @@ struct Flight {
     texture_writes: Vec<(usize, usize)>,
 }
 
+/// Which submissions can publish a byte when several fences land together.
+fn writeback_owners<'a>(mut flights: impl Iterator<Item = &'a Flight>) -> crate::writeback::Owners {
+    let first = flights.next().expect("at least one finished flight");
+    let mut owners = crate::writeback::Owners::single(first.number);
+    if !crate::writeback::changed_since(first.number) {
+        return owners;
+    }
+    for flight in flights {
+        for (shadow, ranges) in &flight.back {
+            owners.declare(flight.number, shadow.id(), ranges);
+        }
+    }
+    owners
+}
+
 /// One thing in the line of what waits for the card, in order.
 enum Late {
     Run(Flight),
@@ -2276,7 +2293,7 @@ static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atom
 static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
 /// Whether `[from, to)` touches one of `ranges` (in order, joined).
-fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
+pub(crate) fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     if from >= to {
         return false;
     }
@@ -2411,6 +2428,9 @@ fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool) -> Optio
                 // lands through CPU tiling and can supply bytes to refresh or
                 // to the before-image of a later partial buffer write.
                 Step::Refresh(_, at, len) | Step::GpuWrite(_, at, len) => {
+                    if crate::writeback::needs_new_snapshot(*at, at + len, &written.buffers) {
+                        return Some(WHY_READ);
+                    }
                     if touches(&written.textures, *at, at + len) {
                         return Some(WHY_READ);
                     }
@@ -2743,7 +2763,7 @@ fn relay_worker() {
 /// once, the pieces that differ found on several threads; but the merge is
 /// `Shadow::relay_merge`, which does not write the copy, and the ranges
 /// are not done with here (each flight's are, afterwards).
-fn relay_hand_back(back: &[Declared]) {
+fn relay_hand_back(back: &[Declared], owners: &crate::writeback::Owners) {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
         if shadow.carded() {
@@ -2771,7 +2791,7 @@ fn relay_hand_back(back: &[Declared]) {
     for ((shadow, from, to), found) in work.iter().zip(found) {
         let mut written = 0;
         for (at, n) in found {
-            written += shadow.relay_merge(at, n, &mut now, &mut title);
+            written += shadow.relay_merge(at, n, &mut now, &mut title, owners);
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
@@ -3190,7 +3210,7 @@ mod landings_tests {
 
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
-fn hand_back(back: &[Declared]) {
+fn hand_back(back: &[Declared], owners: &crate::writeback::Owners) {
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
@@ -3216,7 +3236,7 @@ fn hand_back(back: &[Declared]) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
         for ((shadow, from, to), found) in work.iter().zip(found) {
-            let written = shadow.copy_back_with(*from, to - from, Some(found));
+            let written = shadow.copy_back_with(*from, to - from, Some(found), owners);
             walls_landed(HOST_COPY, *from, to - from, to - from, written, 0, None);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -3249,7 +3269,7 @@ fn hand_back(back: &[Declared]) {
             }
         }
         for (from, to) in spans {
-            let written = shadow.copy_back(from, to - from);
+            let written = shadow.copy_back_with(from, to - from, None, owners);
             walls_landed(HOST_COPY, from, to - from, to - from, written, 0, None);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -3791,7 +3811,12 @@ impl Host {
     /// whatever was sent meanwhile, so it may bring a later flight's
     /// bytes, which that flight's landing then finds merged already; and
     /// nothing is sent back up.
-    fn relay_card_back(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) {
+    fn relay_card_back(
+        &self,
+        plans: &[&CardPlan],
+        fetch: &mut Option<RelayFetch>,
+        owners: &crate::writeback::Owners,
+    ) {
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
@@ -3890,8 +3915,9 @@ impl Host {
         for (shadow, lo, hi, at) in &pieces {
             // SAFETY: the mapping of the fetched bytes, `total` of them;
             // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            let gpu =
+                unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title, owners);
             shadow.walls_merged(gpu.len(), merged);
             written += merged;
         }
@@ -3930,8 +3956,10 @@ impl Host {
                         last_notes(&runs)
                     ));
                 }
-                let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
-                self.relay_card_back(&plans, fetch);
+                let plans: Vec<&CardPlan> =
+                    flights.iter().filter_map(|f| f.card.as_ref()).collect();
+                let owners = writeback_owners(flights.iter().copied());
+                self.relay_card_back(&plans, fetch, &owners);
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -3947,7 +3975,7 @@ impl Host {
                         }
                     }
                 }
-                relay_hand_back(&back);
+                relay_hand_back(&back, &owners);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
                 for flight in &flights {
@@ -3980,6 +4008,7 @@ impl Host {
             }
         }
         if last > 0 {
+            crate::writeback::published(last);
             FINISHED.store(last, Ordering::Release);
             bury(last);
         }
@@ -4034,6 +4063,7 @@ impl Host {
         plan: &CardPlan,
         submitted: &mut u64,
         seen: &mut std::collections::HashSet<(usize, usize, usize)>,
+        owners: &crate::writeback::Owners,
     ) {
         if plan.ranges.is_empty() {
             return;
@@ -4114,14 +4144,20 @@ impl Host {
                         let chunk: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64)> =
                             chunk.iter().map(|&(i, lo, hi, at)| (plan.ranges[i].shadow.clone(), i, lo, hi, at)).collect();
                         let counts = counts.clone();
+                        let owners = owners.clone();
                         Box::new(move || {
                             let mut title = Vec::new();
                             for (shadow, i, lo, hi, at) in chunk {
                                 // SAFETY: the mapping of the fetched bytes;
                                 // the copy into it has run, and the caller
                                 // waits for this job.
-                                let gpu = unsafe { std::slice::from_raw_parts((fetched + at as usize) as *const u8, hi - lo) };
-                                let merged = shadow.card_merge(lo, gpu, &mut title);
+                                let gpu = unsafe {
+                                    std::slice::from_raw_parts(
+                                        (fetched + at as usize) as *const u8,
+                                        hi - lo,
+                                    )
+                                };
+                                let merged = shadow.card_merge(lo, gpu, &mut title, &owners);
                                 shadow.walls_merged(gpu.len(), merged);
                                 counts[i].fetch_add(merged, Ordering::Relaxed);
                             }
@@ -4137,8 +4173,12 @@ impl Host {
                 for &(i, lo, hi, at) in &pieces {
                     // SAFETY: the mapping of the fetched bytes, `total` of
                     // them; the copy into it has run.
-                    let gpu = unsafe { std::slice::from_raw_parts((*data + at as usize) as *const u8, hi - lo) };
-                    let merged = plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
+                    let gpu = unsafe {
+                        std::slice::from_raw_parts((*data + at as usize) as *const u8, hi - lo)
+                    };
+                    let merged = plan.ranges[i]
+                        .shadow
+                        .card_merge(lo, gpu, &mut title, owners);
                     plan.ranges[i].shadow.walls_merged(gpu.len(), merged);
                     written[i] += merged;
                 }
@@ -4357,6 +4397,10 @@ impl Host {
                 }
                 submitting(3, flights);
                 let copying = std::time::Instant::now();
+                let owners = writeback_owners(items.iter().filter_map(|item| match item {
+                    Late::Run(flight) => Some(flight),
+                    _ => None,
+                }));
                 let mut seen = std::collections::HashSet::new();
                 let mut back: Vec<Declared> = Vec::new();
                 for item in &items {
@@ -4364,7 +4408,7 @@ impl Host {
                         continue;
                     };
                     if let Some(card) = &flight.card {
-                        self.card_back(card, submitted, &mut seen);
+                        self.card_back(card, submitted, &mut seen, &owners);
                     }
                     for (shadow, ranges) in &flight.back {
                         match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
@@ -4379,7 +4423,7 @@ impl Host {
                         }
                     }
                 }
-                hand_back(&back);
+                hand_back(&back, &owners);
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // In the order given: what tells the title the card is done.
@@ -4402,6 +4446,7 @@ impl Host {
                 }
             }
             if last > 0 {
+                crate::writeback::published(last);
                 FINISHED.store(last, Ordering::Release);
                 bury(last);
             }
@@ -4455,6 +4500,9 @@ impl Host {
         crate::copystat::submission_begins();
         let was_working = working(true);
         submitting(1, runs.len());
+        // Under the submission lock, before inspecting dependencies. A remap
+        // racing preparation also invalidates this submission's old writes.
+        crate::writeback::starting(STARTED.load(Ordering::Relaxed) + 1);
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
@@ -4715,11 +4763,18 @@ impl Host {
         let copying = std::time::Instant::now();
         // For copies in the card's memory the compare has run there: the
         // pieces that differ are fetched and merged.
+        let owners = crate::writeback::Owners::single(this_submission);
         if let Some(card) = &card {
-            self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
+            self.card_back(
+                card,
+                &mut submitted,
+                &mut std::collections::HashSet::new(),
+                &owners,
+            );
         }
         let back = declared_writes(runs);
-        hand_back(&back);
+        hand_back(&back, &owners);
+        crate::writeback::published(this_submission);
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -5740,10 +5795,20 @@ impl HostList {
     /// Independent lists can discover new guest memory copies in any order.
     pub(crate) fn raw_memory_ranges(
         &self,
+        directory: &ID3D12Resource,
+        revision: u64,
         count: usize,
         writes: bool,
     ) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
-        self.deferred().raw_copies.advance(count, writes)
+        let mut deferred = self.deferred();
+        let id = directory.as_raw() as usize;
+        if deferred.raw_copies.directory != id {
+            deferred.kept.push(directory.clone().into());
+        }
+        if deferred.raw_copies.directory != id || deferred.raw_copies.revision != revision {
+            deferred.raw_copies = RawCopyCoverage { directory: id, revision, ..Default::default() };
+        }
+        deferred.raw_copies.advance(count, writes)
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.

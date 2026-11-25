@@ -1074,14 +1074,14 @@ mod tests {
             words
         };
         assert_eq!(contents(), [6, 0, 0, tlas, tlas, base + 8, 0, 0]);
-        assert_eq!(gpu.acceleration_addresses(), [tlas]);
+        assert_eq!(&*gpu.acceleration_addresses(), &[tlas]);
         acceleration[4] += 256;
         create_srv(null, null, &acceleration, slot(1));
         copy_simple(null, 1, slot(4), slot(3), 0);
         copy_simple(null, 1, slot(3), slot(0), 0); // untagged, deferred source
         create_srv(null, null, null.cast(), slot(2));
         assert_eq!(contents(), [6, 0, 0, tlas + 256, 0, 0, base + 8, 0]);
-        assert_eq!(gpu.acceleration_addresses(), [tlas + 256]);
+        assert_eq!(&*gpu.acceleration_addresses(), &[tlas + 256]);
         assert_eq!(release(object), 0);
     }
 
