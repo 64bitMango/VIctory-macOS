@@ -90,6 +90,11 @@ extern "system" fn completed(this: This) -> u64 {
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     crate::queue::pump_held_if_free(crate::queue::Why::Fence);
+    // The title is about to wait: an unwaited submission is finished now,
+    // which makes the Signals kept behind it and may let held work go.
+    if fence(this).value.load(Ordering::Acquire) < value && crate::unwaited::finish(crate::unwaited::By::FenceWait) {
+        crate::queue::pump_held(crate::queue::Why::Fence);
+    }
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
@@ -110,6 +115,9 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
 /// The title's Signal from the CPU: what queues hold behind a Wait for it
 /// may run now (`crate::hold`).
 extern "system" fn signal(this: This, value: u64) -> HRESULT {
+    // A queue's Signal kept behind an unwaited submission is made first, as
+    // it was made first.
+    crate::unwaited::finish(crate::unwaited::By::FenceWait);
     let hr = set(this, value);
     crate::queue::pump_held(crate::queue::Why::Fence);
     hr

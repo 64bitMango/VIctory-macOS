@@ -563,6 +563,12 @@ impl Shadow {
         written
     }
 
+    /// Whether shaders of a submission not yet copied back may be writing
+    /// the copy.
+    pub(crate) fn written_by_shaders(&self) -> bool {
+        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
     /// Whether the title wrote none of the copy's memory since the copy took
     /// it (tracked memory only): [`Shadow::update`] would copy nothing.
     pub(crate) fn clean(&self) -> bool {
