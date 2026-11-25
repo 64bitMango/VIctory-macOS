@@ -390,6 +390,16 @@ pub struct Options {
     /// gradients scaled by `2^bias`, for hosts that ignore the bias of a
     /// compute shader's sample (D3DMetal, #30).
     pub bias_as_gradients: bool,
+    /// Trial linked layout for the 16-row mesh/pixel interface.
+    pub compact_mesh_interface: bool,
+    /// Mesh: each export's output stores come after all the values they
+    /// store, not each after its own value. Metal shader converter builds a
+    /// row's vector where the row's first channel is stored, from values
+    /// made after it when they are widened halves or bitcasts; Apple's GPU
+    /// compiler then crashes (register allocation) on the mesh pipelines
+    /// whose pixel shader reads that row (D3DMetal: "XPC_ERROR_CONNECTION_
+    /// INTERRUPTED", the pipeline a no-op).
+    pub mesh_stores_last: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -517,14 +527,22 @@ pub fn emit_with(
         atomic_locks: options.atomic_locks,
         bias_as_gradients: options.bias_as_gradients,
     };
-    let l = match lower::lower(&parts(st, res)) {
+    let l = match lower::lower_with_layout(
+        &parts(st, res),
+        options.compact_mesh_interface,
+        options.mesh_stores_last,
+    ) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+            lower::lower_with_layout(
+                &parts(&st, &res),
+                options.compact_mesh_interface,
+                options.mesh_stores_last,
+            )?
         }
         l => l?,
     };

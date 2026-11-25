@@ -95,10 +95,23 @@ enum Stop {
     Fail(ShaderError),
 }
 
+#[cfg(any(test, windows))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with_layout(parts, false, false)
+}
+
+/// [`lower`], with the trial interface layout and the mesh store order
+/// [`super::Options`] chooses.
+pub(crate) fn lower_with_layout(
+    parts: &Parts,
+    compact: bool,
+    mesh_stores_last: bool,
+) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        let mut l = Lower::new(parts, &bad);
+        l.mesh_stores_last = mesh_stores_last;
+        match l.run(compact) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -261,6 +274,9 @@ struct Lower<'a> {
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword ([`packed_half`]).
     half_outputs: HashMap<u8, bool>,
+    /// Mesh: an export's output stores all come after the values they
+    /// store ([`Options::mesh_stores_last`](super::Options)).
+    mesh_stores_last: bool,
     /// How lane masks become data.
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
@@ -692,6 +708,7 @@ impl<'a> Lower<'a> {
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io),
+            mesh_stores_last: false,
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
@@ -1287,7 +1304,7 @@ impl<'a> Lower<'a> {
         Ok(if float { self.as_int(r) } else { r })
     }
 
-    fn run(mut self) -> Result<Lowered, Stop> {
+    fn run(mut self, compact: bool) -> Result<Lowered, Stop> {
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -1384,6 +1401,12 @@ impl<'a> Lower<'a> {
         let memory_writes = self.s.memory_dirty.is_some();
         let view_addresses = self.s.view_addresses.is_some();
         let cmp_samplers = self.s.cmp_samplers;
+        if compact {
+            let interface = if self.s.pixel { &mut self.s.inputs } else { &mut self.s.outputs };
+            if !super::container::compact_mesh_interface(interface) {
+                return Err(unsupported(0, "unexpected layout for compact mesh interface"));
+            }
+        }
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -9967,6 +9990,15 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // Mesh, with `mesh_stores_last`: every value first, then the stores
+        // in a run. Metal shader converter builds a row's vector where the
+        // row's first channel is stored, from the values of all its
+        // channels; a value made after that store (a 16-bit half widened, a
+        // bitcast) is used before it is defined, and Apple's GPU compiler
+        // crashes in register allocation when the pixel shader reads that
+        // row.
+        let defer = mesh && self.mesh_stores_last;
+        let mut deferred = Vec::new();
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -9995,27 +10027,46 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
-            let mut args = vec![
-                self.s.m.i32(id as u32),
-                self.s.m.i32(0),
-                self.s.m.i8(col),
-                x,
-            ];
-            if mesh {
-                args.push(self.mesh_thread());
+            if defer {
+                deferred.push((id, col, suffix, x));
+            } else {
+                self.store_output(name, opcode, mesh, (id, col, suffix, x));
             }
-            let void = self.s.t.void;
-            self.s.op(
-                self.cur,
-                &format!("{name}{suffix}"),
-                Attr::NoUnwind,
-                void,
-                opcode,
-                &args,
-            );
+        }
+        for store in deferred {
+            self.store_output(name, opcode, mesh, store);
         }
         self.end_guarded(at, &[]);
         Ok(())
+    }
+
+    /// One output store of [`Lower::export`]: output element `id`'s channel
+    /// `col` takes `x` (an `.f32` or `.i32` value, as `suffix` says).
+    fn store_output(
+        &mut self,
+        name: &str,
+        opcode: u32,
+        mesh: bool,
+        (id, col, suffix, x): (usize, u8, &str, V),
+    ) {
+        let mut args = vec![
+            self.s.m.i32(id as u32),
+            self.s.m.i32(0),
+            self.s.m.i8(col),
+            x,
+        ];
+        if mesh {
+            args.push(self.mesh_thread());
+        }
+        let void = self.s.t.void;
+        self.s.op(
+            self.cur,
+            &format!("{name}{suffix}"),
+            Attr::NoUnwind,
+            void,
+            opcode,
+            &args,
+        );
     }
 
     /// Mesh: `exp prim` as the lane's primitive. Each corner takes ten

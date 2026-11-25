@@ -103,6 +103,20 @@ fn bias_as_gradients() -> bool {
     })
 }
 
+/// Whether mesh shaders store their outputs after computing them all:
+/// under Wine, where D3DMetal's Metal shader converter builds an output row
+/// from values made after the row's first store, and Apple's GPU compiler
+/// then crashes on the pipeline (`emit::Options::mesh_stores_last`).
+/// `VICTORY_MESH_STORES_LAST=0` or `1` overrides.
+fn mesh_stores_last() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_MESH_STORES_LAST").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => under_wine(),
+    })
+}
+
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
 pub(crate) fn under_wine() -> bool {
@@ -123,10 +137,12 @@ pub(crate) fn under_wine() -> bool {
 }
 
 /// [`build`] for translations with host workarounds (atomic locks, bias
-/// as gradients): their own cache entries, one per combination.
-fn options_build(locks: bool, bias: bool) -> &'static [u8; 32] {
-    static BUILDS: [OnceLock<[u8; 32]>; 4] = [const { OnceLock::new() }; 4];
-    BUILDS[usize::from(locks) | usize::from(bias) << 1].get_or_init(|| {
+/// as gradients, mesh stores last): their own cache entries, one per
+/// combination.
+fn options_build(locks: bool, bias: bool, stores_last: bool) -> &'static [u8; 32] {
+    static BUILDS: [OnceLock<[u8; 32]>; 8] = [const { OnceLock::new() }; 8];
+    let i = usize::from(locks) | usize::from(bias) << 1 | usize::from(stores_last) << 2;
+    BUILDS[i].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
         if locks {
@@ -134,6 +150,9 @@ fn options_build(locks: bool, bias: bool) -> &'static [u8; 32] {
         }
         if bias {
             h.update(b"bias as gradients");
+        }
+        if stores_last {
+            h.update(b"mesh stores last");
         }
         *h.finalize().as_bytes()
     })
@@ -150,11 +169,13 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         view_marks: true,
         atomic_locks: atomic_locks(),
         bias_as_gradients: bias_as_gradients(),
+        compact_mesh_interface: false,
+        mesh_stores_last: mesh_stores_last(),
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    let build = if options.atomic_locks || options.bias_as_gradients {
-        options_build(options.atomic_locks, options.bias_as_gradients)
+    let build = if options.atomic_locks || options.bias_as_gradients || options.mesh_stores_last {
+        options_build(options.atomic_locks, options.bias_as_gradients, options.mesh_stores_last)
     } else {
         build()
     };

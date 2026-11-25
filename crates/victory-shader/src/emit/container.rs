@@ -88,6 +88,41 @@ pub(crate) fn same_mode_per_row(elements: &mut [SigElement], read: bool) {
     }
 }
 
+/// Move the three fields of row 5 into existing holes, then close the
+/// empty row. Called after lowering: DXIL loads/stores address elements by
+/// signature ID and relative component, so element order must stay fixed.
+pub(crate) fn compact_mesh_interface(elements: &mut [SigElement]) -> bool {
+    let mut occupied = [0u8; 15];
+    let mut destinations = Vec::with_capacity(elements.len());
+    for e in elements.iter() {
+        let Some(original_row) = e.row else { return false };
+        let row = original_row;
+        let (row, col) = match (row, e.col, e.cols) {
+            (5, 0, 1) => (7, 3),
+            (5, 1, 2) => (13, 2),
+            (5, 3, 1) => (8, 3),
+            (5, _, _) => return false,
+            (6..=15, col, _) => (row - 1, col),
+            (0..=4, col, _) => (row, col),
+            _ => return false,
+        };
+        if original_row >= 2 && (e.kind != 0 || e.comp != 9 || e.interp != 2) {
+            return false;
+        }
+        let mask = ((1u8 << e.cols) - 1) << col;
+        if occupied[row as usize] & mask != 0 {
+            return false;
+        }
+        occupied[row as usize] |= mask;
+        destinations.push((row, col));
+    }
+    for (e, (row, col)) in elements.iter_mut().zip(destinations) {
+        e.row = Some(row);
+        e.col = col;
+    }
+    true
+}
+
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend((elements.len() as u32).to_le_bytes());
