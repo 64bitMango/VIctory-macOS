@@ -1263,17 +1263,12 @@ mod tests {
                     eprintln!("synthetic {case:?} SDK valid bytes={}", dxil.len());
                 }
             } else {
+                // The loop does not overwrite the input first, so the
+                // program reads the barycentrics it was given: as values
+                // through SV_Barycentrics (this fork; upstream refuses
+                // "barycentrics read directly").
                 eprintln!("synthetic {case:?} {:?}", shader.as_ref().err());
-                assert!(
-                    matches!(
-                        shader,
-                        Err(ShaderError::Unsupported {
-                            what: "barycentrics read directly",
-                            ..
-                        })
-                    ),
-                    "{case:?}"
-                );
+                assert!(shader.is_ok(), "{case:?}");
             }
         }
     }
