@@ -134,7 +134,7 @@ pub(crate) fn raise(list: &HostList, light: This) -> bool {
     let Some(light) = crate::resource::host_resource(light) else {
         return false;
     };
-    record(list, light, level)
+    record(list, &light, level)
 }
 
 /// The pass, made once.

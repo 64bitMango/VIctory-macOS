@@ -762,29 +762,10 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
-                            // Where the root address lies in the copy its view shows.
-                            let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
-                                Some(&Root::View(address)) => crate::shadow::find(address, 1)
-                                    .and_then(|s| u32::try_from(s.offset(address)).ok()),
-                                _ => None,
-                            };
-                            match offset {
-                                Some(offset) => offset,
-                                None => {
-                                    not_run("a root view's offset: no root view, or outside title buffers");
-                                    return false;
-                                }
-                            }
-                        }
-                        None if is_root_view(u) => {
-                            let uav = u.dword == victory_shader::emit::ROOT_UAV_VIEW;
-                            match self.root_view(list, compute, u.slot, uav) {
-                                Some((slot, _)) => slot,
-                                None => return false,
-                            }
-                        }
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
+                        None => match self.user_entry(list, compute, u) {
+                            Some(value) => value,
+                            None => return false,
+                        },
                     };
                 }
                 // SAFETY: an open list; `values` covers the parameter.
@@ -899,6 +880,43 @@ impl State {
         #[cfg(feature = "diagnostics")]
         crate::capture::binding("");
         true
+    }
+
+    /// The value of user-data entry `u` (not a table made for this draw):
+    /// a root view's heap index or its offset in that view, else what the
+    /// title set ([`Self::user_value`]). None if the draw must be dropped.
+    /// Only a root descriptor's entries name views: dword 4 of root
+    /// constants is a constant (until 2026-11-25 it was taken for a root
+    /// view's offset and, the slot holding constants, every draw reading it
+    /// was dropped: the Xbox BVH builder's dispatches, about 2,000 a frame).
+    fn user_entry(&mut self, list: &HostList, compute: bool, u: &victory_shader::emit::UserData) -> Option<u32> {
+        if is_root_view_offset(u) {
+            // Where the root address lies in the copy its view shows.
+            let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
+                Some(&Root::View(address)) => crate::shadow::find(address, 1)
+                    .and_then(|s| u32::try_from(s.offset(address)).ok())
+                    .ok_or(Some(address)),
+                _ => Err(None),
+            };
+            return match offset {
+                Ok(offset) => Some(offset),
+                Err(None) => {
+                    once!(slot = u.slot, "a shader reads a root view's offset the title did not set: dropped");
+                    not_run("root view offset: no root view set");
+                    None
+                }
+                Err(Some(address)) => {
+                    once!(address = format_args!("{address:#x}"), "a root view's offset outside its copy: dropped");
+                    not_run("root view offset: no copy holds the address");
+                    None
+                }
+            };
+        }
+        if is_root_view(u) {
+            let uav = u.dword == victory_shader::emit::ROOT_UAV_VIEW;
+            return self.root_view(list, compute, u.slot, uav).map(|(slot, _)| slot);
+        }
+        Some(self.user_value(compute, u.slot, u.root, u.dword))
     }
 
     /// The heap index of a raw view (`uav`: unordered access) of the host
@@ -1990,9 +2008,16 @@ fn describe(view: Option<&View>) -> String {
     }
 }
 
-/// A user-data entry that takes the heap index of a root view's view.
+/// A user-data entry that takes the heap index of a root view's view (or,
+/// [`is_root_view_offset`], the root address's offset in it).
 fn is_root_view(u: &victory_shader::emit::UserData) -> bool {
     u.root == RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
+}
+
+/// A user-data entry that takes a root view's offset in its view: a root
+/// descriptor's, never dword 4 of root constants.
+fn is_root_view_offset(u: &victory_shader::emit::UserData) -> bool {
+    u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_VIEW_OFFSET
 }
 
 /// Whether a shader reads root views through views the host makes.
@@ -2013,6 +2038,34 @@ mod tests {
     use crate::object::{HRESULT, S_OK};
     use crate::compute::{Param, srv, uav};
     use windows::core::s;
+
+    /// Dword 4 of root constants is a constant, not a root view's offset:
+    /// the Xbox BVH builder's dispatches (run 13: compute f6e47efa50226beb,
+    /// root constants at slot 8, user data 32-45) read it and were all
+    /// dropped as "root view offset: no root view set". A root descriptor's
+    /// offset entry still drops a draw whose root view is not set.
+    #[test]
+    fn root_constants_dword_4_is_a_constant() {
+        use victory_shader::emit::{ROOT_SRV_VIEW, ROOT_VIEW_OFFSET, UserData};
+        let constant = |dword| UserData { index: 32 + dword, slot: 8, root: RootType::Constants, dword };
+        let offset = UserData { index: 7, slot: 0, root: RootType::Descriptor, dword: ROOT_VIEW_OFFSET };
+        assert!(!is_root_view_offset(&constant(ROOT_VIEW_OFFSET)));
+        assert!(!is_root_view(&constant(ROOT_VIEW_OFFSET)));
+        assert!(!is_root_view(&constant(ROOT_SRV_VIEW)));
+        assert!(is_root_view_offset(&offset));
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        let words: Vec<u32> = (0..14).map(|k| 0x100 + k).collect();
+        state.set_constants(true, 8, &words, 0);
+        for dword in 0..14 {
+            assert_eq!(state.user_entry(&list, true, &constant(dword)), Some(0x100 + dword), "dword {dword}");
+        }
+        assert_eq!(state.user_entry(&list, true, &offset), None, "no root view at slot 0");
+        list.close();
+    }
 
     /// Reads 16 dwords 64 bytes apart from `offset` past the root view
     /// (heap index in the table) as the translated shaders do: the root

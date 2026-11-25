@@ -138,8 +138,13 @@ impl Shader {
                     let mut container = self.container.lock().unwrap_or_else(|e| e.into_inner());
                     let done = translate(&container);
                     // After the translation, not before: if it panics, the
-                    // bytes are still there for the next try.
-                    *container = Vec::new();
+                    // bytes are still there for the next try. A mesh shader
+                    // keeps them: a pipeline may translate it again without
+                    // the outputs its pixel shader does not read
+                    // ([`Shader::translated_keeping`]).
+                    if self.stage != "mesh" {
+                        *container = Vec::new();
+                    }
                     done
                 };
                 let ms = started.elapsed().as_millis() as u64;
@@ -184,9 +189,10 @@ impl Shader {
         let mut map = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(kept.clone())
             .or_insert_with(|| {
+                let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
                 let (host, cached) =
-                    crate::shader_cache::host_shader_keeping(&self.container, Some(kept));
-                match host.and_then(|host| with_resources(&self.container, host)) {
+                    crate::shader_cache::host_shader_keeping(&container, Some(kept));
+                match host.and_then(|host| with_resources(&container, host)) {
                     Ok(t) => {
                         tracing::info!(
                             hash = %self.hash,
