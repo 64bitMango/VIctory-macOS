@@ -1398,7 +1398,8 @@ pub(crate) mod tests {
     /// into it by calls only, and each slot is as the last call left it
     /// with no sync's help.
     #[cfg(windows)]
-    fn slots_written_during_syncs_end_as_their_records(alone: bool) {
+    fn slots_written_during_syncs_end_as_their_records(alone: bool, one_lock: bool) {
+        use host::tests::ONE_LOCK;
         use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
@@ -1409,6 +1410,7 @@ pub(crate) mod tests {
         const WRITERS: u64 = 4;
         const ROUNDS: u64 = 5_000;
         HEAPS_ALONE.with(|a| a.set(alone));
+        ONE_LOCK.with(|one| one.set(one_lock));
         let page = crate::watch::PAGE;
         let pages = (SLOTS as usize * 32).div_ceil(page);
         // Each heap in pages of its own: samplers, views, and the pair one
@@ -1442,6 +1444,7 @@ pub(crate) mod tests {
             let stop = &stop;
             scope.spawn(move || {
                 HEAPS_ALONE.with(|a| a.set(alone));
+                ONE_LOCK.with(|one| one.set(one_lock));
                 let host = crate::host::host().expect("checked");
                 let mut round = 0u32;
                 while !stop.load(Relaxed) {
@@ -1459,6 +1462,7 @@ pub(crate) mod tests {
                 .map(|t| {
                     scope.spawn(move || {
                         HEAPS_ALONE.with(|a| a.set(alone));
+                        ONE_LOCK.with(|one| one.set(one_lock));
                         let null = std::ptr::null();
                         // Records of 16 samplers and of 16 placed texture
                         // views, where no heap sees them.
@@ -1574,6 +1578,7 @@ pub(crate) mod tests {
         drop(owners);
         crate::watch::tests::free(memory);
         HEAPS_ALONE.with(|a| a.set(false));
+        ONE_LOCK.with(|one| one.set(false));
     }
 
     /// Several threads write the same slots of a heap no sync looks at, at
@@ -1583,6 +1588,19 @@ pub(crate) mod tests {
     #[cfg(windows)]
     #[test]
     fn the_last_of_several_threads_writing_a_slot_at_once_makes_it() {
+        last_of_several_threads_makes_a_slot(false);
+    }
+
+    /// The same with one lock for all of a heap's slots (as
+    /// `VICTORY_SLOT_LOCKS=0`).
+    #[cfg(windows)]
+    #[test]
+    fn the_last_of_several_threads_writing_a_slot_at_once_makes_it_under_one_lock() {
+        last_of_several_threads_makes_a_slot(true);
+    }
+
+    #[cfg(windows)]
+    fn last_of_several_threads_makes_a_slot(one_lock: bool) {
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
@@ -1602,6 +1620,7 @@ pub(crate) mod tests {
                 for t in 0..4u64 {
                     let barrier = &barrier;
                     scope.spawn(move || {
+                        host::tests::ONE_LOCK.with(|one| one.set(one_lock));
                         let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
                         let mut view = [0u32; 16];
                         view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
@@ -1637,16 +1656,19 @@ pub(crate) mod tests {
     #[test]
     fn slots_written_from_several_threads_during_syncs_end_as_their_records() {
         for _ in 0..3 {
-            slots_written_during_syncs_end_as_their_records(false);
+            slots_written_during_syncs_end_as_their_records(false, false);
         }
     }
 
     /// The same with the heaps' lock held alone wherever it is taken (as
-    /// `VICTORY_HEAPS_SHARED=0`).
+    /// `VICTORY_HEAPS_SHARED=0`) and one lock for all of a heap's slots (as
+    /// `VICTORY_SLOT_LOCKS=0`, `VICTORY_SYNC_RUNS=0`), and with only the
+    /// latter.
     #[cfg(windows)]
     #[test]
     fn slots_written_from_several_threads_end_as_their_records_with_the_heaps_held_alone() {
-        slots_written_during_syncs_end_as_their_records(true);
+        slots_written_during_syncs_end_as_their_records(true, true);
+        slots_written_during_syncs_end_as_their_records(false, true);
     }
 
     /// A placed heap reused at the same address replaces the stale range;
