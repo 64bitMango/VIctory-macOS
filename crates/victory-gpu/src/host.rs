@@ -1590,9 +1590,10 @@ impl Host {
         let mut finished = Finished::default();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Dropped as before: the mark, then the lock, then the lists.
+        let mut held = Some(self.submitted.lock().unwrap_or_else(|e| e.into_inner()));
         let _holding = Holding::enter();
-        self.submit_held(&mut Some(submitted), runs, keep, &mut finished)
+        self.submit_held(&mut held, runs, keep, &mut finished)
     }
 
     /// [`Host::submit`] under the submission lock `held`, which it gives
