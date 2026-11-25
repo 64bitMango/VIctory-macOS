@@ -75,6 +75,9 @@ pub(crate) struct Lowered {
     /// Exchanges between the halves of console waves ([`Halves`]).
     #[cfg(test)]
     pub exchanges: u32,
+    /// Group barriers written.
+    #[cfg(test)]
+    pub barriers: usize,
 }
 
 pub(crate) struct Parts<'a> {
@@ -686,6 +689,16 @@ impl<'a> Lower<'a> {
             let wave = if x.native.wave64 { 64 } else { 32 };
             let lanes = cs.threads.iter().product::<u32>();
             let one_wave = lanes <= wave;
+            // Where the threads of a group meet at a barrier: with one
+            // console wave, wherever the wave's lanes are all together;
+            // with several, only where every lane runs once.
+            let meet = |live: bool| {
+                if one_wave {
+                    wave_blocks(x, live)
+                } else {
+                    once_blocks(p)
+                }
+            };
             // The console's one wave is several host waves: LDS no longer
             // passes between its lanes without a barrier.
             let mut synced = false;
@@ -693,7 +706,7 @@ impl<'a> Lower<'a> {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
-                if let Some(b) = split_wave_barriers(p) {
+                if let Some(b) = split_wave_barriers_in(p, &meet(true)) {
                     split_barriers = b;
                     synced = true;
                 }
@@ -719,6 +732,7 @@ impl<'a> Lower<'a> {
                 halves = Some(Halves {
                     whole: lanes <= 32,
                     count: lanes.div_ceil(32),
+                    meet: meet(false),
                     once: once_blocks(p),
                     solo: solo_blocks(x, cs.threads, cs.thread_id_vgprs()),
                     flat: None,
@@ -1543,7 +1557,7 @@ impl<'a> Lower<'a> {
             self.refuse(what);
             return r;
         }
-        let (lo, hi) = self.exchange(self.cur, r);
+        let (lo, hi) = self.exchange(self.cur, self.cur_ir, r);
         both(self, lo, hi)
     }
 
@@ -1688,6 +1702,8 @@ impl<'a> Lower<'a> {
             wave_size: self.s.wave_size,
             #[cfg(test)]
             exchanges: self.halves.as_ref().map_or(0, |h| h.sites),
+            #[cfg(test)]
+            barriers: self.s.m.written_calls("dx.op.barrier"),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2221,7 +2237,7 @@ impl<'a> Lower<'a> {
                     let b = self.def_block.get(&lo).copied().unwrap_or(0);
                     if self.halves_meet(b) && !(at == self.cur && self.guarded != 0) {
                         // each half's ballot is a dword of the console's mask
-                        xy = self.exchange(at, xy.0);
+                        xy = self.exchange(at, b, xy.0);
                     } else {
                         // One thread alone there: its bit, in its half's
                         // dword. Other lanes there too: the other half's
@@ -3527,7 +3543,7 @@ impl<'a> Lower<'a> {
 
     /// Halves: whether the two halves can exchange in IR block `b`.
     fn halves_meet(&self, b: usize) -> bool {
-        self.halves.as_ref().is_some_and(|h| h.once[b])
+        self.halves.as_ref().is_some_and(|h| h.meet[b])
     }
 
     /// Halves: the form is not the console's program (it is made again
@@ -3540,10 +3556,11 @@ impl<'a> Lower<'a> {
 
     /// Halves: `v`, which every lane of a half holds alike, as the lower
     /// and the upper half of this thread's console wave hold it. Every lane
-    /// stores its half's dword, the group meets, and each reads both. `at`
-    /// is in a block every lane runs once, so each exchange has dwords
-    /// that are written once.
-    fn exchange(&mut self, at: usize, v: V) -> (V, V) {
+    /// stores its half's dword (each exchange has its own), the group
+    /// meets, and each reads both. `at` is in IR block `b`, where the
+    /// halves meet; where that is in a loop they meet again after reading,
+    /// so that no half stores the next pass's before the other has read.
+    fn exchange(&mut self, at: usize, b: usize, v: V) -> (V, V) {
         let i32t = self.s.t.i32;
         let h = self.halves.as_mut().expect("halves");
         let (count, n) = (h.count, h.sites);
@@ -3562,7 +3579,12 @@ impl<'a> Lower<'a> {
         let lo = self.s.m.bin(at, Bin::And, half, lower);
         let hi = self.s.m.bin(at, Bin::Or, half, one);
         let (lo, hi) = (self.s.m.element(at, g, lo), self.s.m.element(at, g, hi));
-        (self.s.m.load(at, lo), self.s.m.load(at, hi))
+        let r = (self.s.m.load(at, lo), self.s.m.load(at, hi));
+        if !self.halves.as_ref().expect("halves").once[b] {
+            self.s
+                .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        }
+        r
     }
 
     /// Halves: whether this thread is in the upper half of its console wave.
@@ -11800,6 +11822,93 @@ pub(crate) fn once_blocks(p: &Program) -> Vec<bool> {
         .collect()
 }
 
+/// The blocks every lane of a console wave runs as often as the wave does:
+/// no per-lane branch decides, directly or through the branches around it,
+/// whether or how often a lane runs them (uniform branches and loops may).
+/// Where a group is one console wave its threads meet at a group barrier
+/// there: all take the wave's path, as often.
+///
+/// `live`: every lane still running, that is: a per-lane branch whose other
+/// way is the program's end does not count (`if (...) return;` for some
+/// lanes, then code for the rest). The threads that ended never reach a
+/// barrier there, which Metal leaves undefined; Apple's GPUs (M5: groups
+/// of 64 with any lanes gone, a whole host wave too, barriers in a loop)
+/// make the rest meet.
+fn wave_blocks(x: &Parts, live: bool) -> Vec<bool> {
+    let p = x.p;
+    let n = p.blocks.len();
+    let succ: Vec<Vec<usize>> = p.blocks.iter().map(|b| b.exit.successors()).collect();
+    // Postdominators: a block's own, and what all its successors share.
+    let mut pdom = vec![vec![true; n]; n];
+    for b in 0..n {
+        if succ[b].is_empty() {
+            pdom[b] = (0..n).map(|q| q == b).collect();
+        }
+    }
+    loop {
+        let mut changed = false;
+        for b in (0..n).rev() {
+            if succ[b].is_empty() {
+                continue;
+            }
+            let new: Vec<bool> = (0..n)
+                .map(|q| q == b || succ[b].iter().all(|&s| pdom[s][q]))
+                .collect();
+            changed |= new != pdom[b];
+            pdom[b] = new;
+        }
+        if !changed {
+            break;
+        }
+    }
+    let per_lane = |q: usize| match x.st.exits[q] {
+        LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } => {
+            taken != not_taken
+                && !x
+                    .st
+                    .bools
+                    .support(when)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(_)))
+        }
+        LaneExit::Indirect => true,
+        _ => false,
+    };
+    // `b` runs or not by the branch that ends `q`.
+    let depends = |b: usize, q: usize| {
+        succ[q].len() > 1 && succ[q].iter().any(|&s| pdom[s][b]) && (b == q || !pdom[q][b])
+    };
+    // A per-lane branch to the program's end only takes lanes out for good.
+    let ends = |b: usize| {
+        succ[b].is_empty()
+            && p.blocks[b]
+                .insts
+                .iter()
+                .all(|i| matches!(i.name(), "s_endpgm" | "s_nop" | "v_nop" | "s_waitcnt"))
+    };
+    let early = |q: usize| live && succ[q].iter().any(|&s| ends(s));
+    let mut divergent: Vec<bool> = (0..n)
+        .map(|b| (0..n).any(|q| per_lane(q) && !early(q) && depends(b, q)))
+        .collect();
+    loop {
+        let mut changed = false;
+        for b in 0..n {
+            if !divergent[b] && (0..n).any(|q| divergent[q] && depends(b, q)) {
+                divergent[b] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    divergent.iter().map(|d| !d).collect()
+}
+
 /// The blocks at most one thread of a compute group runs: every lane that
 /// enters has passed a test of its thread id against zero in each dimension
 /// the group has more than one thread in (`v_cmp_eq_u32 0, v0 | v1`, the
@@ -11902,7 +12011,10 @@ struct Halves {
     whole: bool,
     /// Halves in a group.
     count: u32,
-    /// [`once_blocks`].
+    /// Where the halves meet, every lane there: [`wave_blocks`] of a group
+    /// that is one console wave, [`once_blocks`] of a larger one.
+    meet: Vec<bool>,
+    /// [`once_blocks`]: an exchange there is not made again.
     once: Vec<bool>,
     /// [`solo_blocks`].
     solo: Vec<bool>,
@@ -11942,21 +12054,53 @@ pub fn kept_wide() -> (u64, Option<&'static str>) {
 /// at its end syncs there when a successor is not one, so divergent code
 /// after it reads clean LDS. `None`: a read in divergent code may see a
 /// write made in divergent code since the last such block.
+///
+/// An atomic that gives nothing back needs no barrier after others of its
+/// kind (sums, ORs, minima: any order leaves the same dword), so lanes may
+/// accumulate in divergent code and loops; the next read syncs.
+#[cfg(test)]
 pub(crate) fn split_wave_barriers(p: &Program) -> Option<Set<(usize, usize)>> {
+    split_wave_barriers_in(p, &once_blocks(p))
+}
+
+/// [`split_wave_barriers`] with barriers in the blocks `uniform` marks
+/// (one console wave in a group: [`wave_blocks`]).
+fn split_wave_barriers_in(p: &Program, uniform: &[bool]) -> Option<Set<(usize, usize)>> {
+    // LDS since the last sync: untouched, changed only by atomics of one
+    // commuting kind (1..), or written.
+    const CLEAN: u8 = 0;
+    const DIRTY: u8 = u8::MAX;
+    const COMMUTING: [&str; 8] = [
+        "ds_add_u32",
+        "ds_or_b32",
+        "ds_and_b32",
+        "ds_xor_b32",
+        "ds_min_u32",
+        "ds_max_u32",
+        "ds_min_i32",
+        "ds_max_i32",
+    ];
+    let join = |a: u8, b: u8| match (a, b) {
+        (CLEAN, x) | (x, CLEAN) => x,
+        (a, b) if a == b => a,
+        _ => DIRTY,
+    };
     let n = p.blocks.len();
     let succ = |b: usize| p.blocks[b].exit.successors();
-    let uniform = once_blocks(p);
     let order = crate::ir::reverse_postorder(&p.blocks);
-    let mut dirty_out = vec![false; n];
+    let mut dirty_out = vec![CLEAN; n];
     loop {
         let mut at = Set::default();
         let mut changed = false;
         for &b in &order {
-            let mut dirty = p.blocks[b].preds.iter().any(|&q| dirty_out[q]);
+            let mut dirty = p.blocks[b]
+                .preds
+                .iter()
+                .fold(CLEAN, |d, &q| join(d, dirty_out[q]));
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
                 let name = inst.name();
                 if name == "s_barrier" {
-                    dirty = false;
+                    dirty = CLEAN;
                 }
                 if !matches!(inst.fields, Fields::Ds { .. })
                     || name.starts_with("ds_swizzle")
@@ -11964,17 +12108,26 @@ pub(crate) fn split_wave_barriers(p: &Program) -> Option<Set<(usize, usize)>> {
                 {
                     continue;
                 }
-                if dirty && !name.starts_with("ds_write") {
+                let kind = COMMUTING
+                    .iter()
+                    .position(|&k| k == name)
+                    .map(|k| k as u8 + 1);
+                let commutes = kind.is_some_and(|k| dirty == k);
+                if dirty != CLEAN && !name.starts_with("ds_write") && !commutes {
                     if !uniform[b] {
                         return None;
                     }
                     at.insert((b, i));
                 }
-                dirty = !name.starts_with("ds_read");
+                dirty = match kind {
+                    Some(k) => k,
+                    None if name.starts_with("ds_read") => CLEAN,
+                    None => DIRTY,
+                };
             }
-            if dirty && uniform[b] && succ(b).iter().any(|&s| !uniform[s]) {
+            if dirty != CLEAN && uniform[b] && succ(b).iter().any(|&s| !uniform[s]) {
                 at.insert((b, p.blocks[b].insts.len()));
-                dirty = false;
+                dirty = CLEAN;
             }
             changed |= std::mem::replace(&mut dirty_out[b], dirty) != dirty;
         }
@@ -13348,6 +13501,38 @@ mod tests {
         assert_eq!(split_barriers(&w, 64, true), 0);
     }
 
+    #[test]
+    fn atomics_of_one_kind_accumulate_in_divergent_code() {
+        // 196bf6114ff3a131's shape: some lanes add to a dword, more than
+        // once; every lane reads the total after the join.
+        const DS_ADD_V1_V0: [u32; 2] = [0xD800_0000, 0x0000_0001]; // ds_add_u32 v1, v0
+        const DS_OR_V1_V0: [u32; 2] = [0xD828_0000, 0x0000_0001]; // ds_or_b32 v1, v0
+        let program = |second: [u32; 2]| {
+            let mut w = vec![V_LSHLREV_V1_2_V0, SAVE_EXEC, CMPX_V0_EQ_0, skip(4)];
+            w.extend(DS_ADD_V1_V0);
+            w.extend(second);
+            w.push(RESTORE_EXEC);
+            w.extend(DS_READ_V2_V1_4);
+            w.push(S_ENDPGM);
+            w
+        };
+        let w = program(DS_ADD_V1_V0);
+        let p = wave64(&w);
+        let at: Vec<_> = super::split_wave_barriers(&p)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(at.len(), 1);
+        assert!(
+            p.blocks[at[0].0].insts[at[0].1]
+                .name()
+                .starts_with("ds_read")
+        );
+        // A sum then an OR of one dword depends on the order: no barrier
+        // can order them there.
+        assert!(super::split_wave_barriers(&wave64(&program(DS_OR_V1_V0))).is_none());
+    }
+
     // ---- a wave64 program as halves of console waves ----
 
     const V_AND_V1_1_V0: u32 = 0x3602_0081; // v_and_b32 v1, 1, v0
@@ -13511,9 +13696,54 @@ mod tests {
         w.extend([0x0001_0102, RESTORE_EXEC, V_MOV_V2_S12]);
         w.extend(DS_WRITE_V1_V2);
         w.push(S_ENDPGM);
-        assert_eq!(halves(&w, 64), (Some(32), 1));
+        let l = lowered(&w, 64, true);
+        assert_eq!((l.wave_size, l.exchanges, l.barriers), (Some(32), 1, 1));
         assert_eq!(halves(&w, 16), (Some(32), 0));
         assert_eq!(lowered(&w, 64, false).wave_size, Some(64));
+    }
+
+    #[test]
+    fn the_halves_of_one_wave_meet_in_a_uniform_loop() {
+        // The sum taken twice, in a loop the wave counts in s10: every
+        // lane is there each pass, and the halves meet again after reading.
+        let mut w = vec![V_LSHLREV_V1_2_V0, V_MOV_V16_V0, 0xBE8A_0380]; // s_mov_b32 s10, 0
+        w.extend(WAVE_SUM_V16_S12);
+        w.extend([0x0001_0102, RESTORE_EXEC, V_MOV_V2_S12]);
+        w.extend(DS_WRITE_V1_V2);
+        w.extend([
+            0x810A_810A, // s_add_i32 s10, s10, 1
+            0xBF06_820A, // s_cmp_eq_u32 s10, 2
+            0xBF84_FFE6, // s_cbranch_scc0 -> the sum
+            S_ENDPGM,
+        ]);
+        let l = lowered(&w, 64, true);
+        assert_eq!((l.wave_size, l.exchanges, l.barriers), (Some(32), 1, 2));
+        // A group of several console waves: each counts its own passes.
+        assert_eq!(halves(&w, 128), (Some(64), 0));
+    }
+
+    #[test]
+    fn lanes_that_end_early_leave_the_rest_to_meet() {
+        // `if (id & 1) return;` then a write and a read of what another
+        // lane wrote: every lane still running is there.
+        let mut w = vec![V_LSHLREV_V1_2_V0, 0x3604_0081]; // v_and_b32 v2, 1, v0
+        w.extend([0xD4C2_0000, 0x0002_0480]); // v_cmp_eq_u32 s[0:1], 0, v2
+        w.extend([AND_SAVEEXEC_S2_S0, skip(4)]);
+        w.extend(DS_WRITE_V1_V0);
+        w.extend(DS_READ_V2_V1_4);
+        w.push(S_ENDPGM);
+        assert!(super::split_wave_barriers(&wave64(&w)).is_none());
+        let l = lowered(&w, 64, true);
+        assert_eq!((l.wave_size, l.split_barriers), (None, 1));
+        // The halves exchange only where no lane has left.
+        let mut w = vec![V_LSHLREV_V1_2_V0, V_MOV_V16_V0, 0x3604_0081];
+        w.extend([0xD4C2_0000, 0x0002_0480]);
+        w.extend([AND_SAVEEXEC_S2_S0, skip(23)]);
+        w.extend(WAVE_SUM_V16_S12);
+        w.extend([0x0001_0102, RESTORE_EXEC, V_MOV_V2_S12]);
+        w.extend(DS_WRITE_V1_V2);
+        w.push(S_ENDPGM);
+        assert_eq!(halves(&w, 64), (Some(64), 0));
     }
 
     #[test]
