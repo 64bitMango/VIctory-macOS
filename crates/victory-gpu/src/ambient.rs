@@ -11,7 +11,10 @@
 //! -9.75). The title's own lighting then applies it with the surfaces'
 //! colors. Raised, not added: the result is the next frame's history.
 //!
-//! `VICTORY_AMBIENT=<level>` sets it (0.6 by default, 0 for none); `off`
+//! The level and colour follow the sky the title draws for its reflections
+//! ([`follow`]; `VICTORY_AMBIENT_SKY=off` keeps the constant).
+//! `VICTORY_AMBIENT=<level>` sets the constant (0.6, 0 for none) and, unless
+//! `VICTORY_AMBIENT_SKY` is set too, has it used instead of the sky; `off`
 //! keeps the title's own output.
 //! shortcut: the same light everywhere, from everywhere; gone once rays run.
 
@@ -34,16 +37,23 @@ pub(crate) const LIGHT: (u8, u32) = (1, 176);
 /// title's resolve wrote; 0 is no indirect diffuse light at all.
 const DEFAULT: f32 = 0.6;
 
-/// The floor; `None` if off.
-pub(crate) fn level() -> Option<f32> {
-    static LEVEL: OnceLock<f32> = OnceLock::new();
-    let level = *LEVEL.get_or_init(|| {
+/// What `VICTORY_AMBIENT` gives: the level (negative for `off`), and
+/// whether it named one.
+fn set_level() -> (f32, bool) {
+    static LEVEL: OnceLock<(f32, bool)> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
         let set = std::env::var("VICTORY_AMBIENT").unwrap_or_default();
         if set.trim() == "off" {
-            return -1.0;
+            return (-1.0, false);
         }
-        set.trim().parse().ok().filter(|l: &f32| l.is_finite() && *l >= 0.0).unwrap_or(DEFAULT)
-    });
+        let named = set.trim().parse().ok().filter(|l: &f32| l.is_finite() && *l >= 0.0);
+        (named.unwrap_or(DEFAULT), named.is_some())
+    })
+}
+
+/// The floor; `None` if off.
+pub(crate) fn level() -> Option<f32> {
+    let (level, _) = set_level();
     (level >= 0.0).then_some(level)
 }
 
@@ -72,6 +82,131 @@ fn tint() -> [f32; 3] {
 
 /// The level and colour last read from `VICTORY_AMBIENT_FILE`, if any.
 static LIVE: std::sync::Mutex<Option<(f32, [f32; 3])>> = std::sync::Mutex::new(None);
+
+/// The program that writes the title's reflections for the last time in a
+/// frame, by the start of its name, and where it writes them (R9G9B9E5 as
+/// 32-bit integers): root parameter and place in its table. The lighting
+/// programs read that image next.
+///
+/// Without rays the reflections are the sky's, unoccluded, wherever a
+/// surface is glossy: indoors a wooden floor, a counter and glass tops wore
+/// a white glaze five to ten times brighter than anything in the room (the
+/// fork's run ciel1, 2026-11-25; it did not move with the ambient level).
+/// They are held to a part of the light around ([`keep`]).
+pub(crate) const REFLECTED: &[u8] = b"a title shader";
+pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
+
+/// The most a reflection may hold, as a part of the ambient light's level:
+/// `VICTORY_AMBIENT_REFLECT=<part>` (0.5 by default; 0 leaves the title's
+/// reflections alone); a ninth number in the file sets it in a running game.
+/// shortcut: stands in for what the title's traced reflections would see.
+static KEEP: std::sync::Mutex<Option<f32>> = std::sync::Mutex::new(None);
+
+/// The least a reflection holds, as a part of the light around: a tenth
+/// number in the file (0, the default, leaves dark reflections dark).
+/// shortcut: without rays, what should mirror the sky (still water) sees
+/// nothing and is black; this gives it a part of the ambient light instead.
+static LEAST: std::sync::Mutex<f32> = std::sync::Mutex::new(0.0);
+
+fn keep() -> f32 {
+    if let Some(live) = *KEEP.lock().unwrap_or_else(|e| e.into_inner()) {
+        return live;
+    }
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        std::env::var("VICTORY_AMBIENT_REFLECT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|k: &f32| k.is_finite() && *k >= 0.0)
+            .unwrap_or(0.5)
+    })
+}
+
+/// The program that draws the sky as the title reflects it, by the start of
+/// its name: a small image of the whole sky, in the light's own units.
+pub(crate) const SKY: &[u8] = b"a title shader";
+
+type Copy = std::sync::Arc<crate::resource::HostTexture>;
+
+/// The sky dome that program last drew into: the host copy, held, since
+/// the title's object may go at any time. Held too while the title draws no
+/// sky: the light stays what the dome last was.
+///
+/// The program draws twice a frame, on two lists recorded at once: the dome
+/// (128x128, R16G16B16A16_FLOAT) and another image of the sky (R11G11B10).
+/// Following whichever was recorded last made the light jump between the
+/// two, three times apart, from frame to frame (the fork's run don1,
+/// 2026-11-25).
+static SKY_IMAGE: std::sync::Mutex<Option<Copy>> = std::sync::Mutex::new(None);
+
+/// The sky program draws into the title texture `image`.
+pub(crate) fn sky_drawn(image: usize) {
+    if let Some(copy) = crate::resource::host_copy(image as This) {
+        hold_sky(&SKY_IMAGE, copy);
+    }
+}
+
+/// `copy` becomes the sky `held`, if it is the dome.
+fn hold_sky(held: &std::sync::Mutex<Option<Copy>>, copy: Copy) {
+    // SAFETY: a live resource.
+    let d = unsafe { copy.texture.GetDesc() };
+    // The host may have made the dome typeless (castable formats).
+    let dome = [DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_TYPELESS].contains(&d.Format);
+    if !dome || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        return;
+    }
+    let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
+    if !held.as_ref().is_some_and(|h| std::sync::Arc::ptr_eq(h, &copy)) {
+        *held = Some(copy);
+    }
+}
+
+/// The light follows the sky: its level and colour are worked out from the
+/// sky image's mean. Hand-set levels that looked right on the fork were
+/// 0.07 at night, 0.3 at dusk and 1.4 at noon, with sky means of 0.001 at
+/// night and 0.65 at dawn; one level for all hours either drowned the
+/// title's own shadows or left what the sun does not reach black. On by
+/// default; `VICTORY_AMBIENT_SKY=off` keeps the constant, and so does a
+/// level named by `VICTORY_AMBIENT` alone; `gain,least,power` sets it; a
+/// file of two or three numbers, or six or seven with the shading's, does
+/// so in a running game. Before the title has drawn a sky the constant
+/// stands.
+/// shortcut: the sky's mean stands in for the light the title's traced
+/// probes would gather; indoors it is the sky's too.
+static FOLLOW: std::sync::Mutex<Option<Option<[f32; 3]>>> = std::sync::Mutex::new(None);
+
+/// The power the level takes of the sky's mean unless set.
+const POWER: f32 = 0.4;
+
+/// Gain, least level and power: the level is `gain * mean^power + least`.
+/// The power is under one because the title's exposure follows the light:
+/// the sky's mean goes from 0.001 at night to several units by day, the
+/// levels that look right only from 0.07 to 1.4.
+fn follow() -> Option<[f32; 3]> {
+    if let Some(live) = *FOLLOW.lock().unwrap_or_else(|e| e.into_inner()) {
+        return live;
+    }
+    static SET: OnceLock<Option<[f32; 3]>> = OnceLock::new();
+    *SET.get_or_init(|| follow_set(std::env::var("VICTORY_AMBIENT_SKY").ok().as_deref(), set_level().1))
+}
+
+/// [`follow`] for what `VICTORY_AMBIENT_SKY` holds, `level_named` if
+/// `VICTORY_AMBIENT` names a level.
+fn follow_set(set: Option<&str>, level_named: bool) -> Option<[f32; 3]> {
+    match set.map(str::trim) {
+        Some("off") => return None,
+        // A level asked for is the level: the fixed light, as before.
+        None if level_named => return None,
+        _ => {}
+    }
+    let mut follow = [0.36, 0.05, POWER];
+    for (to, v) in follow.iter_mut().zip(set.unwrap_or_default().split(',')) {
+        if let Ok(v) = v.trim().parse() {
+            *to = v;
+        }
+    }
+    Some(follow)
+}
 
 /// Where the resolve reads the scene's depth (reversed, D32 with stencil):
 /// root parameter and place in its table.
@@ -119,9 +254,33 @@ fn live_level() -> Option<f32> {
                     .split_whitespace()
                     .filter_map(|v| v.parse().ok())
                     .collect();
-                if let [level, r, g, b, ref rest @ ..] = read[..] {
+                // Two, three, six or seven numbers: gain, least, a power if
+                // their count is odd, then the shading's four.
+                if let [gain, least, ref rest @ ..] = read[..]
+                    && matches!(rest.len(), 0 | 1 | 4 | 5)
+                {
+                    let (power, rest) = match rest.len() % 2 {
+                        1 => (rest[0], &rest[1..]),
+                        _ => (POWER, rest),
+                    };
                     if let [s, r, n, t] = rest[..] {
                         *SHADE.lock().unwrap_or_else(|e| e.into_inner()) = Some([s, r, n, t]);
+                    }
+                    let new = Some(Some([gain, least, power]));
+                    let mut follow = FOLLOW.lock().unwrap_or_else(|e| e.into_inner());
+                    if *follow != new {
+                        tracing::info!(gain, least, power, "ambient light follows the sky, set from the file");
+                        *follow = new;
+                    }
+                } else if let [level, r, g, b, ref rest @ ..] = read[..] {
+                    *FOLLOW.lock().unwrap_or_else(|e| e.into_inner()) = Some(None);
+                    if let [s, r, n, t, ref last @ ..] = rest[..] {
+                        *SHADE.lock().unwrap_or_else(|e| e.into_inner()) = Some([s, r, n, t]);
+                        if let [k, ref floor @ ..] = last[..] {
+                            *KEEP.lock().unwrap_or_else(|e| e.into_inner()) = Some(k.max(0.0));
+                            *LEAST.lock().unwrap_or_else(|e| e.into_inner()) =
+                                floor.first().map_or(0.0, |f| f.max(0.0));
+                        }
                     }
                     let new = Some((level.max(0.0), [r, g, b]));
                     let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
@@ -137,13 +296,57 @@ fn live_level() -> Option<f32> {
     LIVE.lock().unwrap_or_else(|e| e.into_inner()).map(|(level, _)| level)
 }
 
+/// Works the light out from the sky, once for the whole image: its three
+/// channels into the three texels of `around`.
+///
+/// The fork's pass takes the sky's mean again at every texel of the light
+/// (64 reads each, at 2560x1440); one group of one thread does it here.
+/// The sky's size comes in the constants (no `GetDimensions` under Wine).
+const SKY_SOURCE: &str = r#"
+cbuffer Sky : register(b0) {
+    float gain; float least; float power;
+    uint sw; uint sh;
+};
+Texture2DArray<float4> sky : register(t0);
+RWTexture2D<float> around : register(u0);
+[numthreads(1, 1, 1)]
+void main(uint3 at : SV_DispatchThreadID) {
+    float3 sum = 0.0;
+    const int N = 8;
+    for (int y = 0; y < N; y++)
+        for (int x = 0; x < N; x++) {
+            // The sun's own texels are held down: it lights by itself.
+            float3 there = sky.Load(int4((x * 2 + 1) * sw / (N * 2), (y * 2 + 1) * sh / (N * 2), 0, 0)).rgb;
+            sum += clamp(there, 0.0, 8.0);
+        }
+    float3 mean = sum / (N * N);
+    float m = dot(mean, float3(0.2126, 0.7152, 0.0722));
+    // The sky's colour, half washed out (the ground lights too); a dark
+    // sky has none worth following.
+    const float3 NIGHT = float3(0.6, 0.75, 1.0);
+    float3 hue = lerp(NIGHT, lerp(float3(1.0, 1.0, 1.0), mean / max(m, 1e-6), 0.5), saturate(m / 0.05));
+    float3 is = hue * (gain * pow(max(m, 0.0), power) + least);
+    around[uint2(0, 0)] = is.r;
+    around[uint2(1, 0)] = is.g;
+    around[uint2(2, 0)] = is.b;
+}
+"#;
+
 const SOURCE: &str = r#"
 cbuffer Floor : register(b0) {
     float level; float3 tint;
     float strength; float radius; float near; float tan_y;
     uint width; uint height;
+    uint follows;
+    float held; float floor_part;
 };
 RWTexture2D<uint> light : register(u0);
+// The light worked out from the sky (`SKY_SOURCE`), when it follows it.
+RWTexture2D<float> around : register(u1);
+float3 from_around() {
+    if (follows == 0) return tint * level;
+    return float3(around[uint2(0, 0)], around[uint2(1, 0)], around[uint2(2, 0)]);
+}
 Texture2D<float> depth : register(t0);
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
 float3 seen(int2 p, float2 size) {
@@ -198,17 +401,40 @@ void main(uint3 at : SV_DispatchThreadID) {
     // What the resolve left is not kept: without rays its inputs are never
     // written and it holds whatever their memory did (bright magenta on
     // translucent surfaces, blocks of colours indoors: run v6, 2026-11-25).
+    if (held > 0.0) {
+        // Reflections: no brighter than a part of the light around, and no
+        // darker than another.
+        const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
+        float3 seen_there = unpack(light[at.xy]);
+        float3 all_round = from_around();
+        float most = dot(all_round, LUMA) * held;
+        float has = dot(seen_there, LUMA);
+        float3 floor_light = all_round * floor_part;
+        if (has > most) light[at.xy] = pack(seen_there * (most / has));
+        else if (has < dot(floor_light, LUMA)) light[at.xy] = pack(floor_light);
+        return;
+    }
     float open = strength > 0.0 ? open_to_light(int2(at.xy), float2(width, height)) : 1.0;
-    light[at.xy] = pack(tint * level * open);
+    light[at.xy] = pack(from_around() * open);
 }
 "#;
 
 /// Views, used in turn: more than the passes of every list in flight.
 const SLOTS: u32 = 1024;
 
+/// Views a pass takes: the light, the light from the sky and the depth for
+/// the main program, then the light from the sky and the sky for the one
+/// that works it out.
+const VIEWS: u32 = 5;
+
 struct Pass {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// The program that works the light out from the sky.
+    sky: (ID3D12RootSignature, ID3D12PipelineState),
+    /// What it writes: three texels of 32-bit floats, always in the
+    /// unordered-access state (each list writes it before it reads it).
+    around: ID3D12Resource,
     views: ID3D12DescriptorHeap,
     step: u32,
     next: AtomicU32,
@@ -223,20 +449,44 @@ unsafe impl Sync for Pass {}
 /// `[RootSignature]`.
 fn make(device: &ID3D12Device) -> windows::core::Result<Pass> {
     use crate::compute::{Param, srv, uav};
-    let params = [Param::Constants { register: 0, count: 10 }, Param::Table(&[uav(0, 1), srv(0, 1)])];
+    let params = [Param::Constants { register: 0, count: 13 }, Param::Table(&[uav(0, 2), srv(0, 1)])];
     let (root, pso) = crate::compute::pipeline(SOURCE, s!("ambient"), 0, &params)?;
+    let params = [Param::Constants { register: 0, count: 5 }, Param::Table(&[uav(0, 1), srv(0, 1)])];
+    let sky = crate::compute::pipeline(SKY_SOURCE, s!("ambient sky"), 0, &params)?;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: 3,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_R32_FLOAT,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let mut around: Option<ID3D12Resource> = None;
     // SAFETY: plain creations.
     unsafe {
         let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         let views = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: kind,
-            NumDescriptors: SLOTS * 2,
+            NumDescriptors: SLOTS * VIEWS,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
             NodeMask: 0,
         })?;
+        device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            None,
+            &mut around,
+        )?;
         Ok(Pass {
             root,
             pso,
+            sky,
+            around: around.ok_or_else(windows::core::Error::empty)?,
             views,
             step: device.GetDescriptorHandleIncrementSize(kind),
             next: AtomicU32::new(0),
@@ -264,7 +514,38 @@ pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
     let Some(light) = crate::resource::host_resource(light) else {
         return false;
     };
-    record(list, &light, depth, level)
+    let sky = sky();
+    record(list, &light, depth, level, sky.as_ref().map(|(copy, f)| (copy, *f)), None)
+}
+
+/// The sky dome with its gain, least level and power, if the light follows
+/// it and the title has drawn it.
+fn sky() -> Option<(Copy, [f32; 3])> {
+    let follow = follow()?;
+    Some((SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone()?, follow))
+}
+
+/// Holds the reflections in `image` to a part of the ambient light, in
+/// `list`, after the program that wrote them last. Whether it recorded
+/// anything (the list's bindings are then ours).
+pub(crate) fn hold(list: &HostList, image: This) -> bool {
+    let (held, Some(level)) = (keep(), level()) else {
+        return false;
+    };
+    if held <= 0.0 {
+        return false;
+    }
+    let Some(image) = crate::resource::host_resource(image) else {
+        return false;
+    };
+    let floor = *LEAST.lock().unwrap_or_else(|e| e.into_inner());
+    let sky = sky();
+    if !record(list, &image, None, level, sky.as_ref().map(|(copy, f)| (copy, *f)), Some([held, floor])) {
+        return false;
+    }
+    static HELD: std::sync::Once = std::sync::Once::new();
+    HELD.call_once(|| tracing::info!(held, floor, "reflections held to the ambient light"));
+    true
 }
 
 /// The title's indirect diffuse light image the pass last wrote
@@ -282,24 +563,67 @@ fn pass() -> Option<&'static Pass> {
     .as_ref()
 }
 
-/// Records the pass over the host texture `light` at `level`.
-fn record(list: &HostList, light: &ID3D12Resource, depth: Option<This>, level: f32) -> bool {
+/// Records the pass over the host texture `light`: at `level`, or as the
+/// held `sky` gives with its gain, least level and power. With
+/// `reflections`, the image is the title's reflections instead, kept
+/// between the second and the first of these parts of that light.
+fn record(
+    list: &HostList,
+    light: &ID3D12Resource,
+    depth: Option<This>,
+    level: f32,
+    sky: Option<(&Copy, [f32; 3])>,
+    reflections: Option<[f32; 2]>,
+) -> bool {
     let (Some(pass), Some(host)) = (pass(), host()) else {
         return false;
     };
     // SAFETY: a live resource.
     let d = unsafe { light.GetDesc() };
-    static ONCE: std::sync::Once = std::sync::Once::new();
+    // Said once for the light and once for the reflections.
+    static SAID: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
+    let once = &SAID[usize::from(reflections.is_some())];
     // A texture other views read as R9G9B9E5 may be made typeless on the
     // host (castable formats): a 32-bit unsigned view of it is the same.
     if d.Format != DXGI_FORMAT_R32_UINT && d.Format != DXGI_FORMAT_R32_TYPELESS {
-        ONCE.call_once(|| tracing::warn!(format = d.Format.0, "no ambient light: another format"));
+        once.call_once(|| {
+            tracing::warn!(format = d.Format.0, reflections = reflections.is_some(), "no ambient light: another format")
+        });
         return false;
     }
-    ONCE.call_once(|| {
-        tracing::info!(level, width = d.Width, height = d.Height, "ambient light");
+    once.call_once(|| {
+        tracing::info!(
+            level,
+            follows_sky = sky.is_some(),
+            reflections = reflections.is_some(),
+            width = d.Width,
+            height = d.Height,
+            "ambient light"
+        );
     });
-    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % SLOTS * 2;
+    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % SLOTS * VIEWS;
+    // The sky's size, and it made readable: the list holds the copy.
+    let sky = sky.map(|(copy, f)| {
+        // SAFETY: a live resource.
+        let d = unsafe { copy.texture.GetDesc() };
+        static SEEN: std::sync::Once = std::sync::Once::new();
+        SEEN.call_once(|| {
+            tracing::info!(
+                format = d.Format.0,
+                width = d.Width,
+                height = d.Height,
+                slices = d.DepthOrArraySize,
+                "the sky image the ambient light would follow"
+            );
+            tracing::info!(gain = f[0], least = f[1], power = f[2], "ambient light follows the sky");
+        });
+        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0;
+        if let Some(barrier) = list.move_texture(copy, read as u32) {
+            // SAFETY: an open list and a live texture the list holds.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+        (&copy.texture, f, [d.Width as u32, d.Height])
+    });
     list.keep(light);
     // The depth the resolve just read, in the state it read it in; of the
     // light's size, or the shading is left out.
@@ -329,6 +653,16 @@ fn record(list: &HostList, light: &ID3D12Resource, depth: Option<This>, level: f
         };
         host.device
             .CreateUnorderedAccessView(light, None::<&ID3D12Resource>, Some(&view), at);
+        let nth = |n: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at.ptr + (n * pass.step) as usize };
+        let worked_out = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_FLOAT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        for n in [1, 3] {
+            host.device
+                .CreateUnorderedAccessView(&pass.around, None::<&ID3D12Resource>, Some(&worked_out), nth(n));
+        }
         let seen = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -337,9 +671,31 @@ fn record(list: &HostList, light: &ID3D12Resource, depth: Option<This>, level: f
                 Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
             },
         };
-        let beside = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at.ptr + pass.step as usize };
-        host.device.CreateShaderResourceView(depth.as_ref(), Some(&seen), beside);
+        host.device.CreateShaderResourceView(depth.as_ref(), Some(&seen), nth(2));
         l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+        let table = |n: u32| D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: gpu.ptr + u64::from((slot + n) * pass.step),
+        };
+        if let Some((sky, [gain, least, power], [sw, sh])) = sky {
+            // One slice of the dome, in its float format whatever the host
+            // made it (typeless, if other views cast it).
+            let dome = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() },
+                },
+            };
+            host.device.CreateShaderResourceView(sky, Some(&dome), nth(4));
+            l.SetComputeRootSignature(&pass.sky.0);
+            l.SetPipelineState(&pass.sky.1);
+            let constants = [gain.to_bits(), least.to_bits(), power.to_bits(), sw, sh];
+            l.SetComputeRoot32BitConstants(0, 5, constants.as_ptr().cast(), 0);
+            l.SetComputeRootDescriptorTable(1, table(3));
+            l.Dispatch(1, 1, 1);
+            uav_barrier(l);
+        }
         l.SetComputeRootSignature(&pass.root);
         l.SetPipelineState(&pass.pso);
         let (width, height) = (d.Width as u32, d.Height);
@@ -347,18 +703,16 @@ fn record(list: &HostList, light: &ID3D12Resource, depth: Option<This>, level: f
         let level = live_level().unwrap_or(level);
         let [strength, radius, near, tan_y] = shade();
         let strength = if depth.is_some() { strength } else { 0.0 };
+        let [held, floor] = reflections.unwrap_or([0.0, 0.0]);
         let constants = [
             level.to_bits(), r.to_bits(), g.to_bits(), b.to_bits(),
             strength.to_bits(), radius.to_bits(), near.to_bits(), tan_y.to_bits(),
             width, height,
+            u32::from(sky.is_some()),
+            held.to_bits(), floor.to_bits(),
         ];
-        l.SetComputeRoot32BitConstants(0, 10, constants.as_ptr().cast(), 0);
-        l.SetComputeRootDescriptorTable(
-            1,
-            D3D12_GPU_DESCRIPTOR_HANDLE {
-                ptr: gpu.ptr + u64::from(slot * pass.step),
-            },
-        );
+        l.SetComputeRoot32BitConstants(0, 13, constants.as_ptr().cast(), 0);
+        l.SetComputeRootDescriptorTable(1, table(0));
         l.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
     }
     uav_barrier(l);
@@ -367,62 +721,69 @@ fn record(list: &HostList, light: &ID3D12Resource, depth: Option<This>, level: f
 
 #[cfg(test)]
 mod tests {
-    /// The pass compiles with the system's compiler (Wine's too) and the
-    /// host takes it.
-    #[test]
-    fn ambient_pass_builds() {
-        let Some(host) = crate::host::host() else {
-            return;
-        };
-        super::make(&host.device).expect("the ambient pass");
-    }
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
 
-    /// The pass writes the constant, packed as R9G9B9E5, over the whole
-    /// image (also past a multiple of its 8x8 groups).
-    #[test]
-    fn ambient_pass_writes_the_constant() {
-        use windows::Win32::Graphics::Direct3D12::*;
-        use windows::Win32::Graphics::Dxgi::Common::*;
-        let Some(host) = crate::host::host() else {
-            return;
-        };
-        let (width, height) = (20u32, 12u32);
+    use crate::host::Host;
+
+    /// A texture of `format` for `flags`, in `state`.
+    fn texture(
+        host: &Host,
+        (width, height, slices): (u32, u32, u16),
+        format: DXGI_FORMAT,
+        flags: D3D12_RESOURCE_FLAGS,
+        state: D3D12_RESOURCE_STATES,
+    ) -> ID3D12Resource {
         let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             Width: u64::from(width),
             Height: height,
-            DepthOrArraySize: 1,
+            DepthOrArraySize: slices,
             MipLevels: 1,
-            Format: DXGI_FORMAT_R32_UINT,
+            Format: format,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            Flags: flags,
             ..Default::default()
         };
         let mut texture: Option<ID3D12Resource> = None;
         // SAFETY: plain creation.
         unsafe {
             host.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    None,
-                    &mut texture,
-                )
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut texture)
                 .unwrap();
         }
-        let texture = texture.unwrap();
-        let pitch = 256u32;
-        let (out, data) = host.shared_buffer(u64::from(pitch * height)).unwrap();
+        texture.unwrap()
+    }
+
+    /// A light image as the title's, in the state its programs leave it in.
+    fn light(host: &Host, width: u32, height: u32) -> ID3D12Resource {
+        let flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        texture(host, (width, height, 1), DXGI_FORMAT_R32_UINT, flags, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+    }
+
+    /// A sky of one colour in `format`, as a host copy the title drew.
+    fn sky(host: &Host, format: DXGI_FORMAT, slices: u16, colour: [f32; 3]) -> super::Copy {
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        let sky = texture(host, (128, 128, slices), format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, state);
         let list = host.new_list().unwrap();
-        assert!(super::record(&list, &texture, None, 0.6));
+        let [r, g, b] = colour;
+        // SAFETY: an open list and a live render target in that state.
+        unsafe { list.list.ClearRenderTargetView(host.rtv(&sky, None), &[r, g, b, 1.0], None) };
+        list.close();
+        host.execute(&[&list]);
+        std::sync::Arc::new(crate::resource::HostTexture::new(sky, state.0 as u32, Vec::new()))
+    }
+
+    /// Runs `list` after reading `image` back in it: its texels.
+    fn texels(host: &Host, list: &crate::host::HostList, image: &ID3D12Resource, width: u32, height: u32) -> Vec<u32> {
+        let pitch = (4 * width).next_multiple_of(256);
+        let (out, data) = host.shared_buffer(u64::from(pitch * height)).unwrap();
         // SAFETY: an open list, live resources; the mapped buffer is read
         // after the list ran.
         unsafe {
             list.list.ResourceBarrier(&[
-                crate::host::transition(&texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                crate::host::transition(image, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
                 crate::host::transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
             ]);
             let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -442,22 +803,211 @@ mod tests {
                 },
             };
             let from = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&texture),
+                pResource: std::mem::transmute_copy(image),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
             };
             list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                image,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
             list.close();
-            host.execute(&[&list]);
-            // 0.6 * (1, 0.98, 0.94): exponent 15 (scale 2^9), mantissas
-            // 307, 301, 289.
-            let want = 307 | 301 << 9 | 289 << 18 | 15 << 27;
+            host.execute(&[list]);
+            let mut all = Vec::new();
             for y in 0..height {
                 for x in 0..width {
-                    let v = data.cast::<u8>().add((y * pitch + 4 * x) as usize).cast::<u32>().read_volatile();
-                    assert_eq!(v, want, "texel {x},{y}");
+                    all.push(data.add((y * pitch + 4 * x) as usize).cast::<u32>().read_volatile());
                 }
             }
+            all
         }
+    }
+
+    /// R9G9B9E5 as the shader packs it.
+    fn pack(c: [f32; 3]) -> u32 {
+        let most = c[0].max(c[1]).max(c[2]);
+        let mut e = (most.max(1e-9).log2().floor() as i32 + 16).clamp(0, 31);
+        if most * 2f32.powi(24 - e) >= 511.5 {
+            e = (e + 1).min(31);
+        }
+        let m = c.map(|c| ((c * 2f32.powi(24 - e) + 0.5) as u32).min(511));
+        m[0] | m[1] << 9 | m[2] << 18 | (e as u32) << 27
+    }
+
+    fn unpack(v: u32) -> [f32; 3] {
+        [v & 511, v >> 9 & 511, v >> 18 & 511].map(|m| m as f32 * 2f32.powi((v >> 27) as i32 - 24))
+    }
+
+    /// The light the sky program works out from a sky of one colour.
+    fn from_sky(colour: [f32; 3], [gain, least, power]: [f32; 3]) -> [f32; 3] {
+        let mean = colour.map(|c| c.clamp(0.0, 8.0));
+        let m = 0.2126 * mean[0] + 0.7152 * mean[1] + 0.0722 * mean[2];
+        let night = [0.6, 0.75, 1.0];
+        let by = (m / 0.05).clamp(0.0, 1.0);
+        let level = gain * m.max(0.0).powf(power) + least;
+        [0, 1, 2].map(|i| {
+            let washed = 1.0 + (mean[i] / m.max(1e-6) - 1.0) * 0.5;
+            (night[i] + (washed - night[i]) * by) * level
+        })
+    }
+
+    /// Every texel of `all` holds `want`, to the format's last step and a
+    /// little of the host's `pow`.
+    fn assert_light(all: &[u32], want: [f32; 3], what: &str) {
+        for (at, &v) in all.iter().enumerate() {
+            let has = unpack(v);
+            for i in 0..3 {
+                assert!(
+                    (has[i] - want[i]).abs() <= want[i] * 0.01 + 1e-4,
+                    "{what}: texel {at} holds {has:?}, not {want:?}"
+                );
+            }
+        }
+    }
+
+    /// The passes compile with the system's compiler (Wine's too) and the
+    /// host takes them.
+    #[test]
+    fn ambient_pass_builds() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        super::make(&host.device).expect("the ambient pass");
+    }
+
+    /// The pass writes the constant, packed as R9G9B9E5, over the whole
+    /// image (also past a multiple of its 8x8 groups).
+    #[test]
+    fn ambient_pass_writes_the_constant() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (width, height) = (20u32, 12u32);
+        let image = light(host, width, height);
+        let list = host.new_list().unwrap();
+        assert!(super::record(&list, &image, None, 0.6, None, None));
+        // 0.6 * (1, 0.98, 0.94): exponent 15 (scale 2^9), mantissas
+        // 307, 301, 289.
+        let want = 307 | 301 << 9 | 289 << 18 | 15 << 27;
+        assert_eq!(pack([0.6, 0.6 * 0.98, 0.6 * 0.94]), want);
+        for (at, v) in texels(host, &list, &image, width, height).into_iter().enumerate() {
+            assert_eq!(v, want, "texel {at}");
+        }
+    }
+
+    /// With a sky the light is `gain * mean^power + least` in the sky's
+    /// hue, half washed out, whatever the level: by day, and bluish under a
+    /// dark sky; the sun's texels count for 8 at most; a dome that is an
+    /// array or typeless on the host is read the same.
+    #[test]
+    fn ambient_pass_follows_the_sky() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (width, height) = (20u32, 12u32);
+        let follow = [0.36, 0.05, 0.4];
+        let float = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        for (colour, format, slices) in [
+            ([1.0, 0.5, 0.25], float, 1),
+            ([0.001, 0.001, 0.002], float, 1),
+            ([100.0, 50.0, 2.0], float, 1),
+            ([0.25, 0.5, 1.0], float, 2),
+            ([0.5, 0.5, 0.25], DXGI_FORMAT_R16G16B16A16_TYPELESS, 1),
+        ] {
+            let image = light(host, width, height);
+            let dome = sky(host, format, slices, colour);
+            let list = host.new_list().unwrap();
+            assert!(super::record(&list, &image, None, 0.6, Some((&dome, follow)), None));
+            let all = texels(host, &list, &image, width, height);
+            assert_light(&all, from_sky(colour, follow), &format!("sky {colour:?} in {format:?} x{slices}"));
+        }
+        // A hand check of the first: 0.36 * 0.58825^0.4 + 0.05 = 0.3412.
+        let has = from_sky([1.0, 0.5, 0.25], follow);
+        assert!((has[1] - 0.3412 * (1.0 + 0.5 / 0.58825) / 2.0).abs() < 1e-3, "{has:?}");
+    }
+
+    /// The dome is held: another image the sky program draws does not take
+    /// its place, and with no sky drawn since (and the title's own object
+    /// gone) the light stays what the dome gave, list after list.
+    #[test]
+    fn ambient_pass_holds_the_sky() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (width, height) = (20u32, 12u32);
+        let (colour, follow) = ([0.75, 0.5, 0.25], [0.36, 0.05, 0.4]);
+        let held = std::sync::Mutex::new(None);
+        let dome = sky(host, DXGI_FORMAT_R16G16B16A16_FLOAT, 1, colour);
+        let dome_at = std::sync::Arc::as_ptr(&dome);
+        super::hold_sky(&held, dome);
+        // The sky's other image, three times brighter.
+        super::hold_sky(&held, sky(host, DXGI_FORMAT_R11G11B10_FLOAT, 1, colour.map(|c| c * 3.0)));
+        let image = light(host, width, height);
+        for frame in 0..3 {
+            let dome = held.lock().unwrap().clone().expect("a held dome");
+            assert_eq!(std::sync::Arc::as_ptr(&dome), dome_at);
+            let list = host.new_list().unwrap();
+            assert!(super::record(&list, &image, None, 0.6, Some((&dome, follow)), None));
+            let all = texels(host, &list, &image, width, height);
+            assert_light(&all, from_sky(colour, follow), &format!("frame {frame}"));
+        }
+    }
+
+    /// Reflections brighter than a part of the light around are brought
+    /// down to it in their own colour, darker ones than the least part are
+    /// given it, and those between are left: against the constant, and
+    /// against the light a sky gives.
+    #[test]
+    fn reflections_are_held_to_the_ambient_light() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (width, height) = (20u32, 12u32);
+        let tint = [1.0, 0.98, 0.94];
+        let follow = [0.36, 0.05, 0.4];
+        let dome = sky(host, DXGI_FORMAT_R16G16B16A16_FLOAT, 1, [1.0, 0.5, 0.25]);
+        let luma = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        // What the image holds before, as a level of the tint; the most and
+        // the least part; what it holds after, as a part of the light.
+        for (before, [most, least], after) in [
+            (4.0, [0.5, 0.0], Some(0.5)),
+            (0.0, [0.5, 0.25], Some(0.25)),
+            (0.0, [0.5, 0.0], None),
+            (0.2, [0.9, 0.1], None),
+        ] {
+            for sky in [None, Some((&dome, follow))] {
+                let image = light(host, width, height);
+                let list = host.new_list().unwrap();
+                // The reflections the title left: a constant of ours.
+                assert!(super::record(&list, &image, None, before, None, None));
+                assert!(super::record(&list, &image, None, 0.6, sky, Some([most, least])));
+                let around = sky.map_or(tint.map(|t| t * 0.6), |_| from_sky([1.0, 0.5, 0.25], follow));
+                let was = tint.map(|t| t * before);
+                let want = match after {
+                    // Brought down: its own colour at the light's brightness.
+                    Some(part) if before > 0.0 => was.map(|c| c * luma(around) * part / luma(was)),
+                    Some(part) => around.map(|c| c * part),
+                    None => was,
+                };
+                let all = texels(host, &list, &image, width, height);
+                let what = format!("{before} held to {most} and {least}, sky {}", sky.is_some());
+                assert_light(&all, want, &what);
+            }
+        }
+    }
+
+    /// `VICTORY_AMBIENT_SKY`: on unless `off`, its numbers over the
+    /// defaults; a level named by `VICTORY_AMBIENT` alone keeps the constant.
+    #[test]
+    fn the_sky_is_followed_unless_a_level_is_named() {
+        assert_eq!(super::follow_set(None, false), Some([0.36, 0.05, 0.4]));
+        assert_eq!(super::follow_set(None, true), None);
+        assert_eq!(super::follow_set(Some("off"), false), None);
+        assert_eq!(super::follow_set(Some(" off "), true), None);
+        assert_eq!(super::follow_set(Some(""), true), Some([0.36, 0.05, 0.4]));
+        assert_eq!(super::follow_set(Some("0.5"), false), Some([0.5, 0.05, 0.4]));
+        assert_eq!(super::follow_set(Some("0.5, 0.1,0.3"), true), Some([0.5, 0.1, 0.3]));
     }
 }
