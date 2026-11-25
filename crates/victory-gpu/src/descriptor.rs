@@ -641,7 +641,25 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
+    // A view recorded before (the title records the same views again and
+    // again, into other slots) is only looked up: readers share the table,
+    // and the recording threads took turns at it. Its record is written
+    // with the table held, as below: its generation is the entry's own
+    // then (`forget` holds the table alone).
+    if record_shared() {
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(&i) = views.index.get(&view) {
+            let generation = views.list[i as usize].1;
+            // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+            unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+            drop(views);
+            #[cfg(windows)]
+            mirror(handle);
+            return;
+        }
+    }
     let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+    // Looked up again: another thread may have entered it meanwhile.
     let i = match views.index.get(&view) {
         Some(&i) => i,
         None => {
@@ -669,6 +687,17 @@ fn record(handle: u64, view: View) {
     drop(views);
     #[cfg(windows)]
     mirror(handle);
+}
+
+/// Whether [`record`] looks a view up with the table shared before it
+/// takes it alone to enter a new one: unless `VICTORY_RECORD_SHARED=0`.
+fn record_shared() -> bool {
+    #[cfg(test)]
+    if tests::RECORD_ALONE.with(|alone| alone.get()) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_RECORD_SHARED"))
 }
 
 /// The title released `resource`: the views naming it go stale.
@@ -1028,6 +1057,9 @@ pub(crate) mod tests {
         /// This thread asks the view entries themselves whether records are
         /// current (as `VICTORY_SLOT_GENERATIONS=0`).
         pub(crate) static FROM_ENTRIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// This thread takes the views table alone for every record (as
+        /// `VICTORY_RECORD_SHARED=0`).
+        pub(crate) static RECORD_ALONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// This thread holds the heaps' lock alone wherever it takes it (as
         /// `VICTORY_HEAPS_SHARED=0`).
         pub(crate) static HEAPS_ALONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1093,6 +1125,53 @@ pub(crate) mod tests {
         (0..32).for_each(|k| forget(resource(k)));
         assert!(generations_match());
         assert_eq!(both(&records), [false; 52]);
+    }
+
+    /// Threads record views of the same few resources into slots of their
+    /// own while others release those resources: a slot then reads back as
+    /// the view its thread recorded there or as nothing (its resource
+    /// released since), never as another view, and the generations kept
+    /// alone stay the entries' own. With the table shared for views
+    /// recorded before, and taken alone for each.
+    #[test]
+    fn views_recorded_and_released_from_several_threads_read_back_as_recorded() {
+        const THREADS: usize = 6;
+        const ROUNDS: usize = if cfg!(debug_assertions) { 20_000 } else { 200_000 };
+        // Resources no other test names.
+        let resource = |k: usize| 0x5eed_7000_0000 + 0x100 * k;
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                scope.spawn(move || {
+                    RECORD_ALONE.with(|alone| alone.set(t % 3 == 2));
+                    let slots = [0u64; 4 * 8];
+                    let at = |i: usize| slots.as_ptr() as u64 + 32 * i as u64;
+                    let mut seed = 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(t as u64 + 1);
+                    for _ in 0..ROUNDS {
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let (k, i, what) = ((seed >> 33) as usize % 8, (seed >> 40) as usize % 8, seed >> 60);
+                        if what < 3 {
+                            forget(resource(k));
+                            continue;
+                        }
+                        // With a description or without: two views a resource.
+                        let desc = (what & 1 == 1).then_some([k as u32; 10]);
+                        let desc_ptr = desc.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
+                        create_srv(std::ptr::null(), resource(k) as This, desc_ptr, at(i));
+                        match view(at(i)) {
+                            None => {}
+                            Some(found) => assert_eq!(found, View::Shader(resource(k), desc)),
+                        }
+                        // SAFETY: a slot of `slots`.
+                        let record = unsafe { (at(i) as *const [u32; 3]).read_unaligned() };
+                        assert_eq!(record[0], VIEW_TAG);
+                        assert!(record[2] != 0, "generations start at 1");
+                    }
+                });
+            }
+        });
+        assert!(generations_match());
+        (0..8).for_each(|k| forget(resource(k)));
+        assert!(generations_match());
     }
 
     /// What newer titles pass; tests use it throughout, so that reading the
