@@ -1407,9 +1407,20 @@ pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
 /// Draw state the host has no use for (root signatures: ours come with
-/// the pipeline; depth bounds, depth order and shading rate hints): any
-/// arguments, nothing returned.
+/// the pipeline; depth order and shading rate hints): any arguments,
+/// nothing returned.
 extern "system" fn ignored_state(_: This) {}
+
+/// Depth bounds `(min, max)`.
+/// shortcut: not passed on (host pipelines leave the test out,
+/// `pipeline::host`); the first call says so, and the host's support for
+/// the test is logged when its device is made.
+extern "system" fn depth_bounds(_: This, min: f32, max: f32) {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        tracing::info!(min, max, "the title sets depth bounds, which the host is not given")
+    });
+}
 
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
@@ -1867,7 +1878,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (52, clear_rtv as *const ()),                 // 0x1a0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, ignored_state as *const ()),             // 0x220 depth bounds
+    (68, depth_bounds as *const ()),              // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait32 as *const ()),                    // 0x238 (newer 0x248)

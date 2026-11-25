@@ -255,6 +255,22 @@ fn create() -> windows::core::Result<Host> {
         let cpu_view_size =
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         tracing::info!("host D3D12 device ready");
+        // The depth bounds test, which host pipelines leave out so far
+        // (`pipeline::host`, subobject 21; the list's own call is not
+        // passed on): whether this host could run it.
+        let mut options2 = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+        let asked = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS2,
+                (&raw mut options2).cast(),
+                size_of_val(&options2) as u32,
+            )
+            .is_ok();
+        tracing::info!(
+            supported = asked && options2.DepthBoundsTestSupported.as_bool(),
+            answered = asked,
+            "host depth bounds test support (D3D12_OPTIONS2.DepthBoundsTestSupported)"
+        );
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).

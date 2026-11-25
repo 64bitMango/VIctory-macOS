@@ -158,6 +158,14 @@ impl GraphicsState {
                     // pipeline uses the plain description); bring it back
                     // with a stream if a title enables it.
                     let d = data.cast::<D3D12_DEPTH_STENCIL_DESC1>().read_unaligned();
+                    if d.DepthBoundsTestEnable.as_bool() {
+                        static SAID: std::sync::Once = std::sync::Once::new();
+                        SAID.call_once(|| {
+                            tracing::warn!(
+                                "a pipeline enables the depth bounds test, which its host pipeline leaves out: its draws pass at every depth"
+                            )
+                        });
+                    }
                     self.depth = D3D12_DEPTH_STENCIL_DESC {
                         DepthEnable: d.DepthEnable,
                         DepthWriteMask: d.DepthWriteMask,
