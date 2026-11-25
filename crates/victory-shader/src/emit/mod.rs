@@ -400,6 +400,15 @@ pub struct Options {
     /// whose pixel shader reads that row (D3DMetal: "XPC_ERROR_CONNECTION_
     /// INTERRUPTED", the pipeline a no-op).
     pub mesh_stores_last: bool,
+    /// Mesh: when Metal would count more output than it allows
+    /// (`container::metal_mesh_bytes` over `METAL_MESH_BYTES`), the vertex
+    /// outputs are ordered for the least alignment padding in the struct
+    /// D3DMetal makes of them (`container::metal_packed_order`). D3DMetal
+    /// fails such pipelines ("Total mesh size (N) exceeds the maximum mesh
+    /// size allowed (32768)"); the order of the elements is not what links
+    /// the stages, so the pixel shaders stay as they are. Meshes within
+    /// the limit are made as without it.
+    pub mesh_pack_outputs: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -410,6 +419,18 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 /// [`translate`] made as `options` say.
 pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    translate_keeping(container, options, None)
+}
+
+/// [`translate_with`]; a mesh program with `kept` leaves out the vertex
+/// outputs it does not name (system values stay): a pipeline's pixel shader
+/// reads no others ([`pixel_reads`]). For the meshes Metal counts too
+/// much output of even packed ([`mesh_over_metal_limit`]).
+pub fn translate_keeping(
+    container: &[u8],
+    options: Options,
+    kept: Option<&Kept>,
+) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -433,7 +454,93 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    emit_keeping(&c, &native, &p, &st, &io, &res, options, kept)
+}
+
+/// The vertex outputs a mesh translation keeps besides its system values:
+/// the semantics (name in upper case, index) a pixel shader reads, sorted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct Kept(Vec<(String, u32)>);
+
+impl Kept {
+    pub fn new(semantics: impl IntoIterator<Item = (String, u32)>) -> Kept {
+        let mut v: Vec<(String, u32)> = semantics
+            .into_iter()
+            .map(|(n, i)| (n.to_ascii_uppercase(), i))
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        Kept(v)
+    }
+
+    fn keeps(&self, e: &container::SigElement) -> bool {
+        e.kind != 0
+            || self
+                .0
+                .binary_search(&(e.name.to_ascii_uppercase(), e.index))
+                .is_ok()
+    }
+
+    /// One line per semantic, for cache keys.
+    pub fn describe(&self) -> String {
+        self.0.iter().map(|(n, i)| format!("{n}{i}\n")).collect()
+    }
+}
+
+/// The input semantics a translated pixel shader reads (its `ISG1`).
+pub fn pixel_reads(dxil: &[u8]) -> Result<Kept, ShaderError> {
+    let c = Container::parse(dxil)?;
+    let part = c
+        .part(FourCC::ISG1)
+        .ok_or(ShaderError::Malformed("no input signature"))?
+        .data;
+    let read = |i: usize| part.get(crate::dxbc::u32_at(part, 4).ok()? as usize + 32 * i + 25);
+    let elements = signature(part)?;
+    let mut out = Vec::new();
+    for (i, e) in elements.into_iter().enumerate() {
+        if read(i).is_some_and(|&rw| rw != 0) {
+            out.push((e.name, e.index));
+        }
+    }
+    Ok(Kept::new(out))
+}
+
+/// A translated mesh shader's vertex and primitive outputs and its maximum
+/// vertex and primitive counts.
+type MeshOutputs = (Vec<container::SigElement>, Vec<container::SigElement>, u32, u32);
+
+fn mesh_outputs(dxil: &[u8]) -> Option<MeshOutputs> {
+    let c = Container::parse(dxil).ok()?;
+    let sig = |f| c.part(f).map_or(Ok(Vec::new()), |p| signature(p.data)).ok();
+    let (outputs, prims) = (sig(FourCC::OSG1)?, sig(FourCC::PSG1)?);
+    let psv = c.part(FourCC::PSV0)?.data;
+    let u16_at = |o: usize| {
+        psv.get(o..o + 2)
+            .map(|b| u32::from(u16::from_le_bytes([b[0], b[1]])))
+    };
+    Some((outputs, prims, u16_at(4 + 12)?, u16_at(4 + 14)?))
+}
+
+/// Whether Metal counts more output than it allows of a translated mesh
+/// shader even with its outputs packed (`container::metal_packed_order`):
+/// D3DMetal fails the pipelines of such a mesh shader with any pixel shader
+/// that reads them all.
+pub fn mesh_over_metal_limit(dxil: &[u8]) -> bool {
+    let Some((outputs, prims, vertices, primitives)) = mesh_outputs(dxil) else {
+        return false;
+    };
+    let packed: Vec<container::SigElement> = container::metal_packed_order(&outputs)
+        .into_iter()
+        .map(|i| outputs[i].clone())
+        .collect();
+    container::metal_mesh_bytes(&packed, &prims, vertices, primitives)
+        > container::METAL_MESH_BYTES
+}
+
+/// Whether a translated mesh shader has vertex outputs (other than system
+/// values) that `kept` does not name.
+pub fn mesh_outputs_unread(dxil: &[u8], kept: &Kept) -> bool {
+    mesh_outputs(dxil).is_some_and(|(outputs, ..)| outputs.iter().any(|e| !kept.keeps(e)))
 }
 
 /// Emits a program whose earlier stages already ran, without write marks.
@@ -457,6 +564,22 @@ pub fn emit_with(
     io: &io::Io,
     res: &resource::Resources,
     options: Options,
+) -> Result<HostShader, ShaderError> {
+    emit_keeping(c, native, p, st, io, res, options, None)
+}
+
+/// [`emit_with`], a mesh program keeping only the vertex outputs `kept`
+/// names ([`translate_keeping`]).
+#[allow(clippy::too_many_arguments)]
+fn emit_keeping(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: Options,
+    kept: Option<&Kept>,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -498,6 +621,25 @@ pub fn emit_with(
     for e in &mut prims {
         e.interp = 1;
     }
+    // Rows of the vertex outputs left out: their exports store nothing.
+    let mut dropped_rows = Vec::new();
+    if let (Some(kept), crate::native::StageIo::Ms(_)) = (kept, &native.io) {
+        outputs.retain(|e| {
+            let keep = kept.keeps(e);
+            if !keep {
+                dropped_rows.extend(e.row);
+            }
+            keep
+        });
+    }
+    if let (true, crate::native::StageIo::Ms(ms)) = (options.mesh_pack_outputs, &native.io) {
+        let bytes =
+            container::metal_mesh_bytes(&outputs, &prims, ms.max_vertices, ms.max_primitives);
+        if bytes > container::METAL_MESH_BYTES {
+            let order = container::metal_packed_order(&outputs);
+            outputs = order.into_iter().map(|i| outputs[i].clone()).collect();
+        }
+    }
     // A mesh group's id arrives multiplied by max(threads, vertices,
     // primitives) (the code divides by that); the thread count is in PSV0
     // from runtime info version 2 on.
@@ -526,6 +668,7 @@ pub fn emit_with(
         inputs: inputs.clone(),
         outputs: outputs.clone(),
         prims: prims.clone(),
+        dropped_rows: dropped_rows.clone(),
         mesh_stride,
         view_marks: options.view_marks,
         atomic_locks: options.atomic_locks,
@@ -1704,6 +1847,312 @@ mod tests {
             fp16,
             pack2: false,
             row2: 0,
+        }
+    }
+
+    /// Rows of [`param_mesh`]'s output signature after the position: each
+    /// a scalar (`TEXCOORD<2r>`) and a 3-vector (`TEXCOORD<2r+1>`), which
+    /// D3DMetal lays out with padding (`container::metal_record`).
+    const PARAM_ROWS: u32 = 14;
+
+    /// The output (or input) elements of [`param_mesh`]: the position, then
+    /// per row r of 1..=rows a scalar `TEXCOORD<2r>` in x and a 3-vector
+    /// `TEXCOORD<2r+1>` in yzw.
+    fn param_elements(rows: u32) -> Vec<SigElement> {
+        let el = |name: &str, index, kind, row, col, cols| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col,
+            cols,
+            usage: ((1u8 << cols) - 1) << col,
+            half: false,
+        };
+        let mut els = vec![el("SV_Position", 0, 3, 0, 0, 4)];
+        for r in 1..=rows {
+            els.push(el("TEXCOORD", 2 * r, 0, r, 0, 1));
+            els.push(el("TEXCOORD", 2 * r + 1, 0, r, 1, 3));
+        }
+        els
+    }
+
+    /// A one-wave triangle mesh program (128 vertices declared) whose lanes
+    /// export, besides [`triangle_mesh`]'s triangle and positions, the
+    /// constants (r, r + 0.25, r + 0.5, r + 0.75) to parameter row r of
+    /// `rows` ([`param_elements`]).
+    fn param_mesh(
+        rows: u32,
+        options: Options,
+        kept: Option<&Kept>,
+    ) -> Result<HostShader, ShaderError> {
+        let mut words = vec![
+            0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x0001_00C1,
+            0x3604_0281, // v_and_b32 v2, 1, v1
+            0x3606_0282, // v_and_b32 v3, 2, v1
+            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+            0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+            0x1008_04F6, // v_mul_f32 v4, 4.0, v2
+            0x0608_08F3, // v_add_f32 v4, -1.0, v4
+            0x100A_06F4, // v_mul_f32 v5, 2.0, v3
+            0x060A_0AF3, // v_add_f32 v5, -1.0, v5
+            0x7E0C_02F0, // v_mov_b32 v6, 0.5
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+        ];
+        for r in 1..=rows {
+            for (k, add) in [0.0f32, 0.25, 0.5, 0.75].into_iter().enumerate() {
+                // v_mov_b32 v(10 + k), r + add
+                words.extend([0x7E14_02FF + ((k as u32) << 17), (r as f32 + add).to_bits()]);
+            }
+            // exp param(r - 1) v10, v11, v12, v13
+            words.extend([0xF800_020F + ((r - 1) << 4), 0x0D0C_0B0A]);
+        }
+        words.extend([
+            0x7E12_02FF, // v_mov_b32 v9, TRIANGLE
+            TRIANGLE,
+            0xF800_0941, // exp prim v9, off, off, off done
+            0x0000_0009,
+            0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
+            0x0706_0504,
+            0xBF81_0000, // s_endpgm
+        ]);
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: (1..=rows as u8)
+                    .map(|r| crate::native::VsOutput {
+                        usage: crate::native::Usage::Generic,
+                        row: r,
+                        param: r - 1,
+                        fp16: false,
+                        pack2: false,
+                    })
+                    .collect(),
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 128,
+                max_primitives: 128,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = container::signature(&param_elements(rows), false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes)?;
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        emit_keeping(&c, &native, &p, &st, &io, &res, options, kept)
+    }
+
+    /// A pixel program that writes four of [`param_mesh`]'s outputs,
+    /// interpolated, to target 0: TEXCOORD6 (row 3 x), TEXCOORD15's second
+    /// channel (row 7 z), TEXCOORD25's third (row 12 w) and TEXCOORD28
+    /// (row 14 x): 3, 7.5, 12.75 and 14. Its signature declares them all.
+    fn param_pixel() -> HostShader {
+        let reads: [(u32, u32); 4] = [(3, 0), (7, 2), (12, 3), (14, 0)];
+        let mut words = Vec::new();
+        for (k, &(row, ch)) in reads.iter().enumerate() {
+            let (dst, attr) = (2 + k as u32, row - 1);
+            // v_interp_p1_f32 v(dst), v0, attr.ch; v_interp_p2_f32 v(dst), v1, attr.ch
+            words.push(0xC800_0000 | dst << 18 | attr << 10 | ch << 8);
+            words.push(0xC801_0001 | dst << 18 | attr << 10 | ch << 8);
+        }
+        words.extend([
+            0xF800_180F,
+            0x0504_0302, // exp mrt0, v2, v3, v4, v5 done vm
+            0xBF81_0000,
+        ]);
+        let inputs = (1..=PARAM_ROWS as u8)
+            .map(|r| crate::native::PsInput {
+                usage: crate::native::Usage::Generic,
+                row: r,
+                mask: 0b1111,
+                attr: r - 1,
+                flat: false,
+                fp16: false,
+                pack2: false,
+                row2: 0,
+            })
+            .collect();
+        let mut isg1 = param_elements(PARAM_ROWS);
+        isg1.remove(0);
+        for e in &mut isg1 {
+            e.usage = 0;
+        }
+        let isg1 = container::signature(&isg1, true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        emit_pixel(&words, inputs, 1 << 1, &isg1, &osg1).unwrap()
+    }
+
+    /// The vertex output semantics of a translated mesh, in `OSG1`.
+    fn output_names(dxil: &[u8]) -> Vec<String> {
+        let c = Container::parse(dxil).unwrap();
+        let mut names: Vec<String> = signature(c.part(FourCC::OSG1).unwrap().data)
+            .unwrap()
+            .into_iter()
+            .map(|e| format!("{}{}", e.name, e.index))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Metal counts more of [`param_mesh`]'s output than it allows as the
+    /// console lays it out, and less packed: packing changes its
+    /// translation; a mesh within the limit is made as without it.
+    #[test]
+    fn mesh_outputs_are_packed_only_over_metals_limit() {
+        let els = param_elements(PARAM_ROWS);
+        assert!(container::metal_mesh_bytes(&els, &[], 128, 128) > container::METAL_MESH_BYTES);
+        let packed: Vec<SigElement> = container::metal_packed_order(&els)
+            .into_iter()
+            .map(|i| els[i].clone())
+            .collect();
+        assert_eq!(container::metal_mesh_bytes(&packed, &[], 128, 128), 128 * 240);
+        let pack = Options {
+            mesh_pack_outputs: true,
+            ..Options::default()
+        };
+        let plain = param_mesh(PARAM_ROWS, Options::default(), None).unwrap();
+        let ours = param_mesh(PARAM_ROWS, pack, None).unwrap();
+        assert_ne!(plain.dxil, ours.dxil);
+        assert_eq!(output_names(&plain.dxil), output_names(&ours.dxil));
+        assert!(!mesh_over_metal_limit(&ours.dxil));
+        // Ten rows: 16 + 10 × 24 bytes a vertex, within the limit.
+        let small = param_mesh(10, pack, None).unwrap();
+        assert_eq!(small.dxil, param_mesh(10, Options::default(), None).unwrap().dxil);
+        assert!(!mesh_over_metal_limit(&small.dxil));
+    }
+
+    /// With what a pixel shader reads kept, a mesh translation keeps those
+    /// outputs and its system values and leaves the rest out; one keeping
+    /// everything is the plain translation.
+    #[test]
+    fn a_kept_mesh_translation_keeps_what_the_pixel_shader_reads() {
+        let ps = param_pixel();
+        let kept = pixel_reads(&ps.dxil).unwrap();
+        assert_eq!(
+            kept.describe(),
+            "TEXCOORD6\nTEXCOORD15\nTEXCOORD25\nTEXCOORD28\n"
+        );
+        let ms = param_mesh(PARAM_ROWS, Options::default(), Some(&kept)).unwrap();
+        assert_eq!(
+            output_names(&ms.dxil),
+            ["SV_Position0", "TEXCOORD15", "TEXCOORD25", "TEXCOORD28", "TEXCOORD6"]
+        );
+        let plain = param_mesh(PARAM_ROWS, Options::default(), None).unwrap();
+        assert!(mesh_outputs_unread(&plain.dxil, &kept));
+        assert!(!mesh_outputs_unread(&ms.dxil, &kept));
+        let all = Kept::new(
+            param_elements(PARAM_ROWS)
+                .into_iter()
+                .filter(|e| e.kind == 0)
+                .map(|e| (e.name.to_lowercase(), e.index)),
+        );
+        let everything = param_mesh(PARAM_ROWS, Options::default(), Some(&all)).unwrap();
+        assert_eq!(everything.dxil, plain.dxil);
+    }
+
+    /// [`param_mesh`] with [`param_pixel`] on the host GPU (and WARP),
+    /// packed, kept to what the pixel shader reads, both, and neither: the
+    /// pixel shader reads the values the mesh stored under their semantics.
+    /// Under Wine, D3DMetal makes the plain one a no-op (Metal: "Total mesh
+    /// size (N) exceeds the maximum mesh size allowed (32768)"), so it only
+    /// has to draw where Metal is not underneath.
+    #[test]
+    #[cfg(windows)]
+    fn packed_and_kept_mesh_outputs_reach_the_pixel_shader() {
+        use super::host::{Draw, Host, Root};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+            D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ps = param_pixel();
+        let kept = pixel_reads(&ps.dxil).unwrap();
+        let pack = Options {
+            mesh_pack_outputs: true,
+            ..Options::default()
+        };
+        let wine = super::host::under_wine();
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+            // SAFETY: the query writes the structure of the given size.
+            let queried = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS7,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            };
+            if queried.is_err() || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED {
+                eprintln!("no mesh shaders on the {label} device; skipped");
+                continue;
+            }
+            for (case, options, kept, must_draw) in [
+                ("packed", pack, None, true),
+                ("kept", Options::default(), Some(&kept), true),
+                ("packed and kept", pack, Some(&kept), true),
+                ("plain", Options::default(), None, !wine),
+            ] {
+                let ms = param_mesh(PARAM_ROWS, options, kept).unwrap();
+                if let Ok(mut v) = super::validator::Validator::load(
+                    super::validator::Validator::default_path().as_deref(),
+                ) {
+                    v.validate(&mut ms.dxil.clone())
+                        .unwrap_or_else(|e| panic!("{case}: {e}"));
+                }
+                let root = host
+                    .root_signature_for(&[(&ms, D3D12_SHADER_VISIBILITY_MESH)])
+                    .unwrap();
+                let pso = host
+                    .mesh_pipeline_with(&root, &ms.dxil, &ps.dxil)
+                    .unwrap_or_else(|e| panic!("{label}, {case}: mesh pipeline: {e}"));
+                let texels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![(0, Root::Constants(vec![0]))],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (16, 16),
+                            mesh_groups: 1,
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}, {case}: draw: {e}"));
+                let want = [3.0f32, 7.5, 12.75, 14.0];
+                let right = texels
+                    .iter()
+                    .filter(|t| t.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-3))
+                    .count();
+                eprintln!("{label}, {case}: {right} of 256 texels right (first {:?})", texels[0]);
+                if must_draw {
+                    assert_eq!(right, 256, "{label}, {case}: first texel {:?}", texels[0]);
+                }
+            }
+            ran += 1;
+        }
+        if ran == 0 {
+            eprintln!("no device with mesh shaders; skipped");
         }
     }
 

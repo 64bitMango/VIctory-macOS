@@ -747,6 +747,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),
+        dropped_rows: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
         bias_as_gradients: false,

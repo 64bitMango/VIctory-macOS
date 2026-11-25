@@ -591,6 +591,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),
+        dropped_rows: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
         bias_as_gradients: false,

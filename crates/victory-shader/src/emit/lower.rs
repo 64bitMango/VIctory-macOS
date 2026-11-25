@@ -77,6 +77,10 @@ pub(crate) struct Parts<'a> {
     pub inputs: Vec<SigElement>,
     pub outputs: Vec<SigElement>,
     pub prims: Vec<SigElement>,
+    /// Mesh: rows of vertex outputs left out of `outputs`
+    /// ([`translate_keeping`](super::translate_keeping)); exports to them
+    /// store nothing.
+    pub dropped_rows: Vec<u32>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
@@ -10378,12 +10382,14 @@ impl<'a> Lower<'a> {
                 .iter()
                 .any(|o| o.param & 0x80 == 0 && o.usage != Usage::Other(0) && u32::from(o.row) == r)
         };
+        // The rows of outputs left out count: the unnamed one may be one.
         let free: std::collections::BTreeSet<u32> = self
             .s
             .outputs
             .iter()
             .filter(|o| o.kind == 0)
             .filter_map(|o| o.row)
+            .chain(self.x.dropped_rows.iter().copied())
             .filter(|&r| !named(r))
             .collect();
         match free.into_iter().collect::<Vec<_>>()[..] {
@@ -11172,6 +11178,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![],
             prims: vec![],
+            dropped_rows: Vec::new(),
             mesh_stride: 0,
             atomic_locks: false,
             bias_as_gradients: false,
@@ -11225,6 +11232,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![],
             prims: vec![],
+            dropped_rows: Vec::new(),
             mesh_stride: 0,
             atomic_locks: false,
             bias_as_gradients: false,
@@ -11417,6 +11425,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![],
             prims: vec![],
+            dropped_rows: Vec::new(),
             mesh_stride: 0,
             atomic_locks: false,
             bias_as_gradients: false,

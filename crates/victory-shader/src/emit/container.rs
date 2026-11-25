@@ -124,6 +124,80 @@ pub(crate) fn compact_mesh_interface(elements: &mut [SigElement]) -> bool {
     true
 }
 
+/// Metal's limit on a mesh pipeline's output, in bytes: `Total mesh size
+/// (N) exceeds the maximum mesh size allowed (32768)` above it, and
+/// D3DMetal makes the pipeline a no-op.
+pub(crate) const METAL_MESH_BYTES: u32 = 32768;
+
+/// Bytes of one output record (vertex or primitive) of a mesh shader as
+/// Metal counts them, the record being the struct D3DMetal (4.0b3) makes of
+/// the signature: the clip and cull distances as a float array, the
+/// position, then one field per other element in element order (the
+/// distances again among them), each of `cols` 32-bit components and
+/// aligned to its own size: 4, 8, 12 (a 3-vector packs at a multiple of
+/// 12, not 16) or 16 bytes, with no padding at the end. Every field counts,
+/// whether the pixel shader reads it or not. Measured with Metal's own
+/// messages (mesh pipelines of chosen output structs) and D3DMetal's
+/// conversions of the title's meshes: the 34816 and 35840 bytes Metal
+/// reported at 128 vertices are records of 272 and 280 bytes as this
+/// counts them, and the meshes it counts within the limit build.
+pub(crate) fn metal_record<'a>(elements: impl IntoIterator<Item = &'a SigElement>) -> u32 {
+    let elements: Vec<&SigElement> = elements.into_iter().collect();
+    let distances: u32 = elements
+        .iter()
+        .filter(|e| matches!(e.kind, 6 | 7))
+        .map(|e| u32::from(e.cols))
+        .sum();
+    let (position, rest): (Vec<&SigElement>, Vec<&SigElement>) =
+        elements.into_iter().partition(|e| e.kind == 3);
+    position.into_iter().chain(rest).fold(4 * distances, |at, e| {
+        let size = 4 * u32::from(e.cols.max(1));
+        at.div_ceil(size) * size + size
+    })
+}
+
+/// Metal's size of a mesh shader's output (see [`metal_record`]).
+pub(crate) fn metal_mesh_bytes(
+    vertices: &[SigElement],
+    primitives: &[SigElement],
+    max_vertices: u32,
+    max_primitives: u32,
+) -> u32 {
+    let prims = if primitives.is_empty() {
+        0
+    } else {
+        max_primitives * metal_record(primitives)
+    };
+    max_vertices * metal_record(vertices) + prims
+}
+
+/// An order of mesh output elements whose Metal record ([`metal_record`])
+/// wastes as little as it can on alignment: system values first, in their
+/// order, then the rest, each time the widest element that starts at the
+/// end without padding (in their order), else a scalar, else the one that
+/// pads least. The elements' rows stay; only their order (their signature
+/// IDs) changes, which D3D12 and Metal do not link by (semantics do).
+pub(crate) fn metal_packed_order(elements: &[SigElement]) -> Vec<usize> {
+    let (mut order, mut rest): (Vec<usize>, Vec<usize>) =
+        (0..elements.len()).partition(|&i| elements[i].kind != 0);
+    while !rest.is_empty() {
+        let at = metal_record(order.iter().map(|&i| &elements[i]));
+        let size = |i: usize| 4 * u32::from(elements[i].cols.max(1));
+        let pad = |i: usize| at.div_ceil(size(i)) * size(i) - at;
+        let pick = rest
+            .iter()
+            .copied()
+            .filter(|&i| pad(i) == 0)
+            .max_by_key(|&i| (size(i), std::cmp::Reverse(i)))
+            .or_else(|| rest.iter().copied().filter(|&i| size(i) == 4).min())
+            .or_else(|| rest.iter().copied().min_by_key(|&i| (pad(i), i)))
+            .expect("not empty");
+        rest.retain(|&i| i != pick);
+        order.push(pick);
+    }
+    order
+}
+
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend((elements.len() as u32).to_le_bytes());
@@ -539,6 +613,107 @@ mod tests {
         }
         assert_eq!(hex(md5(&[0x61; 55])), "ef1772b6dff9a122358552954ad0df65");
         assert_eq!(hex(md5(&[0x61; 56])), "3b0c8ac703f828b04c6c197006d17218");
+    }
+
+    /// Elements of `cols` 32-bit components, one per row: `(name, kind, cols)`.
+    fn outputs(spec: &[(&str, u8, u8)]) -> Vec<SigElement> {
+        spec.iter()
+            .enumerate()
+            .map(|(row, &(name, kind, cols))| SigElement {
+                name: name.into(),
+                index: row as u32,
+                kind,
+                comp: 9,
+                interp: 2,
+                row: Some(row as u32),
+                col: 0,
+                cols,
+                usage: (1 << cols) - 1,
+                half: false,
+            })
+            .collect()
+    }
+
+    /// The sizes Metal gave for mesh pipelines (128 vertices, no primitive
+    /// data) of chosen output structs: position, 15 float4, then the rest.
+    #[test]
+    fn metal_records_are_the_sizes_metal_reports() {
+        let base: Vec<(&str, u8, u8)> = std::iter::once(("SV_Position", 3, 4))
+            .chain(std::iter::repeat_n(("TEXCOORD", 0, 4), 15))
+            .collect();
+        for (rest, bytes) in [
+            (&[4][..], 34816),
+            (&[1], 33280),
+            (&[2], 33792),
+            (&[3], 35328),
+            (&[1, 1], 33792),
+            (&[1, 4], 36864),
+            (&[3, 1], 35840),
+            (&[1, 3], 35328),
+            (&[3, 3], 36864),
+            (&[3, 3, 3, 3], 39936),
+            (&[4, 3], 36864),
+            (&[3, 2], 36864),
+            (&[2, 3], 35328),
+            (&[1, 1, 1, 3], 36864),
+        ] {
+            let mut spec = base.clone();
+            spec.extend(rest.iter().map(|&c| ("TEXCOORD", 0, c)));
+            let els = outputs(&spec);
+            assert_eq!(metal_mesh_bytes(&els, &[], 128, 128), bytes, "{rest:?}");
+        }
+    }
+
+    /// One of the title's meshes (da22b2adfd4f76d3): Metal counted 34816
+    /// bytes; in the packed order it is 30720, the sum of its components.
+    #[test]
+    fn packed_order_fits_a_title_mesh_under_metals_limit() {
+        let mut els = outputs(&[
+            ("SV_Position", 3, 4),
+            ("SV_ClipDistance", 6, 4),
+            ("COLOR", 0, 4),
+            ("COLOR", 0, 4),
+            ("COLOR", 0, 4),
+            ("COLOR", 0, 1),
+            ("TEXCOORD", 0, 2),
+            ("TEXCOORD", 0, 1),
+            ("TEXCOORD", 0, 4),
+            ("TEXCOORD", 0, 3),
+            ("TEXCOORD", 0, 1),
+            ("TEXCOORD", 0, 3),
+            ("TEXCOORD", 0, 3),
+            ("TEXCOORD", 0, 3),
+            ("TEXCOORD", 0, 3),
+            ("TEXCOORD", 0, 3),
+            ("TEXCOORD", 0, 3),
+            ("TEXCOORD", 0, 2),
+            ("TEXCOORD", 0, 4),
+        ]);
+        // Rows 5 and 7 hold more than one element, as in the title's.
+        for (i, (row, col)) in [(5, 0), (5, 1), (5, 3), (6, 0), (7, 0), (7, 3)]
+            .into_iter()
+            .enumerate()
+        {
+            els[5 + i].row = Some(row);
+            els[5 + i].col = col;
+        }
+        assert_eq!(metal_mesh_bytes(&els, &[], 128, 128), 34816);
+        let order = metal_packed_order(&els);
+        let packed: Vec<SigElement> = order.iter().map(|&i| els[i].clone()).collect();
+        assert_eq!(metal_mesh_bytes(&packed, &[], 128, 128), 30720);
+        // System values first, then the float4s, the float2s (which end at
+        // a multiple of 12), the float3s, the scalars.
+        assert_eq!(
+            order,
+            [0, 1, 2, 3, 4, 8, 18, 6, 17, 9, 11, 12, 13, 14, 15, 16, 5, 7, 10]
+        );
+        // D3DMetal puts the position first wherever its element is.
+        let mut last = els.clone();
+        last.rotate_left(1);
+        assert_eq!(metal_mesh_bytes(&last, &[], 128, 128), 34816);
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..els.len()).collect::<Vec<_>>());
     }
 
     #[test]
