@@ -14,6 +14,13 @@ use super::paged::Paged;
 use super::{VIEW_TAG, View, view_at, views_current};
 use crate::host::host;
 
+struct DynamicSlots {
+    cursor: usize,
+    taken: Vec<bool>,
+    /// Once a search fails, this size and larger cannot fit until release.
+    first_failed_size: Option<usize>,
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -36,7 +43,7 @@ pub(crate) struct HostHeap {
     kept: Mutex<Paged<Held>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    next: Mutex<DynamicSlots>,
     /// Slot pairs kept for host copies' views (`crate::memory`), past the
     /// dynamic slots and below the null buffer views: the next never
     /// taken, those given back, and where they end.
@@ -208,7 +215,11 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(Paged::new((count + extra) as usize)),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new(DynamicSlots {
+                cursor: 0,
+                taken: vec![false; extra as usize],
+                first_failed_size: None,
+            }),
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
                 null if !sampler && null > count + extra && null < total => null - 1,
@@ -316,11 +327,13 @@ impl HostHeap {
             return None;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
         let n = n as usize;
+        if guard.first_failed_size.is_some_and(|size| n >= size) {
+            return None;
+        }
         // Search from `next` on, then from the start (extending past cursor by
         // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
+        let cursor = guard.cursor;
         let end = self.dynamic as usize;
         let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
         let starts = (cursor..end).chain(0..second_end);
@@ -333,21 +346,22 @@ impl HostHeap {
                 run = 0;
             }
             last = at;
-            run = if taken[at] { 0 } else { run + 1 };
+            run = if guard.taken[at] { 0 } else { run + 1 };
             if run == n {
                 found = Some(at + 1 - n);
                 break;
             }
         }
         let Some(first) = found else {
+            guard.first_failed_size = Some(n);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 tracing::warn!(n, "no free dynamic descriptor slots: a table is not made")
             });
             return None;
         };
-        taken[first..first + n].fill(true);
-        *next = ((first + n) % self.dynamic as usize) as u32;
+        guard.taken[first..first + n].fill(true);
+        guard.cursor = (first + n) % end;
         Some(self.count + first as u32)
     }
 
@@ -397,8 +411,9 @@ impl HostHeap {
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
+        if let Some(slots) = guard.taken.get_mut(at as usize..end) {
             slots.fill(false);
+            guard.first_failed_size = None;
         }
     }
 
@@ -2111,9 +2126,10 @@ mod tests {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
+        assert_eq!(heap.dynamic(51), None);
+        assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
 
     #[test]

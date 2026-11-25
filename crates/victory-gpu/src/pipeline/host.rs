@@ -583,6 +583,8 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
+            #[cfg(feature = "diagnostics")]
+            tracing::info!(?shaders, pipeline = %name, %state, "preparing host graphics pipeline");
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
@@ -651,6 +653,8 @@ impl HostPipeline {
             &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs],
             &state,
         );
+        #[cfg(feature = "diagnostics")]
+        tracing::info!(?shaders, pipeline = %name, %state, "preparing host graphics pipeline");
         let started = std::time::Instant::now();
         let made = super::library::pipeline(
             &name,

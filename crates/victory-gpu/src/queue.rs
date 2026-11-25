@@ -476,6 +476,79 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// Count returns separately from entries so a quiet render thread can be
+/// distinguished from a present call that has yet to return.
+#[cfg(all(windows, feature = "diagnostics"))]
+static PRESENT_RETURNS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn start_progress_log() {
+    use std::time::{Duration, Instant};
+    if !crate::switch::on("VICTORY_PROGRESS_LOG") {
+        return;
+    }
+    let result = std::thread::Builder::new().name("render-progress".into()).spawn(|| {
+        let mut previous = PRESENT_RETURNS.load(Ordering::Relaxed);
+        let mut last_progress = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_secs(15));
+            let returned = PRESENT_RETURNS.load(Ordering::Relaxed);
+            if returned != previous {
+                previous = returned;
+                last_progress = Instant::now();
+            }
+            let (cache_hits, cache_misses) = crate::shader_cache::counts();
+            let (working_set_mb, commit_mb, system_load_pct, system_avail_mb) = memory_mb();
+            tracing::info!(
+                working_set_mb, commit_mb, system_load_pct, system_avail_mb,
+                presents_started = presented(),
+                presents_returned = returned,
+                seconds_without_observed_progress = last_progress.elapsed().as_secs(),
+                draws = crate::draw::drawn(),
+                dispatches = crate::draw::dispatched(),
+                pipelines_pending = crate::pipeline::making(),
+                cache_hits, cache_misses,
+                "render progress"
+            );
+        }
+    });
+    if let Err(error) = result {
+        tracing::warn!(%error, "could not start render progress log");
+    }
+}
+
+/// Wine's view of memory for the progress log: this process's working set
+/// and committed private bytes, then the system's load and available
+/// physical memory, in MiB (load in percent). Wine reports these values
+/// itself; the macOS footprint can differ. Use an external watcher as the
+/// reference.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn memory_mb() -> (u64, u64, u32, u64) {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const MB: u64 = 1 << 20;
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    // SAFETY: zeroed is a valid MEMORYSTATUSEX; its length is set before use.
+    let mut s: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    s.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    unsafe { GlobalMemoryStatusEx(&mut s) };
+    (
+        c.WorkingSetSize as u64 / MB,
+        c.PagefileUsage as u64 / MB,
+        s.dwMemoryLoad,
+        s.ullAvailPhys / MB,
+    )
+}
+
 /// Every plane's resources. Only the start of a plane description is
 /// known (token, count, resources), so the planes after the first are
 /// found by their stride: the first offset past the first plane where the
@@ -623,6 +696,10 @@ extern "system" fn present(
     account_frame(frame);
     #[cfg(feature = "diagnostics")]
     crate::frame::presented();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if frame == 1 {
+        start_progress_log();
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -695,6 +772,8 @@ extern "system" fn present(
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    PRESENT_RETURNS.fetch_add(1, Ordering::Relaxed);
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was
