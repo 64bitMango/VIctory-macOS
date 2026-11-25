@@ -605,6 +605,10 @@ fn read_stream(
         };
         at += size;
     }
+    // Here, not where the run makes the pipeline: a pre-build of the same
+    // stream must name the same state.
+    #[cfg(windows)]
+    graphics.apply_integer_blend_bypass();
     (shaders, graphics)
 }
 
