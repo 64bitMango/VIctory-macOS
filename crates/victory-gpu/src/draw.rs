@@ -547,6 +547,9 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
+        if crate::pipeline::is_left_out(self.pipeline as This) {
+            return false;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
@@ -1076,6 +1079,10 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        // Left out on purpose (`VICTORY_BVH_BUILDS=0`): not counted as dropped.
+        if crate::pipeline::is_left_out(self.pipeline as This) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1772,6 +1779,9 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
+        if crate::pipeline::is_left_out(self.pipeline as This) {
+            return false;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);

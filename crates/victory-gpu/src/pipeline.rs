@@ -347,6 +347,48 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// The title's ray-tracing acceleration-structure builder (its
+/// XboxBvhBuilder.dll compute shaders, the title the known build): about
+/// 2,000 dispatches a world frame, dropped until 640b830 read their root
+/// constants as root views.
+const BVH_BUILDER: [&str; 11] = [
+    "f6e47efa50226beb",
+    "3b90165a77d95cdf",
+    "5e68767498c57eb6",
+    "6f6a359d1166bb27",
+    "ffd93c8a029ff016",
+    "190fbf0ebe040169",
+    "c85822de2e41cfaa",
+    "5062bc7a48e842f8",
+    "c42a31951201f9a0",
+    "35e51bb27a463294",
+    "f94e5d8bf4e1cf05",
+];
+
+/// Whether the builder's dispatches run: `VICTORY_BVH_BUILDS=0` leaves them
+/// out (every build, not only diagnostics), to measure or rule out their
+/// cost. On by default: the title's ray-traced passes read what they build.
+#[cfg(windows)]
+fn bvh_builds() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_BVH_BUILDS").map_or(true, |v| v.trim() != "0");
+        if !on {
+            tracing::info!("ray-tracing structure builds left out (VICTORY_BVH_BUILDS=0)");
+        }
+        on
+    })
+}
+
+/// Whether `this` is one of the title's BVH builder programs and
+/// `VICTORY_BVH_BUILDS=0` leaves those out.
+#[cfg(windows)]
+pub(crate) fn is_left_out(this: This) -> bool {
+    !this.is_null()
+        && !bvh_builds()
+        && pipeline(this).shaders.iter().any(|s| BVH_BUILDER.contains(&s.hash.as_str()))
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
