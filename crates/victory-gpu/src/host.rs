@@ -811,7 +811,7 @@ pub(crate) struct HostList {
     /// Depth textures with a writable twin the list uses (`crate::twin`),
     /// by host copy: the side its first use needs and the side it leaves
     /// newer.
-    twins: Mutex<std::collections::HashMap<usize, crate::twin::Use>>,
+    twins: Mutex<crate::quick::Map<usize, crate::twin::Use>>,
     /// A copy of ours replaced the list's compute root signature and
     /// pipeline: draws and dispatches set theirs again.
     rebind: std::sync::atomic::AtomicBool,
@@ -882,7 +882,7 @@ const STAMPS: u32 = 4096;
 type Note = (String, Option<(u64, u64)>);
 
 type States =
-    std::collections::HashMap<usize, (u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
+    crate::quick::Map<usize, (u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -1031,9 +1031,9 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: crate::quick::Set<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: crate::quick::Set<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -1052,7 +1052,7 @@ struct Deferred {
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
     /// The buffer copies its commands use (by address), until it has run:
     /// not released for idleness meanwhile (`crate::shadow::Flight`).
-    flying: std::collections::HashMap<usize, crate::shadow::Flight>,
+    flying: crate::quick::Map<usize, crate::shadow::Flight>,
 }
 
 impl Host {
@@ -1456,7 +1456,7 @@ impl Host {
         let faults = crate::copystat::page_faults();
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
-        let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
+        let mut index: crate::quick::Map<(usize, usize, usize), usize> = Default::default();
         // Shaders that read memory with no copy computed something else than
         // the console's: it stays out of title memory, where it broke the
         // title's own data (runs c1, c4), and so does what every program
@@ -2655,11 +2655,11 @@ struct Batch {
     /// The ranges still to bring up to date, by copy.
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>,
     /// Where each copy's refreshes are in `refreshes`, by copy.
-    pending: std::collections::HashMap<usize, usize>,
+    pending: crate::quick::Map<usize, usize>,
     /// The ranges of each copy brought up to date since the last write that
     /// can have changed them, by copy (held, so that its address names no
     /// other).
-    current: std::collections::HashMap<
+    current: crate::quick::Map<
         usize,
         (std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges),
     >,

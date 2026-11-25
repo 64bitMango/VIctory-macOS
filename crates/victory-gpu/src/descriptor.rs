@@ -93,7 +93,8 @@ impl Heap {
         }
         // Submissions held off while a view heap is made and filled
         // (`Host::quiet`), from before `pending` is taken: `mirror` waits
-        // for that with `SHADER_HEAPS` held, which a submission waits for.
+        // for that with `SHADER_HEAPS` held, which a submission may wait
+        // for (behind a thread waiting to hold it alone).
         let _quiet = (self.desc.kind == VIEWS_KIND)
             .then(|| crate::host::host()?.quiet())
             .flatten();
@@ -127,8 +128,125 @@ const SHADER_VISIBLE: u32 = 1;
 
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap.
+///
+/// A read-write lock. As a mutex it was held by every title thread for the
+/// whole of each view it wrote into a heap, and by the submitting thread
+/// for the whole of each heap sync: the title's recording threads waited
+/// 200-390 ms a frame on it (run ab-all1), taking turns at work that is
+/// each heap's own. Held shared ([`heaps`]) by what looks a heap up and
+/// then works under that heap's locks: [`mirror`], [`sync_heaps`],
+/// [`read_textures`], [`release_dynamic`], [`with_host`]. Held alone
+/// ([`heaps_alone`]) to register and drop a heap, and by the passes whose
+/// steps are one against every slot write: [`make_read`], [`evict`],
+/// [`with_slots_still`]. `VICTORY_HEAPS_SHARED=0` holds it alone
+/// everywhere, as the mutex was.
+///
+/// What the mutex gave, and what gives it now:
+/// - A registered heap is live while the lock is held: `Heap::drop` holds
+///   it alone.
+/// - The list does not change under a walk of it: registering holds it
+///   alone.
+/// - One thread at a time makes a slot: the slot lock
+///   (`host::HostHeap::made`), held from reading the slot's record to
+///   entering what it views (`host::HostHeap::mirror`). Draws recorded
+///   while a title thread wrote or a sync ran always relied on that alone;
+///   now title threads and heap syncs do too.
+/// - A sync leaves every slot as the title's record of it was when the
+///   sync looked: it looks at the records of the pages written, and makes
+///   each slot that differs through `mirror`, which reads the record again
+///   under the slot lock. A title thread writing a slot meanwhile makes it
+///   itself after its write (its own `mirror`), or dirties the page for
+///   the next sync (bytes copied without a call); whichever thread takes
+///   the slot lock last read the record last. A write that had not
+///   returned when the submission began was never part of it: with the
+///   mutex its `mirror` could as well wait out the whole sync.
+/// - The passes held alone see no slot written meanwhile by a title thread
+///   or a sync, as before (draws being recorded were never held off).
+///
+/// Lock order (each only with those before it held or none): a
+/// submission's turn (`Host::submitted`, also `Host::quiet`), this lock,
+/// a heap's `pending`, a host heap's slot lock `made`, then the leaves:
+/// [`VIEWS`] (shared), `kept`, `crate::bindless::Viewed`, the copies'
+/// registries (`crate::shadow`). [`with_slots_still`] takes every heap's
+/// slot lock in the list's order, under this lock held alone. Nothing takes
+/// this lock while it holds it (a second shared hold behind a waiting
+/// exclusive one would not return).
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+static SHADER_HEAPS: std::sync::RwLock<Vec<Registration>> = std::sync::RwLock::new(Vec::new());
+
+/// [`SHADER_HEAPS`] held shared, or alone with `VICTORY_HEAPS_SHARED=0`.
+#[cfg(windows)]
+enum Heaps {
+    Shared(std::sync::RwLockReadGuard<'static, Vec<Registration>>),
+    Alone(std::sync::RwLockWriteGuard<'static, Vec<Registration>>),
+}
+
+#[cfg(windows)]
+impl std::ops::Deref for Heaps {
+    type Target = Vec<Registration>;
+    fn deref(&self) -> &Vec<Registration> {
+        match self {
+            Heaps::Shared(heaps) => heaps,
+            Heaps::Alone(heaps) => heaps,
+        }
+    }
+}
+
+/// Whether [`heaps`] shares the lock: unless `VICTORY_HEAPS_SHARED=0`.
+#[cfg(windows)]
+fn heaps_shared() -> bool {
+    #[cfg(test)]
+    if tests::HEAPS_ALONE.with(|alone| alone.get()) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_HEAPS_SHARED"))
+}
+
+/// The registered heaps, live and the same ones until the guard is dropped;
+/// other threads may hold them too.
+#[cfg(windows)]
+fn heaps() -> Heaps {
+    if heaps_shared() {
+        Heaps::Shared(SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()))
+    } else {
+        Heaps::Alone(heaps_alone())
+    }
+}
+
+/// The registered heaps with no other thread holding them.
+#[cfg(windows)]
+fn heaps_alone() -> std::sync::RwLockWriteGuard<'static, Vec<Registration>> {
+    SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// [`heaps_alone`] for a pass over the heaps' slots: how long it holds them
+/// is counted (diagnostics), every title thread writing a view waits it out.
+#[cfg(windows)]
+fn heaps_for_pass() -> Pass {
+    Pass {
+        heaps: heaps_alone(),
+        #[cfg(feature = "diagnostics")]
+        _held: crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::HeapsAloneUs),
+    }
+}
+
+/// The heaps held alone by a pass (fields drop in order: the time held
+/// ends when the lock is given back).
+#[cfg(windows)]
+struct Pass {
+    #[cfg(feature = "diagnostics")]
+    _held: crate::watch::Timed,
+    heaps: std::sync::RwLockWriteGuard<'static, Vec<Registration>>,
+}
+
+#[cfg(windows)]
+impl std::ops::Deref for Pass {
+    type Target = Vec<Registration>;
+    fn deref(&self) -> &Vec<Registration> {
+        &self.heaps
+    }
+}
 
 #[cfg(any(windows, test))]
 type Registration = (u64, u64, usize);
@@ -169,15 +287,17 @@ fn heap_at(heaps: &[Registration], handle: u64) -> Option<usize> {
 }
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
-/// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
-/// so `Heap::drop` cannot free the heap concurrently.
+/// is in a shader-visible heap. Keeps `SHADER_HEAPS` held (shared) for the
+/// duration so `Heap::drop` cannot free the heap concurrently.
 #[cfg(windows)]
 fn mirror(handle: u64) {
-    #[cfg(feature = "diagnostics")]
-    let waited = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MirrorWaitUs);
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    #[cfg(feature = "diagnostics")]
-    drop(waited);
+    // Its wait is counted (diagnostics: "title threads waiting to write
+    // views").
+    let heaps = if heaps_shared() {
+        Heaps::Shared(crate::contend::read(&SHADER_HEAPS, crate::contend::Lock::Heaps))
+    } else {
+        Heaps::Alone(crate::contend::write(&SHADER_HEAPS, crate::contend::Lock::Heaps))
+    };
     let Some(at) = heap_at(&heaps, handle) else {
         return;
     };
@@ -209,7 +329,9 @@ fn mirror(handle: u64) {
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
     // Held throughout: a heap is not dropped while its slots are made.
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    // Shared: title threads write views meanwhile (`SHADER_HEAPS`).
+    let heaps = heaps();
+    let _syncing = crate::contend::syncing();
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -252,7 +374,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     // runs evict2, noevict1). They are never released, so they outlive it;
     // the lock is held only to look the slots up and to make the views.
     let placed: Vec<View> = {
-        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = heaps_for_pass();
         heaps
             .iter()
             // SAFETY: registered heaps are live (removed when dropped).
@@ -269,7 +391,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     crate::texture::in_parallel(placed.len(), |i| {
         let _ = host::placed_texture(&placed[i]);
     });
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps_for_pass();
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -290,7 +412,7 @@ pub(crate) fn make_read(slots: &[u32]) {
 /// shader-visible view heaps view.
 #[cfg(windows)]
 pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps();
     let mut textures = std::collections::HashSet::new();
     for &(_, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -307,7 +429,7 @@ pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
 /// (`crate::resource::evict` gives those textures up).
 #[cfg(windows)]
 pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps_for_pass();
     for &(_, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -328,7 +450,7 @@ pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
 pub(crate) fn with_slots_still<R>(
     f: impl FnOnce(&dyn Fn(&std::collections::HashSet<usize>) -> std::collections::HashSet<usize>) -> R,
 ) -> R {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps_for_pass();
     let hosts: Vec<&host::HostHeap> = heaps
         .iter()
         // SAFETY: registered heaps are live (removed when dropped, which
@@ -343,7 +465,7 @@ pub(crate) fn with_slots_still<R>(
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps();
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
@@ -356,7 +478,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 /// heap cannot be released; None if it is gone or has no host heap.
 #[cfg(windows)]
 pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) -> Option<R> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps();
     if !heaps.iter().any(|&(_, _, h)| h == heap) {
         return None;
     }
@@ -370,7 +492,7 @@ pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) ->
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = heaps_alone();
         unregister_heap(&mut heaps, at);
     }
 }
@@ -550,9 +672,33 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
-    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+    // A view recorded before (the title records the same views again and
+    // again, into other slots) is only looked up: readers share the table,
+    // and the recording threads took turns at it. Its record is written
+    // with the table held, as below: its generation is the entry's own
+    // then (`forget` holds the table alone).
+    if record_shared() {
+        let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
+        if let Some(&i) = views.index.get(&view) {
+            let generation = views.list[i as usize].1;
+            // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+            unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+            drop(views);
+            #[cfg(all(windows, feature = "diagnostics"))]
+            crate::copystat::add(crate::copystat::C::RecordFound, 1);
+            #[cfg(windows)]
+            mirror(handle);
+            return;
+        }
+    }
+    let mut views = crate::contend::write(&VIEWS, crate::contend::Lock::Views);
+    // Looked up again: another thread may have entered it meanwhile.
     let i = match views.index.get(&view) {
-        Some(&i) => i,
+        Some(&i) => {
+            #[cfg(all(windows, feature = "diagnostics"))]
+            crate::copystat::add(crate::copystat::C::RecordFound, 1);
+            i
+        }
         None => {
             let i = match views.free.pop() {
                 Some(i) => {
@@ -569,6 +715,8 @@ fn record(handle: u64, view: View) {
                 views.by_resource.entry(r).or_default().push(i);
             }
             views.index.insert(view, i);
+            #[cfg(all(windows, feature = "diagnostics"))]
+            crate::copystat::add(crate::copystat::C::RecordNew, 1);
             i
         }
     };
@@ -578,6 +726,17 @@ fn record(handle: u64, view: View) {
     drop(views);
     #[cfg(windows)]
     mirror(handle);
+}
+
+/// Whether [`record`] looks a view up with the table shared before it
+/// takes it alone to enter a new one: unless `VICTORY_RECORD_SHARED=0`.
+fn record_shared() -> bool {
+    #[cfg(test)]
+    if tests::RECORD_ALONE.with(|alone| alone.get()) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_RECORD_SHARED"))
 }
 
 /// The title released `resource`: the views naming it go stale.
@@ -605,7 +764,7 @@ pub(crate) fn forget(resource: usize) {
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
 }
@@ -617,7 +776,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 /// `VICTORY_SLOT_GENERATIONS=0`.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
-    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
     if generations_alone() {
         let generations = &views.generations;
         return records
@@ -652,7 +811,7 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
     let (view, current) = views.list.get(i as usize)?;
     (tag == VIEW_TAG && *current == generation).then(|| view.clone())
 }
@@ -875,7 +1034,7 @@ pub(crate) extern "system" fn create_heap(
     let result = object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out);
     #[cfg(windows)]
     if visible && result == crate::object::S_OK {
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = heaps_alone();
         register_heap(&mut heaps, (start, start + size), at);
     }
     result
@@ -937,6 +1096,12 @@ pub(crate) mod tests {
         /// This thread asks the view entries themselves whether records are
         /// current (as `VICTORY_SLOT_GENERATIONS=0`).
         pub(crate) static FROM_ENTRIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// This thread takes the views table alone for every record (as
+        /// `VICTORY_RECORD_SHARED=0`).
+        pub(crate) static RECORD_ALONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// This thread holds the heaps' lock alone wherever it takes it (as
+        /// `VICTORY_HEAPS_SHARED=0`).
+        pub(crate) static HEAPS_ALONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// Whether the generations kept alone are the entries' own.
@@ -999,6 +1164,53 @@ pub(crate) mod tests {
         (0..32).for_each(|k| forget(resource(k)));
         assert!(generations_match());
         assert_eq!(both(&records), [false; 52]);
+    }
+
+    /// Threads record views of the same few resources into slots of their
+    /// own while others release those resources: a slot then reads back as
+    /// the view its thread recorded there or as nothing (its resource
+    /// released since), never as another view, and the generations kept
+    /// alone stay the entries' own. With the table shared for views
+    /// recorded before, and taken alone for each.
+    #[test]
+    fn views_recorded_and_released_from_several_threads_read_back_as_recorded() {
+        const THREADS: usize = 6;
+        const ROUNDS: usize = if cfg!(debug_assertions) { 20_000 } else { 200_000 };
+        // Resources no other test names.
+        let resource = |k: usize| 0x5eed_7000_0000 + 0x100 * k;
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                scope.spawn(move || {
+                    RECORD_ALONE.with(|alone| alone.set(t % 3 == 2));
+                    let slots = [0u64; 4 * 8];
+                    let at = |i: usize| slots.as_ptr() as u64 + 32 * i as u64;
+                    let mut seed = 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(t as u64 + 1);
+                    for _ in 0..ROUNDS {
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let (k, i, what) = ((seed >> 33) as usize % 8, (seed >> 40) as usize % 8, seed >> 60);
+                        if what < 3 {
+                            forget(resource(k));
+                            continue;
+                        }
+                        // With a description or without: two views a resource.
+                        let desc = (what & 1 == 1).then_some([k as u32; 10]);
+                        let desc_ptr = desc.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
+                        create_srv(std::ptr::null(), resource(k) as This, desc_ptr, at(i));
+                        match view(at(i)) {
+                            None => {}
+                            Some(found) => assert_eq!(found, View::Shader(resource(k), desc)),
+                        }
+                        // SAFETY: a slot of `slots`.
+                        let record = unsafe { (at(i) as *const [u32; 3]).read_unaligned() };
+                        assert_eq!(record[0], VIEW_TAG);
+                        assert!(record[2] != 0, "generations start at 1");
+                    }
+                });
+            }
+        });
+        assert!(generations_match());
+        (0..8).for_each(|k| forget(resource(k)));
+        assert!(generations_match());
     }
 
     /// What newer titles pass; tests use it throughout, so that reading the
@@ -1171,6 +1383,270 @@ pub(crate) mod tests {
         crate::watch::tests::free(memory);
     }
 
+    /// Title threads write descriptors into two placed heaps (samplers, and
+    /// views of placed textures) by calls, by copies through the device and
+    /// as bytes, clear them, bind them as draws do and look them up, all at
+    /// the same slots, while another thread runs heap syncs and the passes
+    /// that hold the heaps alone. Once they are done and a sync has run,
+    /// every host slot is made from the record its title slot holds (from
+    /// none where that names no view), and what the view heap's slots view
+    /// is entered for exactly those: as in a second pair of heaps given
+    /// the same bytes by one thread and synced once. A third heap, in
+    /// memory of ours, no sync looks at: placed texture views are written
+    /// into it by calls only, and each slot is as the last call left it
+    /// with no sync's help.
+    #[cfg(windows)]
+    fn slots_written_during_syncs_end_as_their_records(alone: bool) {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const SLOTS: u32 = 512;
+        // Other tests' passes name low slots of every view heap.
+        const FIRST: u32 = 64;
+        const WRITERS: u64 = 4;
+        const ROUNDS: u64 = 5_000;
+        HEAPS_ALONE.with(|a| a.set(alone));
+        let page = crate::watch::PAGE;
+        let pages = (SLOTS as usize * 32).div_ceil(page);
+        // Each heap in pages of its own: samplers, views, and the pair one
+        // thread fills afterwards.
+        let memory = crate::watch::tests::pool(4 * pages);
+        let base = |heap: usize| (memory + heap * pages * page) as u64;
+        let make = |heap: usize, kind: u32| {
+            let size = u64::from(SLOTS) * u64::from(increment(kind).unwrap_or(0));
+            let desc = HeapDesc { kind, count: SLOTS, flags: SHADER_VISIBLE, nodes: 1 };
+            owner(desc, Placement { address: base(heap), size })
+        };
+        let owners = [make(0, SAMPLERS), make(1, VIEWS_KIND), make(2, SAMPLERS), make(3, VIEWS_KIND)];
+        let unwatched = owner(
+            HeapDesc { kind: VIEWS_KIND, count: SLOTS, flags: SHADER_VISIBLE, nodes: 1 },
+            Placement { address: 0, size: 0 },
+        );
+        let unwatched_start = heap(unwatched.0).start;
+        if owners.iter().chain([&unwatched]).any(|o| heap(o.0).host().is_none()) {
+            drop(unwatched);
+            drop(owners);
+            crate::watch::tests::free(memory);
+            return;
+        }
+        // Memory the placed textures' views name (never read: such a view
+        // is left null until a shader reads its slot, which none does).
+        let textures = vec![0u8; 16 << 12];
+        let textures_at = textures.as_ptr() as u64;
+        let sampler_heap = owners[0].0 as usize;
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let stop = &stop;
+            scope.spawn(move || {
+                HEAPS_ALONE.with(|a| a.set(alone));
+                let host = crate::host::host().expect("checked");
+                let mut round = 0u32;
+                while !stop.load(Relaxed) {
+                    host.between_submissions(sync_heaps);
+                    round += 1;
+                    if round.is_multiple_of(4) {
+                        with_slots_still(|_| ());
+                        let _ = read_textures(&[FIRST, FIRST + 1]);
+                        evict(&Default::default());
+                        make_read(&[]);
+                    }
+                }
+            });
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|t| {
+                    scope.spawn(move || {
+                        HEAPS_ALONE.with(|a| a.set(alone));
+                        let null = std::ptr::null();
+                        // Records of 16 samplers and of 16 placed texture
+                        // views, where no heap sees them.
+                        let (sampler_records, view_records) = ([0u64; 2 * 16], [0u64; 4 * 16]);
+                        let from = |views: bool, k: u64| match views {
+                            false => sampler_records.as_ptr() as u64 + 16 * k,
+                            true => view_records.as_ptr() as u64 + 32 * k,
+                        };
+                        let sampler = |k: u64| [21, 1 + k as u32 % 4, 1 + k as u32 / 4, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+                        // A 4x1 RGBA8 texture, linear, and a 2D view of it.
+                        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+                        let placed = |k: u64| {
+                            let mut view = [0u32; 16];
+                            view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+                            let address = textures_at + (k << 12);
+                            (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+                            view
+                        };
+                        for k in 0..16 {
+                            create_sampler(null, &sampler(k), from(false, k));
+                            create_placed_srv(null, &words, &placed(k), from(true, k));
+                        }
+                        let mut seed = 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(t + 1);
+                        for _ in 0..ROUNDS {
+                            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                            let (what, k, wide) = (seed >> 60, seed >> 56 & 15, seed >> 52 & 15);
+                            // Mostly the same few slots as the other threads.
+                            let span = if wide == 0 { u64::from(SLOTS - FIRST) - 4 } else { 24 };
+                            let slot = FIRST + ((seed >> 20) % span) as u32;
+                            // A third of the writes into the heap no sync
+                            // looks at: by calls only.
+                            let own = (seed >> 48) % 3 == 0;
+                            let views = own || what & 1 == 1;
+                            let (kind, step) = if views { (VIEWS_KIND, 32u64) } else { (SAMPLERS, 16) };
+                            let start = if own { unwatched_start } else { base(usize::from(views)) };
+                            let at = start + u64::from(slot) * step;
+                            match what >> 1 {
+                                2..=4 if own => create_placed_srv(null, &words, &placed(k), at),
+                                0 if views => create_placed_srv(null, &words, &placed(k), at),
+                                0 => create_sampler(null, &sampler(k), at),
+                                1 => copy_simple(null, 1 + (k as u32 & 3), at, from(views, k.min(12)), kind),
+                                // As bytes, with no call: the next sync finds it.
+                                // SAFETY: a record of ours into a slot of the heap.
+                                2 | 3 => unsafe {
+                                    std::ptr::copy_nonoverlapping(from(views, k) as *const u8, at as *mut u8, 12)
+                                },
+                                // SAFETY: a slot of the heap.
+                                4 => unsafe { std::ptr::write_bytes(at as *mut u8, 0, step as usize) },
+                                // As a draw binding the slot through a table
+                                // (sampler slots: a placed texture's would be
+                                // made from memory that is no texture).
+                                5 | 6 if !views => {
+                                    let title = heap(sampler_heap as This);
+                                    let _ = title.host().and_then(|h| h.mirror(slot, at, true));
+                                }
+                                _ => {
+                                    let _ = view(at);
+                                }
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.join().expect("a writing thread");
+            }
+            stop.store(true, Relaxed);
+        });
+        // One thread gives the second pair the same bytes.
+        for h in 0..2 {
+            let bytes = SLOTS as usize * if h == 0 { 16 } else { 32 };
+            // SAFETY: both heaps' memory, of `bytes` each.
+            unsafe { std::ptr::copy_nonoverlapping(base(h) as *const u8, base(h + 2) as *mut u8, bytes) };
+        }
+        host.between_submissions(sync_heaps);
+        for h in 0..2 {
+            let step = if h == 0 { 16 } else { 32 };
+            let (raced, single) = (heap(owners[h].0).host().expect("checked"), heap(owners[h + 2].0).host().expect("checked"));
+            let mut made = 0;
+            for i in 0..SLOTS {
+                // SAFETY: a slot of the heap.
+                let record = unsafe { ((base(h) + u64::from(i) * step) as *const [u32; 3]).read_unaligned() };
+                let key = match views_current(&[record])[0] {
+                    true => u64::from(record[2]) << 32 | u64::from(record[1]),
+                    false => 0,
+                };
+                assert_eq!(raced.made_key(i), key, "heap {h} slot {i}: made from its record");
+                assert_eq!(raced.made_key(i), single.made_key(i), "heap {h} slot {i}: as one thread leaves it");
+                assert_eq!(raced.kept(i), single.kept(i), "heap {h} slot {i}: holding what one thread leaves");
+                made += usize::from(key != 0);
+            }
+            if h == 1 {
+                assert!(made > 0, "views were written");
+                assert_eq!(raced.viewed.slots(), made, "what the slots view is entered for the slots made");
+                assert_eq!(single.viewed.slots(), made);
+            }
+        }
+        let raced = heap(unwatched.0).host().expect("checked");
+        let mut made = 0;
+        for i in 0..SLOTS {
+            // SAFETY: a slot of the heap.
+            let record = unsafe { ((unwatched_start + u64::from(i) * 32) as *const [u32; 3]).read_unaligned() };
+            let key = match views_current(&[record])[0] {
+                true => u64::from(record[2]) << 32 | u64::from(record[1]),
+                false => 0,
+            };
+            assert_eq!(raced.made_key(i), key, "the heap no sync looks at, slot {i}: made from its record");
+            made += usize::from(key != 0);
+        }
+        assert!(made > 0, "views were written");
+        assert_eq!(raced.viewed.slots(), made, "what the slots view is entered for the slots made");
+        drop(unwatched);
+        drop(owners);
+        crate::watch::tests::free(memory);
+        HEAPS_ALONE.with(|a| a.set(false));
+    }
+
+    /// Several threads write the same slots of a heap no sync looks at, at
+    /// once, by calls (placed texture views, left null until read, and
+    /// cleared slots): after each round every slot is made from the record
+    /// it holds, whichever thread's write was the last.
+    #[cfg(windows)]
+    #[test]
+    fn the_last_of_several_threads_writing_a_slot_at_once_makes_it() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        const SLOTS: u32 = 96;
+        const FIRST: u32 = 64;
+        let title = owner(
+            HeapDesc { kind: VIEWS_KIND, count: SLOTS, flags: SHADER_VISIBLE, nodes: 1 },
+            Placement { address: 0, size: 0 },
+        );
+        let start = heap(title.0).start;
+        let Some(host) = heap(title.0).host() else { return };
+        let textures = vec![0u8; 16 << 12];
+        let textures_at = textures.as_ptr() as u64;
+        for round in 0..400u64 {
+            let barrier = std::sync::Barrier::new(4);
+            std::thread::scope(|scope| {
+                for t in 0..4u64 {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+                        let mut view = [0u32; 16];
+                        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+                        let address = textures_at + ((round + t) % 16 << 12);
+                        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+                        barrier.wait();
+                        for i in FIRST..SLOTS {
+                            let at = start + u64::from(i) * 32;
+                            if (round + t + u64::from(i)).is_multiple_of(5) {
+                                // A cleared slot, written by a copy of zeros.
+                                let zeros = [0u64; 4];
+                                copy_simple(std::ptr::null(), 1, at, zeros.as_ptr() as u64, VIEWS_KIND);
+                            } else {
+                                create_placed_srv(std::ptr::null(), &words, &view, at);
+                            }
+                        }
+                    });
+                }
+            });
+            for i in FIRST..SLOTS {
+                // SAFETY: a slot of the heap.
+                let record = unsafe { ((start + u64::from(i) * 32) as *const [u32; 3]).read_unaligned() };
+                let key = match views_current(&[record])[0] {
+                    true => u64::from(record[2]) << 32 | u64::from(record[1]),
+                    false => 0,
+                };
+                assert_eq!(host.made_key(i), key, "round {round}, slot {i}");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn slots_written_from_several_threads_during_syncs_end_as_their_records() {
+        for _ in 0..3 {
+            slots_written_during_syncs_end_as_their_records(false);
+        }
+    }
+
+    /// The same with the heaps' lock held alone wherever it is taken (as
+    /// `VICTORY_HEAPS_SHARED=0`).
+    #[cfg(windows)]
+    #[test]
+    fn slots_written_from_several_threads_end_as_their_records_with_the_heaps_held_alone() {
+        slots_written_during_syncs_end_as_their_records(true);
+    }
+
     /// A placed heap reused at the same address replaces the stale range;
     /// descriptor writes go only to the new heap.
     #[cfg(windows)]
@@ -1191,7 +1667,7 @@ pub(crate) mod tests {
         let old = owner(desc, placement);
         let new = owner(desc, placement);
         {
-            let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
             assert_eq!(
                 heaps
                     .iter()
@@ -1244,7 +1720,7 @@ pub(crate) mod tests {
             crate::object::S_FALSE
         );
         {
-            let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
             assert_eq!(heap_at(&heaps, address), Some(existing.0 as usize));
         }
         create_cbv(std::ptr::null(), &[0x3000, 1, 256, 0], address);

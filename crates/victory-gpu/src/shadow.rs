@@ -38,7 +38,7 @@ pub(crate) struct Shadow {
     tracked: Option<crate::watch::Tracked>,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
-    pending: Mutex<std::collections::HashSet<(usize, usize)>>,
+    pending: Mutex<crate::quick::Set<(usize, usize)>>,
     /// The copy's bytes before the submission ran where its shaders write:
     /// what the GPU wrote differs. Disjoint segments (offset, bytes) in
     /// order, and the 64 KiB pieces (by title address) already compared.
@@ -103,7 +103,7 @@ impl Drop for Flight {
 
 /// Snapshot segments (offset, bytes; `crate::segments`) and the pieces
 /// compared.
-type Snapshot = (Vec<crate::segments::Segment>, std::collections::HashSet<usize>);
+type Snapshot = (Vec<crate::segments::Segment>, crate::quick::Set<usize>);
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
@@ -1109,10 +1109,32 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+/// A read-write lock: a lookup that finds the copy made ([`find`], for every
+/// buffer view made and every draw's buffers) shares it with others;
+/// registering, releasing and making a copy hold it alone ([`buffers`]).
+static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+/// The title buffers, held alone.
+fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether lookups of copies already made share their registries
+/// ([`BUFFERS`], [`LOOSE`]): unless `VICTORY_COPIES_SHARED=0`, which takes
+/// them alone for every lookup, as when they were mutexes.
+fn lookups_shared() -> bool {
+    #[cfg(test)]
+    if tests::LOOKUPS_ALONE.with(|alone| alone.get()) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_COPIES_SHARED"))
+}
+
+/// The buffer [`find`] takes for `[address, end)`: the innermost of the
+/// nearest 64 starting at or below it.
+fn holding(map: &BTreeMap<(u64, usize), Entry>, address: u64, end: u64) -> Option<(u64, usize)> {
+    map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).map(|(k, _)| *k)
 }
 
 /// Counts copies made and title buffers released: [`all`] may differ when
@@ -1151,13 +1173,25 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 #[track_caller]
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
+    // The copy already made, or no buffer there: found with the buffers
+    // shared. A copy to make is made below with them held alone, the
+    // buffer looked up again.
+    if lookups_shared() {
+        let map = crate::contend::read(&BUFFERS, crate::contend::Lock::Copies);
+        match holding(&map, address, end) {
+            None => {
+                drop(map);
+                return loose(address, end);
+            }
+            Some(key) => {
+                if let Some(shadow) = map.get(&key).and_then(|e| e.shadow.clone()) {
+                    return Some(shadow);
+                }
+            }
+        }
+    }
+    let mut map = crate::contend::write(&BUFFERS, crate::contend::Lock::Copies);
+    let key = holding(&map, address, end);
     let Some(key) = key else {
         drop(map);
         return loose(address, end);
@@ -1197,14 +1231,26 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// ([`release_idle`]) and made again when asked for.
 const WINDOW: u64 = 4 << 20;
 
-/// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+/// Copies of title memory outside buffers, by (start, length). A
+/// read-write lock: a lookup that finds its window ([`loose`]) shares it
+/// and stamps the window while it holds it; a release ([`release_idle`])
+/// holds it alone while it checks those stamps and takes windows out, so
+/// no window goes that a lookup holding the lock has found.
+static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
 #[track_caller]
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    if lookups_shared()
+        && let Some(shadow) = crate::contend::read(&LOOSE, crate::contend::Lock::Copies).get(&(start, len))
+    {
+        // Under the lock (shared), which a release holds alone.
+        shadow.ask();
+        return Some(shadow.clone());
+    }
+    // Looked up again: another thread may have made it meanwhile.
+    let mut map = crate::contend::write(&LOOSE, crate::contend::Lock::Copies);
     if let Some(shadow) = map.get(&(start, len)) {
         // Under the lock, where a release checks it.
         shadow.ask();
@@ -1328,7 +1374,7 @@ fn make_missed_again() -> u64 {
     for (start, len) in wanted {
         // Counted as made again where it is made (`loose`); one a lookup
         // made meanwhile is not counted here.
-        let there = LOOSE.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(start, len));
+        let there = LOOSE.write().unwrap_or_else(|e| e.into_inner()).contains_key(&(start, len));
         if !there && loose(start, start + len).is_some() {
             made += 1;
         }
@@ -1371,7 +1417,7 @@ fn release_idle(now: crate::idle::Stamp, seconds: u64, within: Option<(u64, u64)
     let idle = |s: &Shadow| crate::idle::idle(asked(s), now, seconds);
     let at = |s: &Arc<Shadow>| Arc::as_ptr(s) as usize;
     let candidates: Vec<Arc<Shadow>> = LOOSE
-        .lock()
+        .write()
         .unwrap_or_else(|e| e.into_inner())
         .values()
         .filter(|s| inside(s) && idle(s))
@@ -1387,7 +1433,7 @@ fn release_idle(now: crate::idle::Stamp, seconds: u64, within: Option<(u64, u64)
     let (gone, shown, busy) = crate::descriptor::with_slots_still(|slots| {
         use windows::core::Interface;
         let shown = crate::bindless::shown(&candidates.iter().map(at).collect());
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         let mut released = released();
         let (mut free, mut busy) = (Vec::new(), 0u64);
         for c in candidates.iter().filter(|c| !shown.contains(&at(c))) {
@@ -1439,7 +1485,7 @@ fn release_idle(now: crate::idle::Stamp, seconds: u64, within: Option<(u64, u64)
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log_idle() {
     let (alive, bytes) = {
-        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         (map.len(), map.values().map(|s| s.len).sum::<u64>())
     };
     let [gone, gone_bytes, again, again_bytes, missed] = [0, 1, 2, 3, 4].map(|i| IDLE_COUNTS[i].swap(0, Relaxed));
@@ -1642,7 +1688,7 @@ impl Arena {
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
     let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
-    all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    all.extend(LOOSE.write().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all
 }
 
@@ -1655,7 +1701,7 @@ pub(crate) fn near(va: u64) -> String {
         .collect();
     all.extend(
         LOOSE
-            .lock()
+            .write()
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
@@ -1687,6 +1733,51 @@ pub(crate) mod tests {
         pub(super) static NO_GAP_MEMO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// This thread's snapshots are joined (as `VICTORY_SNAPSHOTS_APART=0`).
         pub(super) static JOINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// This thread takes the copies' registries alone for every lookup
+        /// (as `VICTORY_COPIES_SHARED=0`).
+        pub(super) static LOOKUPS_ALONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Threads look up copies of the same buffers and windows at once, none
+    /// of them made before: each range gets one copy, whichever thread made
+    /// it, and every thread finds that one from then on, with the
+    /// registries shared for lookups and taken alone.
+    #[test]
+    fn lookups_from_several_threads_find_one_copy_each() {
+        let Some((p, w)) = windows(2) else { return };
+        let b = crate::watch::tests::pool(4);
+        let buffer = |k: usize| b + k * PAGE;
+        (0..4).for_each(|k| register(buffer(k), buffer(k) as u64, PAGE as u64));
+        let found: Vec<Vec<usize>> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..6)
+                .map(|t| {
+                    scope.spawn(move || {
+                        LOOKUPS_ALONE.with(|alone| alone.set(t % 3 == 2));
+                        let mut seen = [0usize; 6];
+                        for round in 0..2000u64 {
+                            for k in 0..6 {
+                                let address = match k {
+                                    0..4 => buffer(k) as u64 + 16 * (round % 8),
+                                    _ => w + (k as u64 - 4) * WINDOW + 4096 * (round % 8),
+                                };
+                                let copy = find(address, 64).expect("a copy");
+                                let at = Arc::as_ptr(&copy) as usize;
+                                assert!(seen[k] == 0 || seen[k] == at, "another copy of range {k}");
+                                seen[k] = at;
+                            }
+                        }
+                        seen.to_vec()
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().expect("a lookup thread")).collect()
+        });
+        assert!(found.iter().all(|seen| seen == &found[0]), "{found:x?}");
+        let distinct: std::collections::BTreeSet<usize> = found[0].iter().copied().collect();
+        assert_eq!(distinct.len(), 6, "a copy for each range");
+        (0..4).for_each(|k| unregister(buffer(k), buffer(k) as u64));
+        crate::watch::tests::free(b);
+        done(p, 2);
     }
 
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
@@ -2426,9 +2517,9 @@ pub(crate) mod tests {
         note_missed(w + WINDOW, w + WINDOW + 0x1_0000);
         // Other tests' misses are made again by whichever test comes first.
         make_missed_again();
-        let again = LOOSE.lock().unwrap().get(&(w, WINDOW)).cloned().expect("made again");
+        let again = LOOSE.write().unwrap().get(&(w, WINDOW)).cloned().expect("made again");
         assert!(!Arc::ptr_eq(&again, &copy), "a new one");
-        assert!(!LOOSE.lock().unwrap().contains_key(&(w + WINDOW, WINDOW)), "never released: not made");
+        assert!(!LOOSE.write().unwrap().contains_key(&(w + WINDOW, WINDOW)), "never released: not made");
         again.update(w as usize + 0x1_0000, 4);
         assert_eq!(again.read_host(w + 0x1_0000, 1), [9], "from title memory");
         assert!(released().pinned((w, WINDOW)));

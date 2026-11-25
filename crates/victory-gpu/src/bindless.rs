@@ -9,7 +9,7 @@
 //! such shaders first brings all of them up to date (what changed since,
 //! `crate::watch`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
@@ -50,20 +50,20 @@ type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
 
 #[derive(Default)]
 struct Inner {
-    slots: HashMap<u32, Seen>,
+    slots: crate::quick::Map<u32, Seen>,
     ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
     textures: BTreeMap<usize, u32>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
     /// as ranges come and go (each list running heap shaders asks for all
     /// of them; rebuilt whole after every change, they cost 13-27 ms a frame,
     /// run perf4).
-    hulls: HashMap<(usize, bool), Hull>,
+    hulls: crate::quick::Map<(usize, bool), Hull>,
     /// Per copy and kind (unordered access): the copy, and how many ranges
     /// start and end at each offset, so that the hulls are made from the
     /// copies, not from every range (the title rewrites slots between most
     /// lists, and remerging the world's 130,000 ranges each time cost 0.15
     /// s per frame).
-    ends: HashMap<(usize, bool), Ends>,
+    ends: crate::quick::Map<(usize, bool), Ends>,
 }
 
 /// A copy, and the counts of its ranges' starts and ends.
@@ -131,7 +131,7 @@ impl Viewed {
     /// host (`made`) or left without a host view.
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
         let seen = view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) });
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = crate::contend::lock(&self.inner, crate::contend::Lock::Viewed);
         if let Some(old) = inner.slots.remove(&index) {
             inner.count(&old, false);
         }
@@ -139,6 +139,12 @@ impl Viewed {
             inner.count(&seen, true);
             inner.slots.insert(index, seen);
         }
+    }
+
+    /// How many title slots hold a view (tests).
+    #[cfg(test)]
+    pub(crate) fn slots(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).slots.len()
     }
 
     /// The buffer ranges views reach, merged per host copy and kind
@@ -381,7 +387,7 @@ pub(crate) fn log(frames: f64) {
         let mut left = [0u32; KINDS.len()];
         let (mut buffers, mut textures) = (0u32, 0u32);
         // Placed textures left null: the largest at each address.
-        let mut placed = HashMap::new();
+        let mut placed = std::collections::HashMap::new();
         for seen in inner.slots.values() {
             match seen {
                 Seen::Buffer(..) => buffers += 1,

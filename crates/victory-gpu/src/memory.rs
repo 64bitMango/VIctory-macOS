@@ -32,7 +32,7 @@
 //! shortcut: a table names copies in at most [`CAPACITY`] 256 MiB regions;
 //! past that, the smallest copies read as missing (logged once).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -102,7 +102,7 @@ struct Shared {
     /// The pair of null views entries without a copy name.
     null: u32,
     /// Each copy's view pair (its first slot), by copy.
-    pairs: HashMap<usize, u32>,
+    pairs: crate::quick::Map<usize, u32>,
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
     layout: Arc<Layout>,
@@ -338,7 +338,7 @@ impl Shared {
             data: data as usize,
             gpu,
             null,
-            pairs: HashMap::new(),
+            pairs: Default::default(),
             generation: u64::MAX,
             layout: Arc::default(),
         })

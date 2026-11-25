@@ -105,7 +105,8 @@ pub(crate) enum C {
     /// Time in copies redone piece by piece after meeting an unmapped page.
     FallbackUs,
     /// Title threads writing a view into a shader-visible heap: time
-    /// waiting for the heaps' lock (held by heap syncs and other writers).
+    /// waiting for the heaps' lock (held alone by passes over the slots;
+    /// with `VICTORY_HEAPS_SHARED=0` by heap syncs and other writers too).
     MirrorWaitUs,
     /// Copies' remembered gaps (memory with nothing committed,
     /// `crate::shadow::Shadow::copy`): gaps found still uncommitted and
@@ -121,8 +122,45 @@ pub(crate) enum C {
     /// finding those whose slot is to be made again, and how many were.
     SyncLookUs,
     SyncMade,
+    /// Of the slots heap syncs made, by why: nothing was made there; the
+    /// title's record names another view; the record names no view any
+    /// more (`crate::descriptor::host::Due`).
+    SyncFirst,
+    SyncRewrote,
+    SyncStale,
+    /// And by what was made: nothing (the slot made null), a constant
+    /// buffer's view, a placed texture's left null until read.
+    SyncNulled,
+    SyncConstant,
+    SyncLeft,
+    /// Waits for locks the recording threads and the submitting thread
+    /// share (`crate::contend`): how often the heaps' lock was taken when a
+    /// title thread writing a view asked ([`C::MirrorWaitUs`] is the time);
+    /// time and times for a heap's slot lock, of heap syncs and of others;
+    /// for the views table; for what a heap's slots view; for the copies'
+    /// registries.
+    HeapsContended,
+    SlotWaitUs,
+    SlotContended,
+    SyncSlotWaitUs,
+    SyncSlotContended,
+    ViewsWaitUs,
+    ViewsContended,
+    ViewedWaitUs,
+    ViewedContended,
+    CopiesWaitUs,
+    CopiesContended,
+    /// Time the heaps' lock was held alone by passes over the slots
+    /// (`crate::descriptor::heaps_for_pass`).
+    HeapsAloneUs,
+    /// Views the title recorded that the views table held already, and new
+    /// ones.
+    RecordFound,
+    RecordNew,
+    /// Not a counter: how many there are.
+    Count,
 }
-const COUNTERS: usize = 68;
+const COUNTERS: usize = C::Count as usize;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -330,7 +368,7 @@ pub(crate) fn log(frames: f64) {
         .collect();
     tracing::info!("  guard lock held per frame: {}", held.join(", "));
     tracing::info!(
-        "  prepare waste per frame: uncommitted gaps of copies passed with one query {:.1} ({:.2} MB zeroed, no read tried), {:.1} forgotten (committed since); snapshots {:.1} MB, {:.1} MB of them copied again as their segment grew; heap syncs (the heaps' lock held throughout, {:.1} ms) looked at {:.0} slots in {:.1} ms and made {:.0}",
+        "  prepare waste per frame: uncommitted gaps of copies passed with one query {:.1} ({:.2} MB zeroed, no read tried), {:.1} forgotten (committed since); snapshots {:.1} MB, {:.1} MB of them copied again as their segment grew; heap syncs (the heaps' lock held throughout, {:.1} ms) looked at {:.0} slots in {:.1} ms and made {:.0}: {:.0} for the first time, {:.0} the title rewrote, {:.0} whose record names no view any more; of them {:.0} made null, {:.0} constant buffers, {:.0} placed textures left until read",
         c[C::GapsKept as usize],
         mb(c[C::GapBytes as usize]),
         c[C::GapsDropped as usize],
@@ -340,6 +378,30 @@ pub(crate) fn log(frames: f64) {
         c[C::SyncSlots as usize],
         ms(c[C::SyncLookUs as usize]),
         c[C::SyncMade as usize],
+        c[C::SyncFirst as usize],
+        c[C::SyncRewrote as usize],
+        c[C::SyncStale as usize],
+        c[C::SyncNulled as usize],
+        c[C::SyncConstant as usize],
+        c[C::SyncLeft as usize],
+    );
+    tracing::info!(
+        "  lock waits per frame (time, times a thread found the lock taken): title threads writing views for the heaps' lock {:.1} ms, {:.0} (held alone by passes over the slots {:.1} ms); for a heap's slot lock {:.1} ms, {:.0} (heap syncs {:.1} ms, {:.0}); for the views table {:.1} ms, {:.0} ({:.0} views recorded were held already, {:.0} new); for what a heap's slots view {:.1} ms, {:.0}; for the copies' registries {:.1} ms, {:.0}",
+        ms(c[C::MirrorWaitUs as usize]),
+        c[C::HeapsContended as usize],
+        ms(c[C::HeapsAloneUs as usize]),
+        ms(c[C::SlotWaitUs as usize]),
+        c[C::SlotContended as usize],
+        ms(c[C::SyncSlotWaitUs as usize]),
+        c[C::SyncSlotContended as usize],
+        ms(c[C::ViewsWaitUs as usize]),
+        c[C::ViewsContended as usize],
+        c[C::RecordFound as usize],
+        c[C::RecordNew as usize],
+        ms(c[C::ViewedWaitUs as usize]),
+        c[C::ViewedContended as usize],
+        ms(c[C::CopiesWaitUs as usize]),
+        c[C::CopiesContended as usize],
     );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
