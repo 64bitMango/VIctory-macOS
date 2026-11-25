@@ -260,11 +260,16 @@ pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
     let Some(level) = level() else {
         return false;
     };
+    LIGHT_RESOURCE.store(light as usize, Ordering::Relaxed);
     let Some(light) = crate::resource::host_resource(light) else {
         return false;
     };
     record(list, &light, depth, level)
 }
+
+/// The title's indirect diffuse light image the pass last wrote
+/// (diagnostics: `draw::probe_constants` lists the programs that read it).
+pub(crate) static LIGHT_RESOURCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The pass, made once.
 fn pass() -> Option<&'static Pass> {

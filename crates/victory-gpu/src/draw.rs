@@ -1480,14 +1480,36 @@ impl State {
                 })
                 .collect()
         });
-        if probes.is_empty() || !crate::capture::listed(crate::queue::presented() + 1) {
+        if !crate::capture::listed(crate::queue::presented() + 1) {
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
+        // Programs that read the ambient pass's light image through a table
+        // are listed too, once each: where the indirect light goes next.
+        let light = crate::ambient::LIGHT_RESOURCE.load(Ordering::Relaxed);
+        static READERS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         for stage in &p.stages {
-            let Some(&(_, offset)) = probes.iter().find(|(h, _)| stage.shader.hash.contains(h.as_str())) else {
+            let probe = probes.iter().find(|(h, _)| stage.shader.hash.contains(h.as_str())).map(|&(_, o)| o);
+            let reads_light = probe.is_none()
+                && light != 0
+                && stage.translated().used.iter().any(|u| {
+                    u.kind == ResourceType::Srv
+                        && u.root == RootType::Table
+                        && matches!(self.roots_ref(compute).get(usize::from(u.slot)), Some(Root::Table(table))
+                            if matches!(crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4), Some(View::Shader(r, _)) if r == light))
+                })
+                && {
+                    let mut readers = READERS.lock().unwrap_or_else(|e| e.into_inner());
+                    let new = !readers.contains(&stage.shader.hash) && readers.len() < 16;
+                    if new {
+                        readers.push(stage.shader.hash.clone());
+                        tracing::info!(target: "victory_gpu::trace", "reads the ambient light image {light:#x}: {} ({})", stage.shader.hash, p.name);
+                    }
+                    new
+                };
+            if probe.is_none() && !reads_light {
                 continue;
-            };
+            }
             // What the shader reads and writes through its tables: the
             // resource (as the capture names its dumps), format and size.
             static READS: AtomicU64 = AtomicU64::new(0);
@@ -1497,7 +1519,7 @@ impl State {
                 else {
                     continue;
                 };
-                if READS.fetch_add(1, Ordering::Relaxed) >= 256 {
+                if READS.fetch_add(1, Ordering::Relaxed) >= 1024 {
                     break;
                 }
                 let who = format!(
@@ -1530,6 +1552,7 @@ impl State {
                     None => tracing::info!(target: "victory_gpu::trace", "view {who}: resource {r:#x} has no host resource"),
                 }
             }
+            let Some(offset) = probe else { continue };
             for u in stage.translated().used.iter().filter(|u| u.kind == ResourceType::Cbv) {
                 let (RootType::Table, Some(Root::Table(table))) =
                     (u.root, self.roots_ref(compute).get(usize::from(u.slot)))
