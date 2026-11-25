@@ -722,11 +722,16 @@ impl HostHeap {
             }
             return None;
         }
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        // Read with the slot lock held: whichever thread makes the slot
+        // last read its record last. A title thread's write is followed by
+        // its own call here, so a heap sync or draw that read the record
+        // from before cannot leave the slot made from that one (heap syncs
+        // run beside title threads, `crate::descriptor::SHADER_HEAPS`).
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
