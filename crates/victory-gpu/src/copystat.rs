@@ -107,8 +107,15 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
+    /// Copies' remembered gaps (memory with nothing committed,
+    /// `crate::shadow::Shadow::copy`): gaps found still uncommitted and
+    /// zeroed with no read tried, their bytes; gaps forgotten because
+    /// something was committed there.
+    GapsKept,
+    GapBytes,
+    GapsDropped,
 }
-const COUNTERS: usize = 62;
+const COUNTERS: usize = 65;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -315,6 +322,12 @@ pub(crate) fn log(frames: f64) {
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
         .collect();
     tracing::info!("  guard lock held per frame: {}", held.join(", "));
+    tracing::info!(
+        "  prepare waste per frame: uncommitted gaps of copies passed with one query {:.1} ({:.2} MB zeroed, no read tried), {:.1} forgotten (committed since)",
+        c[C::GapsKept as usize],
+        mb(c[C::GapBytes as usize]),
+        c[C::GapsDropped as usize],
+    );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
     snapshots.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
