@@ -50,20 +50,20 @@ type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
 
 #[derive(Default)]
 struct Inner {
-    slots: HashMap<u32, Seen>,
+    slots: crate::quick::Map<u32, Seen>,
     ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
     textures: BTreeMap<usize, u32>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
     /// as ranges come and go (each list running heap shaders asks for all
     /// of them; rebuilt whole after every change, they cost 13-27 ms a frame,
     /// run perf4).
-    hulls: HashMap<(usize, bool), Hull>,
+    hulls: crate::quick::Map<(usize, bool), Hull>,
     /// Per copy and kind (unordered access): the copy, and how many ranges
     /// start and end at each offset, so that the hulls are made from the
     /// copies, not from every range (the title rewrites slots between most
     /// lists, and remerging the world's 130,000 ranges each time cost 0.15
     /// s per frame).
-    ends: HashMap<(usize, bool), Ends>,
+    ends: crate::quick::Map<(usize, bool), Ends>,
 }
 
 /// A copy, and the counts of its ranges' starts and ends.

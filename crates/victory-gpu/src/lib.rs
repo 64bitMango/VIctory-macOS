@@ -70,6 +70,8 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
+#[cfg(any(windows, test))]
+mod quick;
 pub mod signature;
 mod switch;
 #[cfg(windows)]

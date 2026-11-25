@@ -73,7 +73,7 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    fresh_tables: crate::quick::Map<(u64, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -84,7 +84,7 @@ pub(crate) struct State {
     memory: Option<(usize, crate::memory::Map)>,
     /// Views made for root SRVs and UAVs in this list ([`State::root_view`]):
     /// (view heap, host copy, unordered access) → dynamic slot.
-    root_slots: std::collections::HashMap<(usize, usize, bool), u32>,
+    root_slots: crate::quick::Map<(usize, usize, bool), u32>,
     /// The run of dynamic slots root views take from (view heap, next
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
