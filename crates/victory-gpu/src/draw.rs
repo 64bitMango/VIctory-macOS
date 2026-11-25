@@ -95,6 +95,9 @@ pub(crate) struct State {
     /// The run of indirect draws being recorded whose clamps go to the host
     /// list before (`crate::indirect::hoisting`).
     hoist: Option<Hoist>,
+    /// The host list and its count of writes at the last pipeline sync
+    /// that put a barrier on it ([`State::synced`]).
+    synced: (usize, u64),
 }
 
 /// Where the clamps of a run of indirect draws go: `clamps`, the host list
@@ -387,6 +390,18 @@ impl State {
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         self.pipeline = pipeline as usize;
+    }
+
+    /// A pipeline sync of the title's: whether it puts an unordered-access
+    /// barrier on the host list (`crate::list::sync_due`), which the
+    /// caller then does.
+    pub(crate) fn synced(&mut self, list: &HostList, mode: u8) -> bool {
+        let now = (std::ptr::from_ref(list) as usize, list.writes());
+        let due = crate::list::sync_due(mode, self.synced, now);
+        if due {
+            self.synced = now;
+        }
+        due
     }
 
     /// Fixed-function state, straight onto the host list (and kept for the
