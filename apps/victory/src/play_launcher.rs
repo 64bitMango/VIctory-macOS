@@ -13,7 +13,17 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     let folder = launcher.parent().context("Launcher folder is missing")?;
     let runtime = folder.join("victory.exe");
     let mut args = std::env::args_os().skip(1).peekable();
-    let warp = args.next_if(|value| value == "--warp").is_some();
+    let (mut warp, mut rt) = (false, false);
+    while let Some(option) = args.peek() {
+        if option == "--warp" {
+            warp = true;
+        } else if option == "--rt" {
+            rt = true;
+        } else {
+            break;
+        }
+        args.next();
+    }
     let game = match args.next() {
         Some(path) => PathBuf::from(path),
         None => {
@@ -24,7 +34,7 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         }
     };
     if args.next().is_some() {
-        bail!("Usage\n{} [--warp] [game executable]", launcher.display());
+        bail!("Usage\n{} [--rt] [--warp] [game executable]", launcher.display());
     }
     if !game.is_file() || !runtime.is_file() {
         bail!(
@@ -70,6 +80,14 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     fs::write(logs.join(latest), path.display().to_string())?;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut child = Command::new(&runtime);
+    if rt {
+        child
+            .env("VICTORY_BVH_BUILDER", "1")
+            .env("VICTORY_BVH_QUARANTINE", "0")
+            .env("VICTORY_ACTIVATE_RAYS", "1")
+            .env("VICTORY_RT_RESOLVE", "1");
+        writeln!(log, "Experimental ray tracing requested")?;
+    }
     if warp {
         child.env("VICTORY_D3D12_WARP", "1");
     }

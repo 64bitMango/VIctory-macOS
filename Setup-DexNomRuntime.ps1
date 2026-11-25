@@ -82,8 +82,15 @@ try {
 $launcher = Join-Path $InstallDir 'victory-play.exe'
 Write-Host "Installed DexNom Runtime in $InstallDir"
 [IO.Directory]::CreateDirectory($ShortcutDirectory) | Out-Null
-$shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $ShortcutDirectory 'DexNom Runtime.lnk'))
-$shortcut.TargetPath = $launcher
-$shortcut.WorkingDirectory = $InstallDir
-$shortcut.Save()
-Write-Host "Open DexNom Runtime from the shortcut in $ShortcutDirectory to play."
+$shell = New-Object -ComObject WScript.Shell
+foreach ($entry in @(
+    @{ Name = 'DexNom Runtime'; Arguments = '' }
+    @{ Name = 'DexNom Runtime (Experimental RT)'; Arguments = '--rt' }
+)) {
+    $shortcut = $shell.CreateShortcut((Join-Path $ShortcutDirectory ($entry.Name + '.lnk')))
+    $shortcut.TargetPath = $launcher
+    $shortcut.Arguments = $entry.Arguments
+    $shortcut.WorkingDirectory = $InstallDir
+    $shortcut.Save()
+}
+Write-Host "Open DexNom Runtime from $ShortcutDirectory to play, or select DexNom Runtime (Experimental RT) to try ray tracing."
