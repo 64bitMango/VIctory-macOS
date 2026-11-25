@@ -488,23 +488,35 @@ fn without_idle_skips(
     kept: Option<&Kept>,
 ) -> Option<HostShader> {
     const S_NOP: u32 = 0xBF80_0000;
-    let skips = lower::idle_skips(p, st);
-    if skips.is_empty() {
-        return None;
+    // First with the skips around loops left in, then without those too.
+    let mut tried = Vec::new();
+    for loops in [false, true] {
+        let skips = lower::idle_skips(p, st, loops);
+        if skips.is_empty() || skips == tried {
+            continue;
+        }
+        let mut code = code.to_vec();
+        for &at in &skips {
+            code[at..at + 4].copy_from_slice(&S_NOP.to_le_bytes());
+        }
+        tried = skips;
+        let Ok((p, st)) = crate::range::build(&code, native.wave64, native.vgprs) else {
+            continue;
+        };
+        let Ok(res) = resource::track(&p, &native.layout, native.stage, st.as_ref().ok()) else {
+            continue;
+        };
+        let (Ok(io), Ok(st)) = (io::raise(&p, native), st) else {
+            continue;
+        };
+        let made = emit_keeping(c, native, &p, &st, &io, &res, options, kept);
+        if lower::take_wide().is_none()
+            && let Ok(made) = made
+        {
+            return Some(made);
+        }
     }
-    let mut code = code.to_vec();
-    for at in skips {
-        code[at..at + 4].copy_from_slice(&S_NOP.to_le_bytes());
-    }
-    let (p, st) = crate::range::build(&code, native.wave64, native.vgprs).ok()?;
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok()).ok()?;
-    let io = io::raise(&p, native).ok()?;
-    let st = st.ok()?;
-    let made = emit_keeping(c, native, &p, &st, &io, &res, options, kept);
-    match lower::take_wide() {
-        None => made.ok(),
-        Some(_) => None,
-    }
+    None
 }
 
 /// The vertex outputs a mesh translation keeps besides its system values:

@@ -12170,7 +12170,12 @@ fn undecided(p: &Program, decides: impl Fn(usize) -> bool) -> Vec<bool> {
 /// than at the skip's target; it writes an SGPR or SCC that is read after
 /// the target (other than a copy of what the register held, or a mask of
 /// the same lanes); or it does not hand EXEC on within what it got.
-pub(crate) fn idle_skips(p: &Program, st: &Structured) -> Vec<usize> {
+///
+/// `loops`: also the skips around such loops as no lane outside could go
+/// round in. (Without them a loop's shape may be lost on what reads it: a
+/// waterfall loop's first-lane reads are the lane's own only while the
+/// lanes enter it by its skip.)
+pub(crate) fn idle_skips(p: &Program, st: &Structured, loops: bool) -> Vec<usize> {
     let n = p.blocks.len();
     // Values some instruction reads, through the phis that pass them on.
     let mut live: Set<Value> = p
@@ -12344,6 +12349,9 @@ pub(crate) fn idle_skips(p: &Program, st: &Structured) -> Vec<usize> {
         let forward = |b: usize, s: usize| {
             if p.blocks[s].offset > p.blocks[b].offset {
                 return true;
+            }
+            if !loops {
+                return false;
             }
             let mut all = outside.clone();
             let side = |d: usize, to: usize| match st.exits[d] {
@@ -14490,7 +14498,7 @@ mod tests {
         }
         // The skip is what leaves that lane alone: it stays.
         let p = wave64(&w);
-        assert!(super::idle_skips(&p, &structure::structure(&p).unwrap()).is_empty());
+        assert!(super::idle_skips(&p, &structure::structure(&p).unwrap(), true).is_empty());
         // Only the compiler's form is taken: a lane number tested against
         // another scalar may be one that differs between the halves.
         let mut w = first_lane_block(0x7D24_0608);
@@ -14715,7 +14723,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         // (the skip of the lanes out of the test; the first lane's is what
         // leaves it alone in its block)
-        assert_eq!(super::idle_skips(&p, &st), [3 * 4]);
+        assert_eq!(super::idle_skips(&p, &st, true), [3 * 4]);
         // The lanes out of the test end, so the rest meet. Exchanged: the
         // lanes left as a number (for the first one, their count, and the
         // count below a lane), and the first lane in EXEC with which half
@@ -14724,7 +14732,12 @@ mod tests {
         // Without the skip every lane runs the code under EXEC.
         let w = allocation(|_| 0xBF80_0000, skip); // s_nop
         assert!(
-            super::idle_skips(&wave64(&w), &structure::structure(&wave64(&w)).unwrap()).is_empty()
+            super::idle_skips(
+                &wave64(&w),
+                &structure::structure(&wave64(&w)).unwrap(),
+                true
+            )
+            .is_empty()
         );
         assert_eq!(halves(&w, 64), (Some(32), 5));
         // So too with every lane in the first one's block.
@@ -14764,10 +14777,9 @@ mod tests {
             ]
         );
         let p = wave64(&w);
-        assert_eq!(
-            super::idle_skips(&p, &structure::structure(&p).unwrap()),
-            [6 * 4]
-        );
+        let st = structure::structure(&p).unwrap();
+        assert_eq!(super::idle_skips(&p, &st, true), [6 * 4]);
+        assert!(super::idle_skips(&p, &st, false).is_empty());
         // A loop the wave counts goes round in every lane, with whatever
         // count the skipped code is left with: its skip stays.
         let mut w = vec![V_LSHLREV_V1_2_V0, V_AND_V1_1_V0, 0xBE8A_0380]; // s_mov_b32 s10, 0
@@ -14782,7 +14794,7 @@ mod tests {
         w.extend(DS_WRITE_V1_V0);
         w.push(S_ENDPGM);
         let p = wave64(&w);
-        assert!(super::idle_skips(&p, &structure::structure(&p).unwrap()).is_empty());
+        assert!(super::idle_skips(&p, &structure::structure(&p).unwrap(), true).is_empty());
     }
 
     #[test]
@@ -14795,13 +14807,13 @@ mod tests {
         w.extend(DS_WRITE_V1_V2);
         w.push(S_ENDPGM);
         let p = wave64(&w);
-        assert!(super::idle_skips(&p, &structure::structure(&p).unwrap()).is_empty());
+        assert!(super::idle_skips(&p, &structure::structure(&p).unwrap(), true).is_empty());
         // Unread after it, the count shows nowhere.
         let at = w.iter().position(|&x| x == 0x7E04_020A).unwrap();
         w[at] = 0x7E04_0280; // v_mov_b32 v2, 0
         let p = wave64(&w);
         assert_eq!(
-            super::idle_skips(&p, &structure::structure(&p).unwrap()).len(),
+            super::idle_skips(&p, &structure::structure(&p).unwrap(), true).len(),
             1
         );
         // Nor does a register the skipped code uses and then gives back
@@ -14821,7 +14833,7 @@ mod tests {
         w.push(S_ENDPGM);
         let skips = |w: &[u32]| {
             let p = wave64(w);
-            super::idle_skips(&p, &structure::structure(&p).unwrap()).len()
+            super::idle_skips(&p, &structure::structure(&p).unwrap(), true).len()
         };
         assert_eq!(skips(&w), 1);
         let at = w.iter().position(|&x| x == 0xBE8A_030B).unwrap();
