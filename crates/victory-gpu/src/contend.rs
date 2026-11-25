@@ -12,8 +12,8 @@ use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 pub(crate) enum Lock {
     /// `crate::descriptor::SHADER_HEAPS`, by title threads writing a view.
     Heaps,
-    /// A host heap's slot lock (`crate::descriptor::host::HostHeap::made`).
-    Slot,
+    /// What a host heap's slots hold (`crate::descriptor::host::HostHeap::kept`).
+    Kept,
     /// The views table (`crate::descriptor::VIEWS`).
     Views,
     /// What a heap's slots view (`crate::bindless::Viewed`).
@@ -53,8 +53,7 @@ fn waited(lock: Lock, since: std::time::Instant) {
     use crate::copystat::C;
     let (us, times) = match lock {
         Lock::Heaps => (C::MirrorWaitUs, C::HeapsContended),
-        Lock::Slot if in_sync() => (C::SyncSlotWaitUs, C::SyncSlotContended),
-        Lock::Slot => (C::SlotWaitUs, C::SlotContended),
+        Lock::Kept => (C::KeptWaitUs, C::KeptContended),
         Lock::Views => (C::ViewsWaitUs, C::ViewsContended),
         Lock::Viewed => (C::ViewedWaitUs, C::ViewedContended),
         Lock::Copies => (C::CopiesWaitUs, C::CopiesContended),

@@ -386,6 +386,8 @@ pub(crate) fn make_read(slots: &[u32]) {
     };
     #[cfg(test)]
     tests::while_making(slots);
+    // Counted with the submitting thread's work on slots (diagnostics).
+    let _syncing = crate::contend::syncing();
     // Several at a time (each a committed texture; hundreds in a new shot,
     // 7 % of the submitting thread when made one by one, run evict5).
     crate::texture::in_parallel(placed.len(), |i| {
@@ -681,8 +683,7 @@ fn record(handle: u64, view: View) {
         let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
         if let Some(&i) = views.index.get(&view) {
             let generation = views.list[i as usize].1;
-            // SAFETY: the handle is a descriptor slot, at least 16 bytes.
-            unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+            write_record(handle, i, generation);
             drop(views);
             #[cfg(all(windows, feature = "diagnostics"))]
             crate::copystat::add(crate::copystat::C::RecordFound, 1);
@@ -721,11 +722,26 @@ fn record(handle: u64, view: View) {
         }
     };
     let generation = views.list[i as usize].1;
-    // SAFETY: the handle is a descriptor slot, at least 16 bytes.
-    unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+    write_record(handle, i, generation);
     drop(views);
     #[cfg(windows)]
     mirror(handle);
+}
+
+/// Writes the record of view entry `i`, generation `generation`, at `handle`:
+/// the tag, then the entry and its generation in one store of eight bytes.
+/// Threads recording views share the views table, so two may write one slot
+/// at once (a title's race, but under the table's lock one record or the
+/// other came out whole): the tag is the same from both, and a store of
+/// eight bytes within a cache line lands whole on the processors this runs
+/// on, so the slot holds one thread's entry with its own generation, not
+/// one's entry with the other's generation, which names no view.
+fn write_record(handle: u64, i: u32, generation: u32) {
+    // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+    unsafe {
+        (handle as *mut u32).write_unaligned(VIEW_TAG);
+        ((handle + 4) as *mut u64).write_unaligned(u64::from(generation) << 32 | u64::from(i));
+    }
 }
 
 /// Whether [`record`] looks a view up with the table shared before it
@@ -1104,6 +1120,12 @@ pub(crate) mod tests {
         pub(crate) static HEAPS_ALONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
+    /// Held by tests that count on entries' generations: one releases and
+    /// makes views thousands of times, which moves freed entries'
+    /// generations on by any number while another looks at a generation
+    /// "never given".
+    static GENERATIONS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Whether the generations kept alone are the entries' own.
     fn generations_match() -> bool {
         let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
@@ -1118,6 +1140,7 @@ pub(crate) mod tests {
     /// past the entries.
     #[test]
     fn records_are_current_by_the_generations_kept_alone_as_by_the_entries() {
+        let _alone = GENERATIONS.lock().unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         let slots = [0u64; 4 * 64];
         let at = |i: usize| slots.as_ptr() as u64 + 32 * i as u64;
@@ -1174,6 +1197,7 @@ pub(crate) mod tests {
     /// recorded before, and taken alone for each.
     #[test]
     fn views_recorded_and_released_from_several_threads_read_back_as_recorded() {
+        let _alone = GENERATIONS.lock().unwrap_or_else(|e| e.into_inner());
         const THREADS: usize = 6;
         const ROUNDS: usize = if cfg!(debug_assertions) { 20_000 } else { 200_000 };
         // Resources no other test names.
@@ -1396,7 +1420,8 @@ pub(crate) mod tests {
     /// into it by calls only, and each slot is as the last call left it
     /// with no sync's help.
     #[cfg(windows)]
-    fn slots_written_during_syncs_end_as_their_records(alone: bool) {
+    fn slots_written_during_syncs_end_as_their_records(alone: bool, one_lock: bool) {
+        use host::tests::ONE_LOCK;
         use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
@@ -1407,6 +1432,7 @@ pub(crate) mod tests {
         const WRITERS: u64 = 4;
         const ROUNDS: u64 = 5_000;
         HEAPS_ALONE.with(|a| a.set(alone));
+        ONE_LOCK.with(|one| one.set(one_lock));
         let page = crate::watch::PAGE;
         let pages = (SLOTS as usize * 32).div_ceil(page);
         // Each heap in pages of its own: samplers, views, and the pair one
@@ -1440,6 +1466,7 @@ pub(crate) mod tests {
             let stop = &stop;
             scope.spawn(move || {
                 HEAPS_ALONE.with(|a| a.set(alone));
+                ONE_LOCK.with(|one| one.set(one_lock));
                 let host = crate::host::host().expect("checked");
                 let mut round = 0u32;
                 while !stop.load(Relaxed) {
@@ -1457,6 +1484,7 @@ pub(crate) mod tests {
                 .map(|t| {
                     scope.spawn(move || {
                         HEAPS_ALONE.with(|a| a.set(alone));
+                        ONE_LOCK.with(|one| one.set(one_lock));
                         let null = std::ptr::null();
                         // Records of 16 samplers and of 16 placed texture
                         // views, where no heap sees them.
@@ -1572,6 +1600,7 @@ pub(crate) mod tests {
         drop(owners);
         crate::watch::tests::free(memory);
         HEAPS_ALONE.with(|a| a.set(false));
+        ONE_LOCK.with(|one| one.set(false));
     }
 
     /// Several threads write the same slots of a heap no sync looks at, at
@@ -1581,6 +1610,19 @@ pub(crate) mod tests {
     #[cfg(windows)]
     #[test]
     fn the_last_of_several_threads_writing_a_slot_at_once_makes_it() {
+        last_of_several_threads_makes_a_slot(false);
+    }
+
+    /// The same with one lock for all of a heap's slots (as
+    /// `VICTORY_SLOT_LOCKS=0`).
+    #[cfg(windows)]
+    #[test]
+    fn the_last_of_several_threads_writing_a_slot_at_once_makes_it_under_one_lock() {
+        last_of_several_threads_makes_a_slot(true);
+    }
+
+    #[cfg(windows)]
+    fn last_of_several_threads_makes_a_slot(one_lock: bool) {
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
@@ -1600,6 +1642,7 @@ pub(crate) mod tests {
                 for t in 0..4u64 {
                     let barrier = &barrier;
                     scope.spawn(move || {
+                        host::tests::ONE_LOCK.with(|one| one.set(one_lock));
                         let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
                         let mut view = [0u32; 16];
                         view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
@@ -1631,20 +1674,71 @@ pub(crate) mod tests {
         }
     }
 
+    /// A slot made from one record is written, at once, another record by
+    /// one thread and the record it is made from again by a second: it ends
+    /// made from whichever record it holds. (The second thread finds the
+    /// slot made from its record while the first is making it from the
+    /// other: it must not take the slot for made.)
+    #[cfg(windows)]
+    #[test]
+    fn a_slot_written_back_to_what_it_is_made_from_while_another_record_is_made_ends_as_its_record() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        const SLOTS: u32 = 96;
+        const FIRST: u32 = 64;
+        let title = owner(
+            HeapDesc { kind: SAMPLERS, count: SLOTS, flags: SHADER_VISIBLE, nodes: 1 },
+            Placement { address: 0, size: 0 },
+        );
+        let start = heap(title.0).start;
+        let Some(host) = heap(title.0).host() else { return };
+        let sampler = |k: u32| [21, 1 + k, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+        for i in FIRST..SLOTS {
+            create_sampler(std::ptr::null(), &sampler(0), start + u64::from(i) * 16);
+        }
+        for round in 0..1500u32 {
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                // Each slot is made from one of the two: one thread writes
+                // it that one again, the other the other.
+                for k in 0..2 {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for i in FIRST..SLOTS {
+                            create_sampler(std::ptr::null(), &sampler(k), start + u64::from(i) * 16);
+                        }
+                    });
+                }
+            });
+            for i in FIRST..SLOTS {
+                // SAFETY: a slot of the heap.
+                let record = unsafe { ((start + u64::from(i) * 16) as *const [u32; 3]).read_unaligned() };
+                assert!(views_current(&[record])[0], "round {round}, slot {i}: one thread's record, whole");
+                let key = u64::from(record[2]) << 32 | u64::from(record[1]);
+                assert_eq!(host.made_key(i), key, "round {round}, slot {i}");
+            }
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn slots_written_from_several_threads_during_syncs_end_as_their_records() {
         for _ in 0..3 {
-            slots_written_during_syncs_end_as_their_records(false);
+            slots_written_during_syncs_end_as_their_records(false, false);
         }
     }
 
     /// The same with the heaps' lock held alone wherever it is taken (as
-    /// `VICTORY_HEAPS_SHARED=0`).
+    /// `VICTORY_HEAPS_SHARED=0`) and one lock for all of a heap's slots (as
+    /// `VICTORY_SLOT_LOCKS=0`, `VICTORY_SYNC_RUNS=0`), and with only the
+    /// latter.
     #[cfg(windows)]
     #[test]
     fn slots_written_from_several_threads_end_as_their_records_with_the_heaps_held_alone() {
-        slots_written_during_syncs_end_as_their_records(true);
+        slots_written_during_syncs_end_as_their_records(true, true);
+        slots_written_during_syncs_end_as_their_records(false, true);
     }
 
     /// A placed heap reused at the same address replaces the stale range;
