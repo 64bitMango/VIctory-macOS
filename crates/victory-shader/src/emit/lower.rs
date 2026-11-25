@@ -1780,6 +1780,81 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, in_lo, lo, upper)
     }
 
+    /// The lanes of the mask whose first lane a `v_readlane_b32` reads
+    /// (`s_ff1_i32_b64` of the mask as its lane, the console compiler's
+    /// read of the first lane of a set), where the host has every lane of
+    /// the mask in the block and each lane there is one: a mask written in
+    /// the block of lanes in EXEC ([`Structured::active`]) that every lane
+    /// entering the block is in, so that it is never empty where the read
+    /// runs (the console reads lane 63 by an empty one).
+    fn mask_led(&self, inst: &Inst) -> Option<Bool> {
+        let (p, st, b) = (self.x.p, self.x.st, self.cur_ir);
+        let Fields::Valu(v) = &inst.fields else {
+            return None;
+        };
+        let &Operand::Scalar { code, .. } = v.src.get(1)? else {
+            return None;
+        };
+        let lane = inst.read(Reg::S(code))?;
+        let here = |v: Value| {
+            p.blocks[b]
+                .insts
+                .iter()
+                .find(|i| i.writes.iter().any(|w| w.1 == v))
+        };
+        let first = here(lane)?;
+        let Fields::Sop { src, .. } = &first.fields else {
+            return None;
+        };
+        let &Operand::Scalar { code, .. } = src.first()? else {
+            return None;
+        };
+        let mask = first.read(Reg::S(code))?;
+        let &lanes = st.masks.get(&mask)?;
+        (first.name() == "s_ff1_i32_b64"
+            && here(mask).is_some()
+            && st.active.contains(&mask)
+            && !st.bools.meet(&[(st.reach[b], true), (lanes, false)]))
+        .then_some(lanes)
+    }
+
+    /// Halves: `a` of the first lane of `lanes` in the console's wave
+    /// ([`Self::mask_led`]): each half finds its first lane of them, and
+    /// the lower half's counts if it has one.
+    fn first_of(&mut self, lanes: Bool, a: V) -> V {
+        let b = self.cur_ir;
+        let c = self.cur;
+        if self.half_alone() {
+            return a;
+        }
+        let on = match self.boolean(lanes, c) {
+            Ok(on) if self.halves_meet(b) && self.guarded == 0 => on,
+            _ => {
+                self.refuse("v_readlane_b32 of a mask's first lane where the halves cannot meet");
+                return a;
+            }
+        };
+        self.s.flags |= flags::WAVE_OPS;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+        let lanes = self.s.m.extract(c, ballot, 0);
+        let (z, k31) = (self.s.m.i32(0), self.s.m.i32(31));
+        let lane = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lanes]);
+        let lane = self.s.m.bin(c, Bin::And, lane, k31);
+        let at = self.read_lane(a, lane);
+        let none = self.s.m.cmp(c, pred::EQ, lanes, z);
+        let own = self.s.m.select(c, none, a, at);
+        let (lo_lanes, _) = self.exchange(c, b, lanes, z);
+        let (lo, hi) = self.exchange(c, b, own, z);
+        let in_lo = self.s.m.cmp(c, pred::NE, lo_lanes, z);
+        self.s.m.select(c, in_lo, lo, hi)
+    }
+
     /// Halves: a host wave's result `r` of an operation over the wave (the
     /// same in all its lanes) made the console wave's: `both` of the lower
     /// and the upper half's. `absent`: what a half with no lane gives (a
@@ -7762,7 +7837,10 @@ impl<'a> Lower<'a> {
                 } else {
                     self.cross_lane(false)?;
                 }
-                let r = if self.halves.as_ref().is_some_and(|h| !h.whole) {
+                let split = self.halves.as_ref().is_some_and(|h| !h.whole);
+                let r = if let Some(lanes) = self.mask_led(inst).filter(|_| split) {
+                    self.first_of(lanes, a)
+                } else if split {
                     // Each half reads its lane of that number; the half
                     // the console's lane is in has the value.
                     if self.half_alone() {
@@ -14907,6 +14985,41 @@ mod tests {
         w.extend(DS_WRITE_V1_V2);
         w.push(S_ENDPGM);
         assert_eq!(halves(&w, 64), (Some(64), 0));
+    }
+
+    #[test]
+    fn the_first_lane_of_a_mask_is_read_by_the_halves_that_hold_it() {
+        // `if (id & 1) return;` then `v_readlane_b32` at `s_ff1_i32_b64` of
+        // the lanes left (0a5ecfee6b79e13b at 0x90): the mask's number,
+        // then each half's lanes of it and its first one's value.
+        let program = |mask: u32, skip_to_end: bool| {
+            let mut w = vec![V_LSHLREV_V1_2_V0, 0x3604_0081]; // v_and_b32 v2, 1, v0
+            w.extend([0xD4C2_0000, 0x0002_0480]); // v_cmp_eq_u32 s[0:1], 0, v2
+            w.push(AND_SAVEEXEC_S2_S0);
+            if skip_to_end {
+                w.push(skip(7));
+            }
+            w.extend([
+                0x8780_7E02,        // s_and_b64 s[0:1], s[2:3], exec
+                0xBE88_1400 | mask, // s_ff1_i32_b64 s8, the mask
+                0xD760_0004,        // v_readlane_b32 s4, v0, s8
+                0x0000_1100,
+                0x7E04_0204, // v_mov_b32 v2, s4
+            ]);
+            w.extend(DS_WRITE_V1_V2);
+            w.push(S_ENDPGM);
+            w
+        };
+        for lanes in [64, 256] {
+            assert_eq!(halves(&program(0, true), lanes), (Some(32), 3));
+        }
+        // The first lane of the lanes the wave began with may have ended:
+        // no half holds its value.
+        assert_eq!(halves(&program(2, true), 64), (Some(64), 0));
+        // Lanes out of EXEC that are still there: the mask may be empty,
+        // and the lane it then gives is read as any other (every lane is
+        // there to be read).
+        assert_eq!(halves(&program(0, false), 64), (Some(32), 2));
     }
 
     #[test]
