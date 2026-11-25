@@ -548,9 +548,14 @@ impl State {
     }
 
     /// After a dispatch of `p`: the least indirect light, if it is the
-    /// program that resolves that.
+    /// program that resolves that; the reflections held to it, if it is the
+    /// one that writes them last.
     fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
-        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+        let Some(stage) = p
+            .stages
+            .first()
+            .filter(|s| s.shader.resolves_light || s.shader.ends_reflections)
+        else {
             return false;
         };
         let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
@@ -564,6 +569,12 @@ impl State {
             };
             crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
         };
+        if !stage.shader.resolves_light {
+            return match view(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                Some(View::Unordered(r, ..)) if r != 0 => crate::ambient::hold(list, r as This),
+                _ => false,
+            };
+        }
         #[cfg(feature = "diagnostics")]
         {
             static LISTED: std::sync::Once = std::sync::Once::new();
