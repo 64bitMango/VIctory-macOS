@@ -3910,7 +3910,11 @@ impl<'a> Lower<'a> {
     /// constant: no lane in a mask, a reduction's identity) in the entry
     /// block, which all run, so such a half reads as that. Its threads set
     /// it before they ended, and the barrier lets the rest go on only once
-    /// they have.
+    /// they have. In a loop a half's threads may all end between two
+    /// passes, with what they stored in the last one still there: after
+    /// the second meeting every thread sets its half's dword to `absent`
+    /// again, and all meet a third time, so that none does so after
+    /// another of its half has stored the next pass's.
     fn exchange(&mut self, at: usize, b: usize, v: V, absent: V) -> (V, V) {
         let i32t = self.s.t.i32;
         let h = self.halves.as_mut().expect("halves");
@@ -3940,6 +3944,11 @@ impl<'a> Lower<'a> {
         if !self.halves.as_ref().expect("halves").once[b] {
             self.s
                 .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            if !full {
+                self.s.m.store(at, own, absent);
+                self.s
+                    .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            }
         }
         r
     }
@@ -14852,7 +14861,9 @@ mod tests {
     fn a_count_the_group_shares_is_one_all_waves_join_alike() {
         // 25 passes, each a count of the lanes with a bit of their id
         // (eae3498e6553afa8 at 0xf48), after `if (id & 1) return;`: the
-        // mask is exchanged each pass by the threads still running.
+        // mask is exchanged each pass by the threads still running, which
+        // meet to store, to read, and to take back what they stored (a
+        // half's threads may all have ended by the next pass).
         let mut w = vec![V_LSHLREV_V1_2_V0, V_AND_V1_1_V0];
         w.extend(CMP_S0_V1_EQ_0);
         w.extend([AND_SAVEEXEC_S2_S0, skip(12)]);
@@ -14874,7 +14885,7 @@ mod tests {
         ]);
         for lanes in [64, 1024] {
             let l = lowered(&w, lanes, true);
-            assert_eq!((l.wave_size, l.exchanges, l.barriers), (Some(32), 1, 2));
+            assert_eq!((l.wave_size, l.exchanges, l.barriers), (Some(32), 1, 3));
         }
         // The count joined with a wave's own number before the loop is no
         // longer one all waves hold alike.
