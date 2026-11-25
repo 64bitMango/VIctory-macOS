@@ -8,7 +8,11 @@ $expectedHash = '1F1D4760419202BB5672F0C428CE51E456B5D08FBAEC8F371D043FD94E01C36
 $sourceUrl = "https://raw.githubusercontent.com/Marvisak/VIctory/2849477415a46f5a079c85cf3e64a3dff32f713c/$relativePath"
 
 function Assert-FormatTableHash([string] $Path) {
-    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $sha.ComputeHash([IO.File]::ReadAllBytes($Path))
+        $actual = [BitConverter]::ToString($digest).Replace('-', '')
+    } finally { $sha.Dispose() }
     if ($actual -ne $expectedHash) {
         throw "Unexpected BCPack table SHA-256 for '$Path'. Expected $expectedHash, received $actual."
     }
