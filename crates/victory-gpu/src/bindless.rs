@@ -141,6 +141,12 @@ impl Viewed {
         }
     }
 
+    /// How many title slots hold a view (tests).
+    #[cfg(test)]
+    pub(crate) fn slots(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).slots.len()
+    }
+
     /// The buffer ranges views reach, merged per host copy and kind
     /// (shader resource, unordered access): copy, start, bytes.
     #[cfg(any(test, feature = "diagnostics"))]

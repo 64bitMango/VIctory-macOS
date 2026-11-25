@@ -1383,6 +1383,213 @@ pub(crate) mod tests {
         crate::watch::tests::free(memory);
     }
 
+    /// Title threads write descriptors into two placed heaps (samplers, and
+    /// views of placed textures) by calls, by copies through the device and
+    /// as bytes, clear them, bind them as draws do and look them up, all at
+    /// the same slots, while another thread runs heap syncs and the passes
+    /// that hold the heaps alone. Once they are done and a sync has run,
+    /// every host slot is made from the record its title slot holds (from
+    /// none where that names no view), and what the view heap's slots view
+    /// is entered for exactly those: as in a second pair of heaps given
+    /// the same bytes by one thread and synced once. A third heap, in
+    /// memory of ours, no sync looks at: placed texture views are written
+    /// into it by calls only, and each slot is as the last call left it
+    /// with no sync's help.
+    #[cfg(windows)]
+    fn slots_written_during_syncs_end_as_their_records(alone: bool) {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const SLOTS: u32 = 512;
+        // Other tests' passes name low slots of every view heap.
+        const FIRST: u32 = 64;
+        const WRITERS: u64 = 4;
+        const ROUNDS: u64 = 5_000;
+        HEAPS_ALONE.with(|a| a.set(alone));
+        let page = crate::watch::PAGE;
+        let pages = (SLOTS as usize * 32).div_ceil(page);
+        // Each heap in pages of its own: samplers, views, and the pair one
+        // thread fills afterwards.
+        let memory = crate::watch::tests::pool(4 * pages);
+        let base = |heap: usize| (memory + heap * pages * page) as u64;
+        let make = |heap: usize, kind: u32| {
+            let size = u64::from(SLOTS) * u64::from(increment(kind).unwrap_or(0));
+            let desc = HeapDesc { kind, count: SLOTS, flags: SHADER_VISIBLE, nodes: 1 };
+            owner(desc, Placement { address: base(heap), size })
+        };
+        let owners = [make(0, SAMPLERS), make(1, VIEWS_KIND), make(2, SAMPLERS), make(3, VIEWS_KIND)];
+        let unwatched = owner(
+            HeapDesc { kind: VIEWS_KIND, count: SLOTS, flags: SHADER_VISIBLE, nodes: 1 },
+            Placement { address: 0, size: 0 },
+        );
+        let unwatched_start = heap(unwatched.0).start;
+        if owners.iter().chain([&unwatched]).any(|o| heap(o.0).host().is_none()) {
+            drop(unwatched);
+            drop(owners);
+            crate::watch::tests::free(memory);
+            return;
+        }
+        // Memory the placed textures' views name (never read: such a view
+        // is left null until a shader reads its slot, which none does).
+        let textures = vec![0u8; 16 << 12];
+        let textures_at = textures.as_ptr() as u64;
+        let sampler_heap = owners[0].0 as usize;
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let stop = &stop;
+            scope.spawn(move || {
+                HEAPS_ALONE.with(|a| a.set(alone));
+                let host = crate::host::host().expect("checked");
+                let mut round = 0u32;
+                while !stop.load(Relaxed) {
+                    host.between_submissions(sync_heaps);
+                    round += 1;
+                    if round.is_multiple_of(4) {
+                        with_slots_still(|_| ());
+                        let _ = read_textures(&[FIRST, FIRST + 1]);
+                        evict(&Default::default());
+                        make_read(&[]);
+                    }
+                }
+            });
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|t| {
+                    scope.spawn(move || {
+                        HEAPS_ALONE.with(|a| a.set(alone));
+                        let null = std::ptr::null();
+                        // Records of 16 samplers and of 16 placed texture
+                        // views, where no heap sees them.
+                        let (sampler_records, view_records) = ([0u64; 2 * 16], [0u64; 4 * 16]);
+                        let from = |views: bool, k: u64| match views {
+                            false => sampler_records.as_ptr() as u64 + 16 * k,
+                            true => view_records.as_ptr() as u64 + 32 * k,
+                        };
+                        let sampler = |k: u64| [21, 1 + k as u32 % 4, 1 + k as u32 / 4, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+                        // A 4x1 RGBA8 texture, linear, and a 2D view of it.
+                        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+                        let placed = |k: u64| {
+                            let mut view = [0u32; 16];
+                            view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+                            let address = textures_at + (k << 12);
+                            (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+                            view
+                        };
+                        for k in 0..16 {
+                            create_sampler(null, &sampler(k), from(false, k));
+                            create_placed_srv(null, &words, &placed(k), from(true, k));
+                        }
+                        let mut seed = 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(t + 1);
+                        for _ in 0..ROUNDS {
+                            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                            let (what, k, wide) = (seed >> 60, seed >> 56 & 15, seed >> 52 & 15);
+                            // Mostly the same few slots as the other threads.
+                            let span = if wide == 0 { u64::from(SLOTS - FIRST) - 4 } else { 24 };
+                            let slot = FIRST + ((seed >> 20) % span) as u32;
+                            // A third of the writes into the heap no sync
+                            // looks at: by calls only.
+                            let own = (seed >> 48) % 3 == 0;
+                            let views = own || what & 1 == 1;
+                            let (kind, step) = if views { (VIEWS_KIND, 32u64) } else { (SAMPLERS, 16) };
+                            let start = if own { unwatched_start } else { base(usize::from(views)) };
+                            let at = start + u64::from(slot) * step;
+                            match what >> 1 {
+                                2..=4 if own => create_placed_srv(null, &words, &placed(k), at),
+                                0 if views => create_placed_srv(null, &words, &placed(k), at),
+                                0 => create_sampler(null, &sampler(k), at),
+                                1 => copy_simple(null, 1 + (k as u32 & 3), at, from(views, k.min(12)), kind),
+                                // As bytes, with no call: the next sync finds it.
+                                // SAFETY: a record of ours into a slot of the heap.
+                                2 | 3 => unsafe {
+                                    std::ptr::copy_nonoverlapping(from(views, k) as *const u8, at as *mut u8, 12)
+                                },
+                                // SAFETY: a slot of the heap.
+                                4 => unsafe { std::ptr::write_bytes(at as *mut u8, 0, step as usize) },
+                                // As a draw binding the slot through a table
+                                // (sampler slots: a placed texture's would be
+                                // made from memory that is no texture).
+                                5 | 6 if !views => {
+                                    let title = heap(sampler_heap as This);
+                                    let _ = title.host().and_then(|h| h.mirror(slot, at, true));
+                                }
+                                _ => {
+                                    let _ = view(at);
+                                }
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.join().expect("a writing thread");
+            }
+            stop.store(true, Relaxed);
+        });
+        // One thread gives the second pair the same bytes.
+        for h in 0..2 {
+            let bytes = SLOTS as usize * if h == 0 { 16 } else { 32 };
+            // SAFETY: both heaps' memory, of `bytes` each.
+            unsafe { std::ptr::copy_nonoverlapping(base(h) as *const u8, base(h + 2) as *mut u8, bytes) };
+        }
+        host.between_submissions(sync_heaps);
+        for h in 0..2 {
+            let step = if h == 0 { 16 } else { 32 };
+            let (raced, single) = (heap(owners[h].0).host().expect("checked"), heap(owners[h + 2].0).host().expect("checked"));
+            let mut made = 0;
+            for i in 0..SLOTS {
+                // SAFETY: a slot of the heap.
+                let record = unsafe { ((base(h) + u64::from(i) * step) as *const [u32; 3]).read_unaligned() };
+                let key = match views_current(&[record])[0] {
+                    true => u64::from(record[2]) << 32 | u64::from(record[1]),
+                    false => 0,
+                };
+                assert_eq!(raced.made_key(i), key, "heap {h} slot {i}: made from its record");
+                assert_eq!(raced.made_key(i), single.made_key(i), "heap {h} slot {i}: as one thread leaves it");
+                assert_eq!(raced.kept(i), single.kept(i), "heap {h} slot {i}: holding what one thread leaves");
+                made += usize::from(key != 0);
+            }
+            if h == 1 {
+                assert!(made > 0, "views were written");
+                assert_eq!(raced.viewed.slots(), made, "what the slots view is entered for the slots made");
+                assert_eq!(single.viewed.slots(), made);
+            }
+        }
+        let raced = heap(unwatched.0).host().expect("checked");
+        let mut made = 0;
+        for i in 0..SLOTS {
+            // SAFETY: a slot of the heap.
+            let record = unsafe { ((unwatched_start + u64::from(i) * 32) as *const [u32; 3]).read_unaligned() };
+            let key = match views_current(&[record])[0] {
+                true => u64::from(record[2]) << 32 | u64::from(record[1]),
+                false => 0,
+            };
+            assert_eq!(raced.made_key(i), key, "the heap no sync looks at, slot {i}: made from its record");
+            made += usize::from(key != 0);
+        }
+        assert!(made > 0, "views were written");
+        assert_eq!(raced.viewed.slots(), made, "what the slots view is entered for the slots made");
+        drop(unwatched);
+        drop(owners);
+        crate::watch::tests::free(memory);
+        HEAPS_ALONE.with(|a| a.set(false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn slots_written_from_several_threads_during_syncs_end_as_their_records() {
+        for _ in 0..3 {
+            slots_written_during_syncs_end_as_their_records(false);
+        }
+    }
+
+    /// The same with the heaps' lock held alone wherever it is taken (as
+    /// `VICTORY_HEAPS_SHARED=0`).
+    #[cfg(windows)]
+    #[test]
+    fn slots_written_from_several_threads_end_as_their_records_with_the_heaps_held_alone() {
+        slots_written_during_syncs_end_as_their_records(true);
+    }
+
     /// A placed heap reused at the same address replaces the stale range;
     /// descriptor writes go only to the new heap.
     #[cfg(windows)]

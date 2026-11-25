@@ -938,6 +938,12 @@ impl HostHeap {
         self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
     }
 
+    /// The record slot `index` was last made from, 0 for none (tests).
+    #[cfg(test)]
+    pub(crate) fn made_key(&self, index: u32) -> u64 {
+        self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize]
+    }
+
     /// Whether slot `index` holds a host view of a resource (tests).
     #[cfg(test)]
     pub(crate) fn kept(&self, index: u32) -> bool {
