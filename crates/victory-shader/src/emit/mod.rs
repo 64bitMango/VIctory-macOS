@@ -437,6 +437,14 @@ pub struct Options {
     /// in the user data [`DISPATCH_THREADS`] names; without them every
     /// thread runs.
     pub thread_counts: bool,
+    /// Compute programs that reach title memory by address or write
+    /// through root views (the console's ray-tracing structure builder and
+    /// its like) get a fence over unordered-access memory before and after
+    /// each buffer or global atomic: their threads take turns through
+    /// atomics, and what one wrote before its atomic must be seen by the
+    /// thread that comes after it. The console's waits for its writes there
+    /// are not in the translated code.
+    pub atomic_fences: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -858,9 +866,14 @@ fn emit_keeping(
         narrow_waves: options.narrow_waves,
     };
     // The structure builder's programs and their like are made for
-    // dispatches counted in threads (`lower::counted`).
+    // dispatches counted in threads (`lower::counted`), and with fences
+    // round their buffer atomics (`lower::fence`).
+    let builder = lower::by_address(p, res);
     let extra = lower::Extra {
-        thread_counts: options.thread_counts && lower::by_address(p, res),
+        thread_counts: options.thread_counts && builder,
+        atomic_fences: options.atomic_fences
+            && native.stage == HwStage::Cs
+            && (builder || lower::writes_root_views(native)),
     };
     // Most programs only interpolate with the barycentric VGPRs, or join
     // them in a former use no lane reads; one that cannot do without them

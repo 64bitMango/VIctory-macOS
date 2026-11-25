@@ -33,8 +33,8 @@ const ATOMIC_ADD_V2_AT_V1: [u32; 2] = [0xE0C8_1000, 0x8002_0201];
 /// v1) with four root constants in s0-s3 and a table in s4 whose first
 /// view is a raw buffer, its descriptor loaded into s[8:11] before `body`.
 /// Made to leave out the threads past a dispatch's counts, for 32-lane host
-/// waves with `narrow`.
-fn program(body: &[u32], wave64: bool, threads: [u32; 3], narrow: bool) -> HostShader {
+/// waves with `narrow`, with fences round its atomics with `fences`.
+fn program(body: &[u32], wave64: bool, threads: [u32; 3], narrow: bool, fences: bool) -> HostShader {
     let mut words = vec![
         0xBE85_0380, // s_mov_b32 s5, 0
         0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
@@ -97,7 +97,10 @@ fn program(body: &[u32], wave64: bool, threads: [u32; 3], narrow: bool) -> HostS
         false,
         false,
         false,
-        lower::Extra { thread_counts: true },
+        lower::Extra {
+            thread_counts: true,
+            atomic_fences: fences,
+        },
     )
     .expect("lower");
     let shader = HostShader {
@@ -188,7 +191,7 @@ fn has_word(shader: &HostShader, axis: u32) -> bool {
 #[test]
 fn the_threads_past_a_count_do_not_run() {
     let body = [v_lshlrev(1, 2, 0), V_MOV_V2_1, ATOMIC_ADD_V2_AT_V1[0], ATOMIC_ADD_V2_AT_V1[1]];
-    let shader = program(&body, false, [64, 1, 1], false);
+    let shader = program(&body, false, [64, 1, 1], false, false);
     assert!(has_word(&shader, 0));
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(made) = pipeline(&shader, false) else { return };
@@ -215,7 +218,7 @@ fn each_axis_is_cut_at_its_count() {
         ATOMIC_ADD_V2_AT_V1[0],
         ATOMIC_ADD_V2_AT_V1[1],
     ];
-    let shader = program(&body, false, [8, 8, 1], false);
+    let shader = program(&body, false, [8, 8, 1], false, false);
     assert!(has_word(&shader, 0) && has_word(&shader, 1) && !has_word(&shader, 2));
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(made) = pipeline(&shader, false) else { return };
@@ -261,7 +264,7 @@ fn lanes_counted_over_a_wave_are_those_below_the_count() {
         [("even lanes", &evens, even), ("lanes on entry", &started, |n| n)];
     for (what, body, of) in programs {
         for (threads, groups) in [(64u32, 2u32), (256, 1)] {
-            let shader = program(body, true, [threads, 1, 1], true);
+            let shader = program(body, true, [threads, 1, 1], true, false);
             assert!(has_word(&shader, 0), "{what}, groups of {threads}");
             let Some(made) = pipeline(&shader, true) else { continue };
             let all = threads * groups;
@@ -288,5 +291,40 @@ fn lanes_counted_over_a_wave_are_those_below_the_count() {
     }
     if ran > 0 {
         eprintln!("ran on the hardware device: {ran} wave64 programs counted lanes past a count of threads");
+    }
+}
+
+/// Fences round a program's atomics (`lower::fence`) change no result and
+/// stop nothing, also where only some lanes reach the atomic: the lanes of
+/// an even number add 1 to their dword, in a wave32 program and a wave64
+/// one, with a count of threads and without.
+#[test]
+fn fences_round_atomics_change_no_result() {
+    let body = [
+        v_lshlrev(1, 2, 0),
+        0x3606_0081, // v_and_b32 v3, 1, v0
+        0x7DA4_0680, // v_cmpx_eq_u32 exec, 0, v3
+        V_MOV_V2_1,
+        ATOMIC_ADD_V2_AT_V1[0],
+        ATOMIC_ADD_V2_AT_V1[1],
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for wave64 in [false, true] {
+        let shader = program(&body, wave64, [64, 1, 1], wave64, true);
+        let Some(made) = pipeline(&shader, wave64) else { continue };
+        for count in [0u32, 74] {
+            let out = run(&made, &shader, [2, 1, 1], [count, 0, 0], 64);
+            let runs = if count == 0 { 128 } else { count };
+            for (i, &word) in out.iter().enumerate() {
+                let i = i as u32;
+                let want = if i % 2 == 0 { u32::from(i < runs) + u32::from(i + 64 < runs) } else { 0 };
+                assert_eq!(word, want, "wave64 {wave64}, count {count}, thread {i}");
+            }
+        }
+        ran += 1;
+    }
+    if ran > 0 {
+        eprintln!("ran on the hardware device: {ran} programs with fences round their atomics");
     }
 }

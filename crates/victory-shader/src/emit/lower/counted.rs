@@ -56,6 +56,9 @@ pub(crate) struct Extra {
     /// The threads of a compute group past a dispatch's counts of threads
     /// leave at once (see the module).
     pub thread_counts: bool,
+    /// Buffer and global atomics stand between two fences
+    /// ([`super::fence`]).
+    pub atomic_fences: bool,
 }
 
 /// A program whose threads past a dispatch's counts leave
@@ -232,7 +235,10 @@ mod tests {
             false,
             false,
             false,
-            Extra { thread_counts: cut },
+            Extra {
+                thread_counts: cut,
+                ..Extra::default()
+            },
         )
         .expect("lower")
     }

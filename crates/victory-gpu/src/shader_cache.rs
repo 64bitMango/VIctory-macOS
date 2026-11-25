@@ -144,6 +144,15 @@ fn narrow_waves() -> bool {
     })
 }
 
+/// Whether the buffer atomics of the ray-tracing structure builder and its
+/// like stand between two fences (`emit::Options::atomic_fences`; after
+/// Belobug 72e748ea): `VICTORY_BVH_FENCES=0` makes them as before. Part of
+/// the translation: the shader cache keys on it. Read once, here.
+fn atomic_fences() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_BVH_FENCES"))
+}
+
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
 pub(crate) fn under_wine() -> bool {
@@ -184,13 +193,14 @@ fn warn_kept_wide() {
 /// made for dispatches counted in threads: their own cache entries, one
 /// per combination.
 fn options_build(o: &victory_shader::emit::Options) -> &'static [u8; 32] {
-    static BUILDS: [OnceLock<[u8; 32]>; 64] = [const { OnceLock::new() }; 64];
+    static BUILDS: [OnceLock<[u8; 32]>; 128] = [const { OnceLock::new() }; 128];
     let i = usize::from(o.atomic_locks)
         | usize::from(o.bias_as_gradients) << 1
         | usize::from(o.mesh_stores_last) << 2
         | usize::from(o.mesh_pack_outputs) << 3
         | usize::from(o.narrow_waves) << 4
-        | usize::from(o.thread_counts) << 5;
+        | usize::from(o.thread_counts) << 5
+        | usize::from(o.atomic_fences) << 6;
     BUILDS[i].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -211,6 +221,9 @@ fn options_build(o: &victory_shader::emit::Options) -> &'static [u8; 32] {
         }
         if o.thread_counts {
             h.update(b"thread counts");
+        }
+        if o.atomic_fences {
+            h.update(b"atomic fences");
         }
         *h.finalize().as_bytes()
     })
@@ -261,6 +274,7 @@ pub fn host_shader_keeping(
         // `VICTORY_THREAD_CUT=0` (or `VICTORY_THREAD_DIMENSIONS=0`): as
         // before (`crate::threads::cut`).
         thread_counts: crate::threads::cut(),
+        atomic_fences: atomic_fences(),
     };
     let translate = |c: &[u8]| {
         let r =
@@ -276,6 +290,7 @@ pub fn host_shader_keeping(
         || options.mesh_pack_outputs
         || options.narrow_waves
         || options.thread_counts
+        || options.atomic_fences
     {
         options_build(&options)
     } else {
