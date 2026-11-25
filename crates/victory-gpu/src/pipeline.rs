@@ -73,6 +73,10 @@ pub(crate) struct Shader {
     pub(crate) resolves_light: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Mesh: translations without the vertex outputs a pixel shader does
+    /// not read, by what they keep ([`Shader::translated_keeping`]).
+    #[cfg(windows)]
+    kept: Mutex<HashMap<victory_shader::emit::Kept, Option<Arc<Translated>>>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -109,6 +113,8 @@ impl Shader {
                 .any(|w| w == crate::ambient::PROGRAM),
             #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(windows)]
+            kept: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -164,6 +170,39 @@ impl Shader {
                 done.ok()
             })
             .as_ref()
+    }
+}
+
+#[cfg(windows)]
+impl Shader {
+    /// A mesh shader's translation keeping only the vertex outputs `kept`
+    /// names (and its system values), made once per `kept`.
+    pub(crate) fn translated_keeping(
+        &self,
+        kept: &victory_shader::emit::Kept,
+    ) -> Option<Arc<Translated>> {
+        let mut map = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(kept.clone())
+            .or_insert_with(|| {
+                let (host, cached) =
+                    crate::shader_cache::host_shader_keeping(&self.container, Some(kept));
+                match host.and_then(|host| with_resources(&self.container, host)) {
+                    Ok(t) => {
+                        tracing::info!(
+                            hash = %self.hash,
+                            cached,
+                            kept = kept.describe().replace('\n', " "),
+                            "mesh shader translated without the outputs its pixel shader does not read"
+                        );
+                        Some(Arc::new(t))
+                    }
+                    Err(e) => {
+                        tracing::warn!(hash = %self.hash, error = %e, "mesh shader does not translate without its unread outputs");
+                        None
+                    }
+                }
+            })
+            .clone()
     }
 }
 

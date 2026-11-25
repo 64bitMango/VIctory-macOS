@@ -117,6 +117,21 @@ fn mesh_stores_last() -> bool {
     })
 }
 
+/// Whether mesh shaders whose outputs Metal would count over its limit
+/// order them for the least padding: under Wine, where D3DMetal fails such
+/// pipelines ("Total mesh size (N) exceeds the maximum mesh size allowed
+/// (32768)") and draws nothing with them (`emit::Options::mesh_pack_outputs`).
+/// Other meshes translate as without it. `VICTORY_MESH_PACK=0` or `1`
+/// overrides.
+fn mesh_pack_outputs() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_MESH_PACK").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => under_wine(),
+    })
+}
+
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
 pub(crate) fn under_wine() -> bool {
@@ -137,22 +152,28 @@ pub(crate) fn under_wine() -> bool {
 }
 
 /// [`build`] for translations with host workarounds (atomic locks, bias
-/// as gradients, mesh stores last): their own cache entries, one per
-/// combination.
-fn options_build(locks: bool, bias: bool, stores_last: bool) -> &'static [u8; 32] {
-    static BUILDS: [OnceLock<[u8; 32]>; 8] = [const { OnceLock::new() }; 8];
-    let i = usize::from(locks) | usize::from(bias) << 1 | usize::from(stores_last) << 2;
+/// as gradients, mesh stores last, mesh outputs packed): their own cache
+/// entries, one per combination.
+fn options_build(o: &victory_shader::emit::Options) -> &'static [u8; 32] {
+    static BUILDS: [OnceLock<[u8; 32]>; 16] = [const { OnceLock::new() }; 16];
+    let i = usize::from(o.atomic_locks)
+        | usize::from(o.bias_as_gradients) << 1
+        | usize::from(o.mesh_stores_last) << 2
+        | usize::from(o.mesh_pack_outputs) << 3;
     BUILDS[i].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
-        if locks {
+        if o.atomic_locks {
             h.update(b"atomic locks");
         }
-        if bias {
+        if o.bias_as_gradients {
             h.update(b"bias as gradients");
         }
-        if stores_last {
+        if o.mesh_stores_last {
             h.update(b"mesh stores last");
+        }
+        if o.mesh_pack_outputs {
+            h.update(b"mesh outputs packed");
         }
         *h.finalize().as_bytes()
     })
@@ -161,6 +182,30 @@ fn options_build(locks: bool, bias: bool, stores_last: bool) -> &'static [u8; 32
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+    host_shader_keeping(container, None)
+}
+
+/// Whether mesh pipelines whose mesh shader Metal counts too much output of
+/// even packed ([`mesh_pack_outputs`]) get a translation of their own,
+/// without the vertex outputs their pixel shader does not read: under
+/// Wine (`emit::translate_keeping`). `VICTORY_MESH_PRUNE=0` or `1`
+/// overrides.
+pub fn mesh_prune() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_MESH_PRUNE").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => under_wine(),
+    })
+}
+
+/// [`host_shader`]; a mesh shader with `kept` without the vertex outputs it
+/// does not name. Those translations have entries of their own, by what
+/// they keep, so one is never taken for a pixel shader that reads more.
+pub fn host_shader_keeping(
+    container: &[u8],
+    kept: Option<&victory_shader::emit::Kept>,
+) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     // Under Wine (D3DMetal), 64-bit image atomics run under locks: its own
@@ -171,13 +216,31 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         bias_as_gradients: bias_as_gradients(),
         compact_mesh_interface: false,
         mesh_stores_last: mesh_stores_last(),
+        mesh_pack_outputs: mesh_pack_outputs(),
     };
-    let translate =
-        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    let build = if options.atomic_locks || options.bias_as_gradients || options.mesh_stores_last {
-        options_build(options.atomic_locks, options.bias_as_gradients, options.mesh_stores_last)
+    let translate = |c: &[u8]| {
+        victory_shader::emit::translate_keeping(c, options, kept).map_err(|e| e.to_string())
+    };
+    let build = if options.atomic_locks
+        || options.bias_as_gradients
+        || options.mesh_stores_last
+        || options.mesh_pack_outputs
+    {
+        options_build(&options)
     } else {
         build()
+    };
+    let keeping;
+    let build = match kept {
+        Some(kept) => {
+            let mut h = blake3::Hasher::new();
+            h.update(build);
+            h.update(b"mesh outputs kept\n");
+            h.update(kept.describe().as_bytes());
+            keeping = *h.finalize().as_bytes();
+            &keeping
+        }
+        None => build,
     };
     // A container a diagnostic patch may apply to has entries of its own,
     // by the patches (`VICTORY_SHADER_PATCH`), on top of the options' build.

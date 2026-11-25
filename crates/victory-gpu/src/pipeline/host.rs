@@ -257,6 +257,9 @@ const QUADS: i32 = 32;
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
+    /// Its own translation in place of the shader's: a mesh shader's
+    /// without the outputs the pixel shader does not read ([`pruned_mesh`]).
+    pub(crate) own: Option<Arc<Translated>>,
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
     /// Root parameters of its root views: (title root parameter, ours).
@@ -273,9 +276,13 @@ pub(crate) struct Stage {
 
 impl Stage {
     pub(crate) fn translated(&self) -> &Translated {
-        self.shader
-            .translated()
-            .expect("host pipelines are made from translated shaders")
+        match &self.own {
+            Some(t) => t,
+            None => self
+                .shader
+                .translated()
+                .expect("host pipelines are made from translated shaders"),
+        }
     }
 }
 
@@ -301,6 +308,38 @@ pub(crate) struct HostPipeline {
     /// written-pages bitmap, if a stage marks its writes through views
     /// (`victory_shader::emit`, "Write marks").
     pub(crate) marks: Option<(u32, u32)>,
+}
+
+/// The mesh shader's translation for a pipeline with this pixel shader
+/// when Metal counts more output of the mesh shader's own than it allows
+/// even packed (`emit::mesh_over_metal_limit`; D3DMetal then makes the
+/// pipeline a no-op) and the pixel shader leaves some of it unread: one
+/// without those outputs (`shader_cache::mesh_prune`).
+fn pruned_mesh(ms: &Shader, ps: &Shader) -> Option<Arc<Translated>> {
+    use victory_shader::emit;
+    if !crate::shader_cache::mesh_prune() {
+        return None;
+    }
+    let mesh = &ms.translated()?.host.dxil;
+    if !emit::mesh_over_metal_limit(mesh) {
+        return None;
+    }
+    let kept = match emit::pixel_reads(&ps.translated()?.host.dxil) {
+        Ok(kept) => kept,
+        Err(e) => {
+            tracing::warn!(error = %e, ?ps, "pixel shader inputs not read");
+            return None;
+        }
+    };
+    if !emit::mesh_outputs_unread(mesh, &kept) {
+        tracing::warn!(
+            ?ms,
+            ?ps,
+            "mesh pipeline over Metal's output limit; its pixel shader reads all of it"
+        );
+        return None;
+    }
+    ms.translated_keeping(&kept)
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -355,10 +394,24 @@ impl HostPipeline {
         for (s, _) in &stages {
             s.translated()?;
         }
+        // Per stage, a translation of its own (`Stage::own`).
+        let own: Vec<Option<Arc<Translated>>> = stages
+            .iter()
+            .map(|(s, _)| match (s.stage, find("pixel")) {
+                ("mesh", Some(ps)) => pruned_mesh(s, ps),
+                _ => None,
+            })
+            .collect();
+        let translated = |i: usize| -> Option<&Translated> {
+            match own.get(i)? {
+                Some(t) => Some(t),
+                None => stages.get(i)?.0.translated(),
+            }
+        };
         let host = host()?;
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
-        let atomics64 = stages.iter().any(|(s, _)| {
-            let Some(t) = s.translated() else {
+        let atomics64 = (0..stages.len()).any(|i| {
+            let Some(t) = translated(i) else {
                 return false;
             };
             victory_shader::Container::parse(&t.host.dxil)
@@ -396,10 +449,11 @@ impl HostPipeline {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
-        for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
+        for (i, &(shader, visibility)) in stages.iter().enumerate() {
+            let t = &translated(i)?.host;
             let mut stage = Stage {
                 shader: shader.clone(),
+                own: own[i].clone(),
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
@@ -495,9 +549,8 @@ impl HostPipeline {
             bound.push(stage);
         }
         // One pair for all stages: they share the heap and the bitmap.
-        let marks = stages
-            .iter()
-            .any(|(s, _)| s.translated().is_some_and(|t| t.host.view_marks))
+        let marks = (0..stages.len())
+            .any(|i| translated(i).is_some_and(|t| t.host.view_marks))
             .then(|| {
                 let first = params.len() as u32;
                 for (kind, register) in [
@@ -526,7 +579,7 @@ impl HostPipeline {
             }
         };
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
+            translated(i).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
                     pShaderBytecode: t.host.dxil.as_ptr().cast(),
