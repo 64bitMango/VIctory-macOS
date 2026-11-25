@@ -110,8 +110,9 @@ impl Shadow {
         (self.start + self.len).saturating_sub(address)
     }
 
-    /// `n` dwords of the copy at title address `address` (tests).
-    #[cfg(test)]
+    /// `n` dwords of the copy at title address `address` (tests and
+    /// diagnostics).
+    #[cfg(any(test, feature = "diagnostics"))]
     pub(crate) fn read_host(&self, address: u64, n: usize) -> Vec<u32> {
         let at = (address - self.start) as usize;
         assert!(at + 4 * n <= self.len as usize);

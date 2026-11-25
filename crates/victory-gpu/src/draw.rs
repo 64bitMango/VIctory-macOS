@@ -1106,6 +1106,8 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
+        #[cfg(feature = "diagnostics")]
+        self.probe_constants(list, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
@@ -1424,6 +1426,82 @@ impl State {
         }
     }
 
+    /// Diagnostics, `VICTORY_PROBE_CBVS=<hash>[@<hex offset>],...`: in a
+    /// listed frame, each table CBV a draw or dispatch of a listed shader
+    /// reads: its address and size, whether the offset lies past the size
+    /// (the console reads 0 there; host CBVs are 256-byte multiples, and
+    /// D3DMetal may not bound them), 16 floats of the host copy from the
+    /// offset (default 0), and the offsets of the first non-finite floats
+    /// within the size; at submission and after the list. The first 64.
+    #[cfg(feature = "diagnostics")]
+    fn probe_constants(&self, list: &HostList, compute: bool) {
+        static PROBES: std::sync::OnceLock<Vec<(String, u64)>> = std::sync::OnceLock::new();
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        let probes = PROBES.get_or_init(|| {
+            std::env::var("VICTORY_PROBE_CBVS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|e| {
+                    let (hash, at) = e.trim().split_once('@').unwrap_or((e.trim(), "0"));
+                    let at = u64::from_str_radix(at.trim().trim_start_matches("0x"), 16).ok()?;
+                    (!hash.is_empty()).then(|| (hash.to_owned(), at))
+                })
+                .collect()
+        });
+        if probes.is_empty() || !crate::capture::listed(crate::queue::presented() + 1) {
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
+        for stage in &p.stages {
+            let Some(&(_, offset)) = probes.iter().find(|(h, _)| stage.shader.hash.contains(h.as_str())) else {
+                continue;
+            };
+            for u in stage.translated().used.iter().filter(|u| u.kind == ResourceType::Cbv) {
+                let (RootType::Table, Some(Root::Table(table))) =
+                    (u.root, self.roots_ref(compute).get(usize::from(u.slot)))
+                else {
+                    continue;
+                };
+                let Some(View::Constant(at, size)) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                else {
+                    continue;
+                };
+                if LOGGED.fetch_add(1, Ordering::Relaxed) >= 64 {
+                    return;
+                }
+                let size = u64::from(size);
+                let who = format!(
+                    "{} Cbv b{} s{}+{} {at:#x}+{size:#x} @{offset:#x}{}",
+                    stage.shader.hash,
+                    u.lower_bound,
+                    u.slot,
+                    u.table_offset_dwords,
+                    if offset + 16 > size { " (past the size)" } else { "" }
+                );
+                let Some(shadow) = crate::shadow::find(at, 1) else {
+                    tracing::info!(target: "victory_gpu::trace", "cbv {who}: no host copy");
+                    continue;
+                };
+                let look = move |s: &crate::shadow::Shadow| {
+                    let (start, len) = s.range();
+                    let end = (at + size.min(1 << 16)).min(start + len);
+                    let words: Vec<u32> = s.read_host(at, ((end.saturating_sub(at)) / 4) as usize);
+                    let bad: Vec<String> = words
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, w)| !f32::from_bits(**w).is_finite())
+                        .take(16)
+                        .map(|(k, w)| format!("{:#x}={w:#x}", 4 * k))
+                        .collect();
+                    format!("{} non-finite in size {bad:?}", s.peek(at + offset, 64))
+                };
+                let (s, w) = (shadow.clone(), who.clone());
+                list.defer_host(move || tracing::info!(target: "victory_gpu::trace", "cbv {w} at submission: {}", look(&s)));
+                list.defer_after(move || tracing::info!(target: "victory_gpu::trace", "cbv {who} after the list: {}", look(&shadow)));
+            }
+        }
+    }
+
     /// In a listed frame, right after a dispatch: each 1D or 3D texture it
     /// writes through a table, read back in the list itself (what the
     /// dispatch left there, before anything later in the frame).
@@ -1568,6 +1646,8 @@ impl State {
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             #[cfg(feature = "diagnostics")]
             self.probe_small(list, false);
+            #[cfg(feature = "diagnostics")]
+            self.probe_constants(list, false);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
