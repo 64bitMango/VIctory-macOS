@@ -10,7 +10,7 @@
 //! -9.75). The title's own lighting then applies it with the surfaces'
 //! colors. Raised, not added: the result is the next frame's history.
 //!
-//! `VICTORY_AMBIENT=<level>` sets it (0 turns it off).
+//! `VICTORY_AMBIENT=<level>` turns it on (0.6, say); off by default.
 //! shortcut: the same light everywhere, from everywhere; gone once rays run.
 
 use std::sync::OnceLock;
@@ -28,7 +28,8 @@ pub(crate) const PROGRAM: &[u8] = b"a title shader";
 /// integers): root parameter and place in its table.
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
 
-const DEFAULT: f32 = 0.6;
+/// Off: the title's own light only (0.6 looked balanced in run a2).
+const DEFAULT: f32 = 0.0;
 
 /// The floor; `None` if off.
 pub(crate) fn level() -> Option<f32> {
