@@ -729,6 +729,55 @@ fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
 }
 
 #[test]
+fn v_cvt_f32_f64_rounds_to_nearest_even_without_host_doubles() {
+    // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x00f): the double's dwords
+    // are root constants 0 and 1. Lowered in integer arithmetic (Metal has
+    // no doubles).
+    let shader = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+    let ulp = |x: f64, n: i64| f64::from_bits((x.to_bits() as i64 + n) as u64);
+    let one_and_half_ulp = f64::from_bits(1.0f64.to_bits() | 1 << 28);
+    let cases: Vec<f64> = vec![
+        0.0,
+        -0.0,
+        1.0,
+        -2.5,
+        64.0,
+        std::f64::consts::PI,
+        1.0e30,
+        -3.0e-20,
+        // Halfway between two floats: to the even one, either way.
+        one_and_half_ulp,
+        ulp(one_and_half_ulp, 1),
+        ulp(one_and_half_ulp, -1),
+        f64::from(f32::MAX),
+        // Too large: infinity; too small: zero (no f32 denormals).
+        1.0e300,
+        -1.0e300,
+        1.0e-300,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    let inputs: Vec<[u32; 4]> = cases
+        .iter()
+        .map(|d| [d.to_bits() as u32, (d.to_bits() >> 32) as u32, 0, 0])
+        .collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let d = cases[i];
+        let want = if (d as f32).is_subnormal() {
+            (d as f32).to_bits() & 0x8000_0000
+        } else {
+            (d as f32).to_bits()
+        };
+        assert_eq!(got, want, "{backend}: v_cvt_f32_f64({d:e}) = {got:#010x}, want {want:#010x}");
+    });
+    // A NaN stays one.
+    let nan = [0, 0x7FF8_0000, 0, 0];
+    run_cases(&shader, &[nan], |backend, _, _, got| {
+        assert!(f32::from_bits(got).is_nan(), "{backend}: {got:#010x}");
+    });
+}
+
+#[test]
 fn v_fract_f32_never_returns_one() {
     // v_fract_f32 v0, v1 (VOP1 opcode 0x020)
     let shader = build_valu_cs(&[vop1(0x020, 0, vgpr(1))]);

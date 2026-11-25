@@ -102,6 +102,94 @@ pub(crate) enum Sym {
         lanes: u64,
         hi: u32,
     },
+    /// A dword of the f64 sum over `lanes` of `mask ? (lo, hi) : 0.0`, the
+    /// double whose dwords are the values `lo` and `hi` (`high`: its high
+    /// dword).
+    SumD {
+        lo: Value,
+        hi: Value,
+        mask: Value,
+        lanes: u64,
+        high: bool,
+    },
+}
+
+/// A lane's register pair as a double inside a section: zero, or the f64
+/// sum over lanes of one masked double (see [`Sym::SumD`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pair {
+    Zero,
+    Sum(Value, Value, Value, u64),
+}
+
+impl Pair {
+    fn of(lo: Sym, hi: Sym) -> Option<Pair> {
+        match (lo, hi) {
+            (Sym::K(0), Sym::K(0 | 0x8000_0000)) => Some(Pair::Zero),
+            // `v_cndmask` of each dword with zero: `mask ? (lo, hi) : 0.0`.
+            (
+                Sym::Red {
+                    op: None,
+                    src: l,
+                    mask: m,
+                    ident: 0,
+                    lanes: a,
+                },
+                Sym::Red {
+                    op: None,
+                    src: h,
+                    mask: m2,
+                    ident: 0,
+                    lanes: b,
+                },
+            ) if m == m2 && a == b => Some(Pair::Sum(l, h, m, a)),
+            (
+                Sym::SumD {
+                    lo: l,
+                    hi: h,
+                    mask: m,
+                    lanes: a,
+                    high: false,
+                },
+                Sym::SumD {
+                    lo: l2,
+                    hi: h2,
+                    mask: m2,
+                    lanes: b,
+                    high: true,
+                },
+            ) if (l, h, m, a) == (l2, h2, m2, b) => Some(Pair::Sum(l, h, m, a)),
+            _ => None,
+        }
+    }
+
+    fn add(self, other: Pair) -> Option<Pair> {
+        match (self, other) {
+            (Pair::Zero, x) | (x, Pair::Zero) => Some(x),
+            (Pair::Sum(l, h, m, a), Pair::Sum(l2, h2, m2, b))
+                if (l, h, m) == (l2, h2, m2) && a & b == 0 =>
+            {
+                Some(Pair::Sum(l, h, m, a | b))
+            }
+            _ => None,
+        }
+    }
+
+    fn dwords(self) -> (Sym, Sym) {
+        match self {
+            Pair::Zero => (Sym::K(0), Sym::K(0)),
+            Pair::Sum(lo, hi, mask, lanes) => {
+                let d = |high| Sym::SumD {
+                    lo,
+                    hi,
+                    mask,
+                    lanes,
+                    high,
+                };
+                (d(false), d(true))
+            }
+        }
+    }
 }
 
 /// What a value a section leaves holds in every lane.
@@ -118,6 +206,9 @@ pub(crate) enum Shape {
     /// [`Sym::Half`] over every lane: `op`, src, mask, identity, the lane
     /// giving the high half.
     Half(Op, Value, Value, u32, u32),
+    /// [`Sym::SumD`] over every lane: the double's dwords, the mask, and
+    /// whether this is the high dword.
+    SumD(Value, Value, Value, bool),
 }
 
 /// The section starting at instruction `start` of a block: its restore
@@ -360,6 +451,18 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             {
                 masked.push(w);
             }
+            // A copy of a value the section made (an f64 sum's dwords
+            // read from a lane and moved).
+            if name == "s_mov_b32"
+                && let Some(&Operand::Scalar { code, .. }) = src.first()
+                && code != NULL
+                && let Some(x) = inst.read(Reg::S(code))
+                && let Some(&s) = uni.get(&x)
+                && let Some(&(_, w)) = inst.writes.first()
+            {
+                uni.insert(w, s);
+                continue;
+            }
             for &(_, w) in &inst.writes {
                 uni.entry(w).or_insert(Sym::Unknown);
             }
@@ -394,6 +497,66 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             }
         };
         let modifiers = v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some();
+        if name == "v_add_f64" {
+            // An f64 sum: each operand a register pair (`v_mov` with DPP
+            // moves the dwords one at a time, `v_readlane` reads them).
+            let pair = |op: Option<&Operand>| -> Vec<Option<Pair>> {
+                let next = match op {
+                    Some(&Operand::Vector { reg, .. }) => Operand::Vector {
+                        reg: reg + 1,
+                        dwords: 1,
+                    },
+                    Some(&Operand::Scalar { code, .. }) if code < 105 => Operand::Scalar {
+                        code: code + 1,
+                        dwords: 1,
+                    },
+                    Some(&Operand::Const(128)) => Operand::Const(128),
+                    _ => return vec![None; wave as usize],
+                };
+                let lo = lanes(op.unwrap(), &vec, &uni);
+                let hi = lanes(&next, &vec, &uni);
+                (0..wave as usize).map(|l| Pair::of(lo[l], hi[l])).collect()
+            };
+            let dst = match v.dst {
+                Some(Operand::Vector { reg, .. }) => {
+                    inst.write(Reg::V(reg)).zip(inst.write(Reg::V(reg + 1)))
+                }
+                _ => None,
+            };
+            let Some((dlo, dhi)) = dst.filter(|_| !modifiers && v.dpp.is_none()) else {
+                for &(_, w) in &inst.writes {
+                    vec.insert(w, vec![Sym::Unknown; wave as usize]);
+                }
+                continue;
+            };
+            let (a, b) = (pair(v.src.first()), pair(v.src.get(1)));
+            let Some(Operand::Vector { reg, .. }) = v.dst else {
+                unreachable!()
+            };
+            let old = |r: u8| {
+                lanes(
+                    &Operand::Vector {
+                        reg: r,
+                        dwords: 1,
+                    },
+                    &vec,
+                    &uni,
+                )
+            };
+            let (mut lo, mut hi) = (old(reg), old(reg + 1));
+            for l in 0..wave as usize {
+                if exec >> l & 1 == 0 {
+                    continue;
+                }
+                (lo[l], hi[l]) = match a[l].zip(b[l]).and_then(|(x, y)| x.add(y)) {
+                    Some(p) => p.dwords(),
+                    None => (Sym::Unknown, Sym::Unknown),
+                };
+            }
+            vec.insert(dlo, lo);
+            vec.insert(dhi, hi);
+            continue;
+        }
         if name == "v_readlane_b32" {
             let (Some(Operand::Scalar { code, .. }), Some(src), Some(lane)) =
                 (v.dst, v.src.first(), v.src.get(1))
@@ -629,6 +792,13 @@ fn shapes(
             lanes,
             hi,
         } if lanes == all => Some(Shape::Half(op, src, mask, ident, hi)),
+        Sym::SumD {
+            lo,
+            hi,
+            mask,
+            lanes,
+            high,
+        } if lanes == all => Some(Shape::SumD(lo, hi, mask, high)),
         _ => None,
     };
     for (v, s) in uni {
@@ -672,6 +842,13 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
                 ident,
                 lanes,
             } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+            Sym::SumD {
+                lo,
+                hi,
+                mask,
+                lanes,
+                high,
+            } if lanes == all => Some(Shape::SumD(lo, hi, mask, high)),
             _ => None,
         };
     }
@@ -973,6 +1150,70 @@ mod tests {
         let sec = &sections(&p, 0)[&0];
         assert_eq!(sec.shapes.get(&v2_val), Some(&Shape::K(7)));
         assert_eq!(sec.shapes.get(&v3_val), Some(&Shape::K(7)));
+    }
+
+    /// `WaveActiveSum` of a double (here a lane count, 1.0 per lane) as
+    /// the compiler expands it: each DPP and lane step moves the two dwords
+    /// one at a time, `v_add_f64` adds the pairs, `v_readlane` reads the
+    /// total's dwords and `s_mov` copies them.
+    #[test]
+    fn f64_sums_are_followed_through_dword_moves() {
+        let dpp8 = |dst: u8, src: u8, sel: [u32; 8]| {
+            let sel = sel.iter().enumerate().fold(0, |a, (i, &l)| a | l << (3 * i));
+            [vop1(dst, 0x01, 0xE9), u32::from(src) | sel << 8]
+        };
+        let add_f64 = vop3(2, 0x164, 256 + 4, 256 + 2, 0);
+        let mut w = vec![
+            sop1(0, 0x3D, 193), // s_or_saveexec_b32 s0, -1
+        ];
+        w.extend(vop3(2, 0x101, 128, 256, 0)); // v_cndmask_b32 v2, 0, v0, s0
+        w.extend(vop3(3, 0x101, 128, 257, 0)); // v_cndmask_b32 v3, 0, v1, s0
+        for sel in [
+            [1, 0, 3, 2, 5, 4, 7, 6],
+            [2, 2, 0, 0, 6, 6, 4, 4],
+            [4, 4, 4, 4, 0, 0, 0, 0],
+        ] {
+            w.extend(dpp8(4, 2, sel));
+            w.extend(dpp8(5, 3, sel));
+            w.extend(add_f64);
+        }
+        // row_mirror, then the other row's first lane.
+        for (d, s) in [(4, 2), (5, 3)] {
+            w.push(vop1(d, 0x01, 0xFA));
+            w.push(dpp16(s, 0x140, 0xF, 0xF, true));
+        }
+        w.extend(add_f64);
+        w.extend(vop3(4, 0x378, 256 + 2, 128, 128));
+        w.extend(vop3(5, 0x378, 256 + 3, 128, 128));
+        w.extend(add_f64);
+        w.extend(vop3(2, 0x360, 256 + 2, 128, 0)); // v_readlane_b32 s2, v2, 0
+        w.extend(vop3(3, 0x360, 256 + 3, 128, 0)); // v_readlane_b32 s3, v3, 0
+        w.push(sop1(4, 0x03, 2)); // s_mov_b32 s4, s2
+        w.push(sop1(5, 0x03, 3)); // s_mov_b32 s5, s3
+        w.push(sop1(EXEC, 0x03, 0)); // s_mov_b32 exec_lo, s0
+        let p = build(&w, false);
+        let insts = &p.blocks[0].insts;
+        let saved = insts[0].write(Reg::S(0)).unwrap();
+        let input = |r| p.inputs.iter().find_map(|&(x, v)| (x == r).then_some(v)).unwrap();
+        let (lo, hi) = (input(Reg::V(0)), input(Reg::V(1)));
+        // The program's last instruction is the s_endpgm `build` adds.
+        let n = insts.len();
+        let (s4, s5) = (
+            insts[n - 4].write(Reg::S(4)).unwrap(),
+            insts[n - 3].write(Reg::S(5)).unwrap(),
+        );
+        let sec = &sections(&p, 0)[&0];
+        assert_eq!(sec.shapes.get(&s4), Some(&Shape::SumD(lo, hi, saved, false)));
+        assert_eq!(sec.shapes.get(&s5), Some(&Shape::SumD(lo, hi, saved, true)));
+        // Lanes counted twice are no sum.
+        let mut twice = w.clone();
+        let at = twice.len() - 7;
+        twice.splice(at..at, add_f64);
+        let p = build(&twice, false);
+        let insts = &p.blocks[0].insts;
+        let n = insts.len();
+        let s4 = insts[n - 4].write(Reg::S(4)).unwrap();
+        assert_eq!(sections(&p, 0)[&0].shapes.get(&s4), None);
     }
 
     #[test]

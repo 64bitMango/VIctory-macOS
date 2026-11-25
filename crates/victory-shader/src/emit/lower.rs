@@ -1180,6 +1180,40 @@ impl<'a> Lower<'a> {
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
             }
+            Shape::SumD(lo, hi, mask, high) => {
+                if self.mask_data == MaskData::None {
+                    return Err("a wave reduction in a mesh shader");
+                }
+                // shortcut: the host has no doubles (Metal): each lane's
+                // double is rounded to f32 and the sum taken in f32. The
+                // programs found sum 1.0 per lane (a count), which f32
+                // holds exactly to 2^24.
+                let c = self.cur;
+                let &m = self
+                    .x
+                    .st
+                    .masks
+                    .get(&mask)
+                    .ok_or("a wave reduction's untracked mask")?;
+                let on = self.boolean(m, c)?;
+                let (lo, hi) = (self.i32_of(lo)?, self.i32_of(hi)?);
+                let x = self.f64_to_f32_bits(lo, hi);
+                let z = self.s.m.i32(0);
+                let x = self.s.m.select(c, on, x, z);
+                self.s.flags |= flags::WAVE_OPS;
+                let f = self.as_float(x);
+                let (sum, signed) = (self.s.m.i8(0), self.s.m.i8(0));
+                let r = self.s.op(
+                    c,
+                    "waveActiveOp.f32",
+                    Attr::NoUnwind,
+                    self.s.t.f32,
+                    119,
+                    &[f, sum, signed],
+                );
+                let r = self.as_int(r);
+                return Ok(self.f32_bits_to_f64_dword(r, high));
+            }
             Shape::Half(_, src, mask, ident, hi) => {
                 // The high half is a console lane's: compute only.
                 if self.mask_data != MaskData::Console {
@@ -2139,6 +2173,142 @@ impl<'a> Lower<'a> {
                 .and_then(|o| self.low16.get(&o).copied()),
             _ => None,
         }
+    }
+
+    /// The f32 bits nearest the double whose dwords are `lo` and `hi`
+    /// (`v_cvt_f32_f64`), in integer arithmetic: the host may have no
+    /// doubles (Metal). Rounds to nearest even; results below the f32
+    /// normals flush to a signed zero, NaNs come out quiet.
+    fn f64_to_f32_bits(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let (sign_k, k20, k0x7ff, mant_k) = (
+            k(self, 0x8000_0000),
+            k(self, 20),
+            k(self, 0x7FF),
+            k(self, 0xF_FFFF),
+        );
+        let sign = self.s.m.bin(c, Bin::And, hi, sign_k);
+        let e = self.s.m.bin(c, Bin::LShr, hi, k20);
+        let e = self.s.m.bin(c, Bin::And, e, k0x7ff);
+        let mh = self.s.m.bin(c, Bin::And, hi, mant_k);
+        // The 23 mantissa bits kept and the 29 below them.
+        let (k3, k29, low29) = (k(self, 3), k(self, 29), k(self, 0x1FFF_FFFF));
+        let top = self.s.m.bin(c, Bin::Shl, mh, k3);
+        let next = self.s.m.bin(c, Bin::LShr, lo, k29);
+        let m = self.s.m.bin(c, Bin::Or, top, next);
+        let rest = self.s.m.bin(c, Bin::And, lo, low29);
+        // Exponent rebiased (1023 to 127), as a signed number.
+        let bias = k(self, 1023 - 127);
+        let e32 = self.s.m.bin(c, Bin::Sub, e, bias);
+        let (k23, one, half) = (k(self, 23), k(self, 1), k(self, 0x1000_0000));
+        let ex = self.s.m.bin(c, Bin::Shl, e32, k23);
+        let r = self.s.m.bin(c, Bin::Or, ex, m);
+        // Round to nearest, ties to even (a carry into the exponent is
+        // right, up to infinity).
+        let above = self.s.m.cmp(c, pred::UGT, rest, half);
+        let tie = self.s.m.cmp(c, pred::EQ, rest, half);
+        let odd = self.s.m.bin(c, Bin::And, m, one);
+        let z = k(self, 0);
+        let odd = self.s.m.cmp(c, pred::NE, odd, z);
+        let tie_up = self.s.m.bin(c, Bin::And, tie, odd);
+        let up = self.s.m.bin(c, Bin::Or, above, tie_up);
+        let inc = self.s.m.select(c, up, one, z);
+        let r = self.s.m.bin(c, Bin::Add, r, inc);
+        // Out of range: too large is infinity, too small zero.
+        let inf = k(self, 0x7F80_0000);
+        let k255 = k(self, 255);
+        let big = self.s.m.cmp(c, pred::SGE, e32, k255);
+        let r = self.s.m.select(c, big, inf, r);
+        let small = self.s.m.cmp(c, pred::SLE, e32, z);
+        let r = self.s.m.select(c, small, z, r);
+        // Infinity and NaN.
+        let special = self.s.m.cmp(c, pred::EQ, e, k0x7ff);
+        let any = self.s.m.bin(c, Bin::Or, mh, lo);
+        let nan = self.s.m.cmp(c, pred::NE, any, z);
+        let qnan = k(self, 0x7FC0_0000);
+        let sp = self.s.m.select(c, nan, qnan, inf);
+        let r = self.s.m.select(c, special, sp, r);
+        self.s.m.bin(c, Bin::Or, r, sign)
+    }
+
+    /// A dword (`high`: the high one) of the double equal to the f32 with
+    /// bits `x` (exact; f32 denormals as signed zeros).
+    fn f32_bits_to_f64_dword(&mut self, x: V, high: bool) -> V {
+        let c = self.cur;
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let (k23, kff, mant_k, z) = (k(self, 23), k(self, 0xFF), k(self, 0x7F_FFFF), k(self, 0));
+        let e = self.s.m.bin(c, Bin::LShr, x, k23);
+        let e = self.s.m.bin(c, Bin::And, e, kff);
+        let m = self.s.m.bin(c, Bin::And, x, mant_k);
+        let zero = self.s.m.cmp(c, pred::EQ, e, z);
+        if !high {
+            let k29 = k(self, 29);
+            let lo = self.s.m.bin(c, Bin::Shl, m, k29);
+            return self.s.m.select(c, zero, z, lo);
+        }
+        let sign_k = k(self, 0x8000_0000);
+        let sign = self.s.m.bin(c, Bin::And, x, sign_k);
+        let special = self.s.m.cmp(c, pred::EQ, e, kff);
+        let rebias = k(self, 1023 - 127);
+        let e64 = self.s.m.bin(c, Bin::Add, e, rebias);
+        let k0x7ff = k(self, 0x7FF);
+        let e64 = self.s.m.select(c, special, k0x7ff, e64);
+        let (k20, k3) = (k(self, 20), k(self, 3));
+        let e64 = self.s.m.bin(c, Bin::Shl, e64, k20);
+        let mh = self.s.m.bin(c, Bin::LShr, m, k3);
+        let hi = self.s.m.bin(c, Bin::Or, e64, mh);
+        let hi = self.s.m.select(c, zero, z, hi);
+        self.s.m.bin(c, Bin::Or, hi, sign)
+    }
+
+    /// The dwords of f64 source `k`, its `neg` and `abs` applied.
+    fn f64_src(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("f64 operand modifiers");
+        }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let (lo, hi) = match op {
+            Operand::Vector { reg, .. } => (Reg::V(reg), Reg::V(reg + 1)),
+            Operand::Scalar { code, .. } if code < 105 => (Reg::S(code), Reg::S(code + 1)),
+            Operand::Const(c @ (128..=208 | 240..=248)) => {
+                let d: f64 = match c {
+                    128..=192 => f64::from(c - 128),
+                    193..=208 => -f64::from(c - 192),
+                    248 => 0.5 / std::f64::consts::PI,
+                    _ => [0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0][usize::from(c - 240)],
+                };
+                let b = d.to_bits();
+                let (lo, hi) = (self.s.m.i32(b as u32), self.s.m.i32((b >> 32) as u32));
+                return Ok(self.f64_modifiers(v, k, lo, hi));
+            }
+            // A literal is the double's high dword.
+            Operand::Literal(x) => {
+                let (lo, hi) = (self.s.m.i32(0), self.s.m.i32(x));
+                return Ok(self.f64_modifiers(v, k, lo, hi));
+            }
+            _ => return Err("an f64 operand"),
+        };
+        let lo = self.i32_of(inst.read(lo).ok_or("an unread operand")?)?;
+        let hi = self.i32_of(inst.read(hi).ok_or("an unread operand")?)?;
+        Ok(self.f64_modifiers(v, k, lo, hi))
+    }
+
+    fn f64_modifiers(&mut self, v: &crate::gfx10::Valu, k: usize, lo: V, hi: V) -> (V, V) {
+        let c = self.cur;
+        let mut hi = hi;
+        if v.abs >> k & 1 != 0 {
+            let m = self.s.m.i32(0x7FFF_FFFF);
+            hi = self.s.m.bin(c, Bin::And, hi, m);
+        }
+        if v.neg >> k & 1 != 0 {
+            let m = self.s.m.i32(0x8000_0000);
+            hi = self.s.m.bin(c, Bin::Xor, hi, m);
+        }
+        (lo, hi)
     }
 
     fn as_float(&mut self, x: V) -> V {
@@ -6468,6 +6638,12 @@ impl<'a> Lower<'a> {
                     Cast::UiToFp
                 };
                 let r = self.s.m.cast(c, op, a, self.s.t.f32);
+                float(self, r)
+            }
+            "v_cvt_f32_f64" => {
+                let (lo, hi) = self.f64_src(inst, 0)?;
+                let r = self.f64_to_f32_bits(lo, hi);
+                let r = self.as_float(r);
                 float(self, r)
             }
             "v_cvt_off_f32_i4" => {
