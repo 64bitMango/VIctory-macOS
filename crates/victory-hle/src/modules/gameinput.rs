@@ -1258,20 +1258,7 @@ mod host {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let vk = named_key(key)?;
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
                     vk,
@@ -1281,10 +1268,64 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
-            .collect()
+            .collect();
+        down.extend(keys_from_file());
+        down
+    }
+
+    /// A key by its name in `VICTORY_KEYS`.
+    #[cfg(feature = "diagnostics")]
+    fn named_key(key: &str) -> Option<u8> {
+        Some(match key.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
+    }
+
+    /// Debugging aid: `VICTORY_KEYS_FILE=<file>`: while the file exists, the
+    /// keys it names (as in `VICTORY_KEYS`, separated by commas or spaces)
+    /// are held, with or without focus: a script watching the log presses a
+    /// key at the page it is for, and nowhere else. Looked at ten times a
+    /// second.
+    #[cfg(feature = "diagnostics")]
+    fn keys_from_file() -> Vec<u8> {
+        use std::sync::Mutex;
+        static FILE: LazyLock<Option<std::path::PathBuf>> =
+            LazyLock::new(|| std::env::var_os("VICTORY_KEYS_FILE").map(Into::into));
+        static LAST: Mutex<Option<(Instant, Vec<u8>)>> = Mutex::new(None);
+        let Some(file) = FILE.as_ref() else {
+            return Vec::new();
+        };
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, keys)) = last.as_ref()
+            && at.elapsed() < Duration::from_millis(100)
+        {
+            return keys.clone();
+        }
+        let keys: Vec<u8> = std::fs::read_to_string(file)
+            .unwrap_or_default()
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter_map(named_key)
+            .collect();
+        if !keys.is_empty() && last.as_ref().is_none_or(|(_, k)| k.is_empty()) {
+            tracing::info!(?keys, "keys held from VICTORY_KEYS_FILE");
+        }
+        *last = Some((Instant::now(), keys.clone()));
+        keys
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
