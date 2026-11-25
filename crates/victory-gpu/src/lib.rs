@@ -61,6 +61,9 @@ pub mod queue;
 mod ranges;
 pub mod resource;
 pub mod root;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod segments;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]

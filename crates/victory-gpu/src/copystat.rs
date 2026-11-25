@@ -114,8 +114,11 @@ pub(crate) enum C {
     GapsKept,
     GapBytes,
     GapsDropped,
+    /// Of the snapshot bytes: those copied again from an older snapshot of
+    /// the same submission (a segment rebuilt as a range grew it).
+    SnapshotAgain,
 }
-const COUNTERS: usize = 65;
+const COUNTERS: usize = 66;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -323,10 +326,12 @@ pub(crate) fn log(frames: f64) {
         .collect();
     tracing::info!("  guard lock held per frame: {}", held.join(", "));
     tracing::info!(
-        "  prepare waste per frame: uncommitted gaps of copies passed with one query {:.1} ({:.2} MB zeroed, no read tried), {:.1} forgotten (committed since)",
+        "  prepare waste per frame: uncommitted gaps of copies passed with one query {:.1} ({:.2} MB zeroed, no read tried), {:.1} forgotten (committed since); snapshots {:.1} MB, {:.1} MB of them copied again as their segment grew",
         c[C::GapsKept as usize],
         mb(c[C::GapBytes as usize]),
         c[C::GapsDropped as usize],
+        mb(c[C::SnapshotBytes as usize]),
+        mb(c[C::SnapshotAgain as usize]),
     );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();

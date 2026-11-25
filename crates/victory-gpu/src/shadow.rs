@@ -63,6 +63,18 @@ pub(crate) struct Shadow {
     gaps: Mutex<(Vec<(usize, usize)>, bool)>,
 }
 
+/// Whether a snapshot takes only the bytes no segment of its copy holds
+/// yet (`crate::segments`), instead of rebuilding one segment over every
+/// range that overlaps or touches: on unless `VICTORY_SNAPSHOTS_APART=0`.
+fn snapshots_apart() -> bool {
+    #[cfg(test)]
+    if tests::JOINED.with(|joined| joined.get()) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_SNAPSHOTS_APART"))
+}
+
 /// Gaps remembered per copy at most: past it the copy remembers none.
 const GAPS: usize = 256;
 
@@ -89,8 +101,9 @@ impl Drop for Flight {
     }
 }
 
-/// Snapshot segments (offset, bytes) and the pieces compared.
-type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
+/// Snapshot segments (offset, bytes; `crate::segments`) and the pieces
+/// compared.
+type Snapshot = (Vec<crate::segments::Segment>, std::collections::HashSet<usize>);
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
@@ -124,10 +137,14 @@ fn give_back(v: Vec<u8>) {
         total += v.capacity();
         total <= POOL_BYTES
     });
+    // The largest: small ones cost the allocator no page faults, and each
+    // kept is looked at whenever a buffer is taken or given back.
+    pool.truncate(POOL_BUFFERS);
 }
 
-/// Snapshot memory kept for reuse.
+/// Snapshot memory kept for reuse, and how many buffers at most.
 const POOL_BYTES: usize = 512 << 20;
+const POOL_BUFFERS: usize = 256;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
@@ -357,34 +374,25 @@ impl Shadow {
             |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let segments = &mut before.0;
-        // The segments the range overlaps or touches.
-        let first = segments.partition_point(|(at, bytes)| at + bytes.len() < from);
-        let last = first + segments[first..].iter().take_while(|(at, _)| *at <= to).count();
-        if let [(at, bytes)] = &segments[first..last]
-            && *at <= from
-            && to <= at + bytes.len()
-        {
-            return;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        // The bytes no segment holds yet, or (`VICTORY_SNAPSHOTS_APART=0`)
+        // one segment with those the range overlaps or touches, rebuilt.
+        let (taken, again) = if snapshots_apart() {
+            (crate::segments::cover_apart(segments, from, to, host, pooled), 0)
+        } else {
+            crate::segments::cover_joined(segments, from, to, host, pooled, give_back)
+        };
+        #[cfg(feature = "diagnostics")]
+        if taken > 0 {
+            use crate::copystat::{C, add};
+            add(C::SnapshotUs, started.elapsed().as_micros() as u64);
+            add(C::SnapshotBytes, taken as u64);
+            add(C::SnapshotAgain, again as u64);
+            crate::copystat::snapshot(self.start, self.len, taken as u64);
         }
-        let start = segments.get(first).filter(|_| first < last).map_or(from, |s| s.0.min(from));
-        let end = segments[first..last].last().map_or(to, |(at, bytes)| (at + bytes.len()).max(to));
-        #[cfg(feature = "diagnostics")]
-        let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SnapshotUs);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::SnapshotBytes, (end - start) as u64);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::snapshot(self.start, self.len, (end - start) as u64);
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        let mut at = start;
-        for (taken, bytes) in segments.drain(first..last) {
-            grown.extend_from_slice(host(at, taken));
-            grown.extend_from_slice(&bytes);
-            at = taken + bytes.len();
-            give_back(bytes);
-        }
-        grown.extend_from_slice(host(at, end));
-        segments.insert(first, (start, grown));
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = (taken, again);
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -411,11 +419,12 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
-            && back
+        // Joined segments never touch: the range is held if one holds it.
+        if back
             && from < to
+            && crate::segments::covered(segments, from, to)
         {
-            let before = &before[from - taken..to - taken];
+            let mut gathered = Vec::new();
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
             // By 64 KiB piece: the copy compared with its bytes before the
@@ -429,7 +438,6 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
                 // A whole piece is compared once per submission, whichever
                 // declared ranges overlap it: then what the GPU wrote there
@@ -438,6 +446,8 @@ impl Shadow {
                     at += n;
                     continue;
                 }
+                // The piece as it was taken, from the segments holding it.
+                let old = crate::segments::held(segments, at, at + n, &mut gathered);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
@@ -1675,6 +1685,8 @@ pub(crate) mod tests {
     thread_local! {
         /// This thread's copies remember no gaps (as `VICTORY_GAP_MEMO=0`).
         pub(super) static NO_GAP_MEMO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// This thread's snapshots are joined (as `VICTORY_SNAPSHOTS_APART=0`).
+        pub(super) static JOINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
@@ -2039,7 +2051,7 @@ pub(crate) mod tests {
         copy.writing(p + PAGE, 2 * PAGE, false);
         copy.writing(p + PAGE, PAGE, false);
         copy.writing(p + 80, 8, false);
-        assert_eq!(bytes(&copy), 72 + 2 * PAGE + 100, "merged where they overlap or touch");
+        assert_eq!(bytes(&copy), 72 + 2 * PAGE + 100, "each byte once where they overlap or touch");
         // The GPU writes inside two ranges.
         copy.write_host((p + 20) as u64, &[1, 2, 3]);
         copy.write_host((p + PAGE + 5) as u64, &[9]);
@@ -2053,6 +2065,81 @@ pub(crate) mod tests {
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
         assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
         unregister(p, p as u64);
+    }
+
+    /// Ranges each reaching past the last (root views at rising addresses)
+    /// and one apart, a title write under them refreshed, shaders' writes
+    /// across the ranges' ends: the bytes each copy-back wrote, title
+    /// memory and the copy after, and the snapshot's segments and bytes at
+    /// its largest. None without a host GPU.
+    #[allow(clippy::type_complexity)]
+    fn rising_ranges() -> Option<(Vec<usize>, Vec<u8>, Vec<u8>, (usize, usize))> {
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return None;
+        };
+        // SAFETY: (all title reads and writes below) bytes of our pool.
+        let title = |at: usize, byte: u8| unsafe { ((p + at) as *mut u8).write_volatile(byte) };
+        (0..len).step_by(7).for_each(|at| title(at, (at % 251) as u8));
+        copy.update(p, len);
+        let mut ranges: Vec<(usize, usize)> = (0..6).map(|k| (1000 + k * 5000, 20_000)).collect();
+        ranges.push((3 * PAGE - 100, 200));
+        ranges.push((6000, 3000));
+        for &(at, n) in &ranges {
+            copy.writing(p + at, n, false);
+        }
+        let taken = {
+            let before = copy.before.lock().unwrap();
+            (before.0.len(), before.0.iter().map(|(_, b)| b.len()).sum())
+        };
+        // The title writes under the ranges; a refresh takes it for the
+        // copy and the snapshot.
+        title(12_000, 0x77);
+        copy.update(p + 8192, 8192);
+        // Shaders write across the ranges' ends, and beside the title's byte.
+        copy.write_host((p + 20_990) as u64, &[0xa1; 20]);
+        copy.write_host((p + 25_996) as u64, &[0xa2; 8]);
+        copy.write_host((p + 12_001) as u64, &[0xa3]);
+        copy.write_host((p + 3 * PAGE - 2) as u64, &[0xa4; 4]);
+        // The title writes again while they run.
+        title(30_000, 0x78);
+        let written: Vec<usize> = ranges.iter().map(|&(at, n)| copy.copy_back(p + at, n)).collect();
+        assert!(copy.before.lock().unwrap().0.is_empty(), "the snapshot goes with the last range");
+        let memory = read_as(p, len);
+        let copied = held(&copy);
+        unregister(p, p as u64);
+        Some((written, memory, copied, taken))
+    }
+
+    /// Snapshots take each declared byte once, as segments of their own,
+    /// and what shaders wrote goes back as it does with one segment rebuilt
+    /// over the ranges that touch (`VICTORY_SNAPSHOTS_APART=0`): the same
+    /// bytes written, title memory and copy.
+    #[test]
+    fn snapshots_apart_copy_back_what_joined_ones_do() {
+        let run = |joined: bool| {
+            JOINED.with(|j| j.set(joined));
+            let out = rising_ranges();
+            JOINED.with(|j| j.set(false));
+            out
+        };
+        let (Some(apart), Some(joined)) = (run(false), run(true)) else {
+            return; // no host GPU here
+        };
+        // 1000 to 46000, and 200 bytes apart.
+        assert_eq!(apart.3, (7, 45_200), "each byte once, a segment per range that added some");
+        assert_eq!(joined.3, (2, 45_200), "one segment over the ranges that touch");
+        assert_eq!(apart.0, joined.0, "bytes written back per range");
+        assert!(apart.1 == joined.1, "title memory");
+        assert!(apart.2 == joined.2, "the copy");
+        // The shaders' bytes and the title's are all in title memory.
+        let m = &apart.1;
+        assert!(m[20_990..21_010].iter().all(|&b| b == 0xa1) && m[25_996..26_004].iter().all(|&b| b == 0xa2));
+        assert_eq!([m[12_000], m[12_001], m[30_000]], [0x77, 0xa3, 0x78]);
+        assert_eq!(m[3 * PAGE - 2..3 * PAGE + 2], [0xa4; 4]);
     }
 
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`
