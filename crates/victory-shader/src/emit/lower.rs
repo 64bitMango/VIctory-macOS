@@ -329,6 +329,13 @@ struct Lower<'a> {
     split_barriers: Set<(usize, usize)>,
     /// The program runs as halves of console waves ([`Halves`]).
     halves: Option<Halves>,
+    /// Halves: the branches sunk below the code they skip ([`sunk_skips`]):
+    /// the skipped block and the skip's target, by the branch's block.
+    sunk: Map<usize, (usize, usize)>,
+    /// The sunk branches met so far, by the skipped block: the condition,
+    /// whether the skip is taken when it holds, and the DXIL block the
+    /// skip's edge then goes through.
+    sinking: Map<usize, (V, bool, usize)>,
     /// Why the halves form is not the console's program, once it is known.
     refused: &'a std::cell::Cell<Option<Why>>,
     /// Guarded regions open ([`Self::begin_guarded`]): not every lane is
@@ -838,6 +845,8 @@ impl<'a> Lower<'a> {
             no_barrier,
             split_barriers,
             halves,
+            sunk: Map::default(),
+            sinking: Map::default(),
             refused,
             guarded: 0,
             half_outputs: half_outputs(&x.native.io),
@@ -872,9 +881,25 @@ impl<'a> Lower<'a> {
             round16: round16(p),
             mode16: Some(0),
         };
-        // Halves: the blocks all threads of a group run once, or none does.
-        // An exchange there is made once; they are where the halves meet in
-        // a group of several console waves.
+        // Several console waves in a group: code one wave skips and another
+        // runs is run by all, so that the halves can meet in it.
+        // (not where all waves go one way: the group meets there as it is)
+        if l.halves.as_ref().is_some_and(|h| h.count > 2) {
+            let same = l.group_uniform();
+            l.sunk = sunk_skips(x);
+            l.sunk.retain(|&d, _| match x.st.exits[d] {
+                LaneExit::Branch { when, .. } => !x
+                    .st
+                    .bools
+                    .support(when)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(scc) if same.contains(scc))),
+                _ => false,
+            });
+        }
+        // Halves: the blocks all threads of a group run together. They are
+        // where the halves meet in a group of several console waves; an
+        // exchange in one outside every loop is made once.
         let group = l
             .halves
             .is_some()
@@ -884,7 +909,8 @@ impl<'a> Lower<'a> {
                 h.full = all;
             }
             h.meet = h.full.iter().zip(&live).map(|(&f, &l)| f || l).collect();
-            h.once = live;
+            let cycle = in_cycle(p);
+            h.once = live.iter().zip(&cycle).map(|(&l, &c)| l && !c).collect();
         }
         l
     }
@@ -895,40 +921,73 @@ impl<'a> Lower<'a> {
     /// dispatch does not write (descriptor tables and root constants;
     /// buffers bound as constants or read-only, which the title cannot have
     /// bound for writing in the same dispatch; tables in the code). Lane
-    /// masks, EXEC and whatever comes from a VGPR or a wave are left out,
-    /// and so are joins (a phi is what each path brought).
+    /// masks, EXEC and whatever comes from a VGPR or a wave are left out.
+    ///
+    /// A join is one where every thread comes to it the same way: of such
+    /// values, in a block all threads that have not ended run together
+    /// ([`Self::together`]) and enter from such blocks only, so that the
+    /// block a thread came from is the one all came from. A loop's count is
+    /// such a join of itself: all are taken to hold alike, and those that
+    /// do not hold on that footing are taken out until the rest do. (By
+    /// the order the threads run those blocks in, which is one order for
+    /// all: the first value or branch to differ would have been made of
+    /// values that did not.)
     fn group_uniform(&self) -> Set<Value> {
         let p = self.x.p;
-        let mut same: Set<Value> = Set::default();
         let StageIo::Cs(cs) = self.x.native.io else {
-            return same;
+            return Set::default();
         };
         let (ids, _) = cs.system_sgprs();
-        for &(reg, v) in &p.inputs {
-            if let Reg::S(c) = reg
-                && (c < cs.user_sgprs() || ids.contains(&Some(c)))
-            {
-                same.insert(v);
-            }
-        }
         const NOT: [&str; 12] = [
             "saveexec", "getpc", "setpc", "swappc", "rfe", "getreg", "setreg", "gpr_idx", "wqm",
             "quadmask", "call", "movrel",
         ];
-        for b in crate::ir::reverse_postorder(&p.blocks) {
-            for (i, inst) in p.blocks[b].insts.iter().enumerate() {
-                let name = inst.name();
-                let pure = match &inst.fields {
-                    Fields::Sop { .. } => !NOT.iter().any(|n| name.contains(n)),
-                    Fields::Smem { .. } => self.static_load(inst, (b, i)),
-                    _ => false,
-                };
-                if pure && inst.reads.iter().all(|r| same.contains(&r.1)) {
-                    same.extend(inst.writes.iter().map(|w| w.1));
+        let order = crate::ir::reverse_postorder(&p.blocks);
+        let mut joins: Vec<(usize, &Phi)> = order
+            .iter()
+            .flat_map(|&b| p.blocks[b].phis.iter().map(move |phi| (b, phi)))
+            .filter(|(_, phi)| {
+                matches!(phi.reg, Reg::S(c) if c <= 105)
+                    && !self.x.st.masks.contains_key(&phi.value)
+            })
+            .collect();
+        loop {
+            let mut same: Set<Value> = joins.iter().map(|j| j.1.value).collect();
+            for &(reg, v) in &p.inputs {
+                if let Reg::S(c) = reg
+                    && (c < cs.user_sgprs() || ids.contains(&Some(c)))
+                {
+                    same.insert(v);
                 }
             }
+            for &b in &order {
+                for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+                    let name = inst.name();
+                    let pure = match &inst.fields {
+                        Fields::Sop { .. } => !NOT.iter().any(|n| name.contains(n)),
+                        Fields::Smem { .. } => self.static_load(inst, (b, i)),
+                        _ => false,
+                    };
+                    if pure && inst.reads.iter().all(|r| same.contains(&r.1)) {
+                        same.extend(inst.writes.iter().map(|w| w.1));
+                    }
+                }
+            }
+            if joins.is_empty() {
+                return same;
+            }
+            // (a join below a sunk branch is each wave's own)
+            let together = self.together(&same, true, false);
+            let before = joins.len();
+            joins.retain(|&(b, phi)| {
+                together[b]
+                    && p.blocks[b].preds.iter().all(|&q| together[q])
+                    && phi.args.iter().all(|a| same.contains(a))
+            });
+            if joins.len() == before {
+                return same;
+            }
         }
-        same
     }
 
     /// Whether a scalar load reads memory the dispatch does not write.
@@ -956,24 +1015,27 @@ impl<'a> Lower<'a> {
             }
     }
 
-    /// The blocks all threads of a compute group run once, or none does: no
-    /// cycle through them, and every branch that decides whether a thread
-    /// runs them (directly or through the branches around it) tests a
-    /// [`Self::group_uniform`] SCC, so all threads take it one way. A group
-    /// barrier there has every thread of the group, as in a block each runs
-    /// once ([`once_blocks`], which these include).
+    /// The blocks all threads of a compute group run together, each as
+    /// often as the others: every branch that decides whether or how often
+    /// a thread runs them (directly or through the branches around it)
+    /// tests an SCC of `same`, values all threads hold alike, so all take
+    /// it one way. A group barrier there has every thread of the group, as
+    /// in a block each runs once ([`once_blocks`], which these include),
+    /// each pass of a loop all go round together too.
     ///
     /// `live`: all threads that have not ended, that is: a branch whose
     /// other way is the program's end does not count (as [`wave_blocks`]:
     /// the threads that ended never reach the barrier; Apple's GPUs make
     /// the rest meet).
-    fn group_blocks(&self, live: bool) -> Vec<bool> {
+    ///
+    /// `sunk`: a branch only taken after the code it skips
+    /// ([`Self::sunk`]) decides nothing either.
+    fn together(&self, same: &Set<Value>, live: bool, sunk: bool) -> Vec<bool> {
         let p = self.x.p;
         let st = self.x.st;
-        let same = self.group_uniform();
-        let n = p.blocks.len();
         let succ = |b: usize| p.blocks[b].exit.successors();
         let decides = |q: usize| match st.exits[q] {
+            _ if sunk && self.sunk.contains_key(&q) => false,
             LaneExit::Branch {
                 when,
                 taken,
@@ -990,9 +1052,12 @@ impl<'a> Lower<'a> {
             _ => succ(q).len() > 1,
         };
         let early = |q: usize| live && succ(q).iter().any(|&s| ends(p, s));
-        let together = undecided(p, |q| decides(q) && !early(q));
-        let cycle = in_cycle(p);
-        (0..n).map(|b| together[b] && !cycle[b]).collect()
+        undecided(p, |q| decides(q) && !early(q))
+    }
+
+    /// [`Self::together`] of the [`Self::group_uniform`] values.
+    fn group_blocks(&self, live: bool) -> Vec<bool> {
+        self.together(&self.group_uniform(), live, true)
     }
 
     /// The dword of the program's code at byte `byte` (a constant table
@@ -1713,6 +1778,81 @@ impl<'a> Lower<'a> {
         let in_hi = self.s.m.cmp(c, pred::NE, hi_lanes, z);
         let upper = self.s.m.select(c, in_hi, hi, lo);
         self.s.m.select(c, in_lo, lo, upper)
+    }
+
+    /// The lanes of the mask whose first lane a `v_readlane_b32` reads
+    /// (`s_ff1_i32_b64` of the mask as its lane, the console compiler's
+    /// read of the first lane of a set), where the host has every lane of
+    /// the mask in the block and each lane there is one: a mask written in
+    /// the block of lanes in EXEC ([`Structured::active`]) that every lane
+    /// entering the block is in, so that it is never empty where the read
+    /// runs (the console reads lane 63 by an empty one).
+    fn mask_led(&self, inst: &Inst) -> Option<Bool> {
+        let (p, st, b) = (self.x.p, self.x.st, self.cur_ir);
+        let Fields::Valu(v) = &inst.fields else {
+            return None;
+        };
+        let &Operand::Scalar { code, .. } = v.src.get(1)? else {
+            return None;
+        };
+        let lane = inst.read(Reg::S(code))?;
+        let here = |v: Value| {
+            p.blocks[b]
+                .insts
+                .iter()
+                .find(|i| i.writes.iter().any(|w| w.1 == v))
+        };
+        let first = here(lane)?;
+        let Fields::Sop { src, .. } = &first.fields else {
+            return None;
+        };
+        let &Operand::Scalar { code, .. } = src.first()? else {
+            return None;
+        };
+        let mask = first.read(Reg::S(code))?;
+        let &lanes = st.masks.get(&mask)?;
+        (first.name() == "s_ff1_i32_b64"
+            && here(mask).is_some()
+            && st.active.contains(&mask)
+            && !st.bools.meet(&[(st.reach[b], true), (lanes, false)]))
+        .then_some(lanes)
+    }
+
+    /// Halves: `a` of the first lane of `lanes` in the console's wave
+    /// ([`Self::mask_led`]): each half finds its first lane of them, and
+    /// the lower half's counts if it has one.
+    fn first_of(&mut self, lanes: Bool, a: V) -> V {
+        let b = self.cur_ir;
+        let c = self.cur;
+        if self.half_alone() {
+            return a;
+        }
+        let on = match self.boolean(lanes, c) {
+            Ok(on) if self.halves_meet(b) && self.guarded == 0 => on,
+            _ => {
+                self.refuse("v_readlane_b32 of a mask's first lane where the halves cannot meet");
+                return a;
+            }
+        };
+        self.s.flags |= flags::WAVE_OPS;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+        let lanes = self.s.m.extract(c, ballot, 0);
+        let (z, k31) = (self.s.m.i32(0), self.s.m.i32(31));
+        let lane = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lanes]);
+        let lane = self.s.m.bin(c, Bin::And, lane, k31);
+        let at = self.read_lane(a, lane);
+        let none = self.s.m.cmp(c, pred::EQ, lanes, z);
+        let own = self.s.m.select(c, none, a, at);
+        let (lo_lanes, _) = self.exchange(c, b, lanes, z);
+        let (lo, hi) = self.exchange(c, b, own, z);
+        let in_lo = self.s.m.cmp(c, pred::NE, lo_lanes, z);
+        self.s.m.select(c, in_lo, lo, hi)
     }
 
     /// Halves: a host wave's result `r` of an operation over the wave (the
@@ -3770,7 +3910,11 @@ impl<'a> Lower<'a> {
     /// constant: no lane in a mask, a reduction's identity) in the entry
     /// block, which all run, so such a half reads as that. Its threads set
     /// it before they ended, and the barrier lets the rest go on only once
-    /// they have.
+    /// they have. In a loop a half's threads may all end between two
+    /// passes, with what they stored in the last one still there: after
+    /// the second meeting every thread sets its half's dword to `absent`
+    /// again, and all meet a third time, so that none does so after
+    /// another of its half has stored the next pass's.
     fn exchange(&mut self, at: usize, b: usize, v: V, absent: V) -> (V, V) {
         let i32t = self.s.t.i32;
         let h = self.halves.as_mut().expect("halves");
@@ -3800,6 +3944,11 @@ impl<'a> Lower<'a> {
         if !self.halves.as_ref().expect("halves").once[b] {
             self.s
                 .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            if !full {
+                self.s.m.store(at, own, absent);
+                self.s
+                    .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            }
         }
         r
     }
@@ -7697,7 +7846,10 @@ impl<'a> Lower<'a> {
                 } else {
                     self.cross_lane(false)?;
                 }
-                let r = if self.halves.as_ref().is_some_and(|h| !h.whole) {
+                let split = self.halves.as_ref().is_some_and(|h| !h.whole);
+                let r = if let Some(lanes) = self.mask_led(inst).filter(|_| split) {
+                    self.first_of(lanes, a)
+                } else if split {
                     // Each half reads its lane of that number; the half
                     // the console's lane is in has the value.
                     if self.half_alone() {
@@ -11273,7 +11425,12 @@ impl<'a> Lower<'a> {
             }
             LaneExit::Jump(t) => {
                 self.enter_loop(b, t, self.cur);
-                Term::Br(self.block[t].expect("reachable"))
+                let to = self.block[t].expect("reachable");
+                match self.sinking.get(&b) {
+                    Some(&(skip, true, e)) => Term::CondBr(skip, e, to),
+                    Some(&(skip, false, e)) => Term::CondBr(skip, to, e),
+                    None => Term::Br(to),
+                }
             }
             LaneExit::Branch {
                 when,
@@ -11309,6 +11466,20 @@ impl<'a> Lower<'a> {
                 } else {
                     cond
                 };
+                // A sunk skip: every lane runs the skipped block, and
+                // those that skip leave it by an edge of the skip's own.
+                if let Some(&(body, to)) = self.sunk.get(&b) {
+                    let e = self.s.m.new_block();
+                    self.s
+                        .m
+                        .terminate(e, Term::Br(self.block[to].expect("reachable")));
+                    self.edges.insert((b, to), e);
+                    self.enter_loop(b, to, e);
+                    self.sinking.insert(body, (cond, to == taken, e));
+                    let body = self.block[body].expect("reachable");
+                    self.s.m.terminate(self.cur, Term::Br(body));
+                    return Ok(());
+                }
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
@@ -12471,6 +12642,81 @@ pub(crate) fn idle_skips(p: &Program, st: &Structured, loops: bool) -> Vec<usize
     skips
 }
 
+/// The uniform branches (by block: the block skipped and the target) that
+/// skip one block of wave operations and of nothing that shows outside the
+/// registers: no memory access, message, barrier or end. In a group of
+/// several console waves one wave takes such a skip and another does not,
+/// so the group cannot meet at a barrier in the block, and the halves of
+/// the waves that run it cannot exchange.
+///
+/// The branch is sunk below the block: every lane at the branch runs the
+/// block, and a lane whose wave skips then leaves by the skip's own edge
+/// into the target, where each join takes for it what the branch's block
+/// held. Such a lane has all its registers as with the skip taken before
+/// the block (what the block wrote is read past it only through the
+/// target's joins), and the block did nothing else. A lane whose wave does
+/// not skip runs what it ran before, with the whole group at the block's
+/// barriers. (The skips are whole waves': the condition is the wave's, the
+/// same in both halves.)
+fn sunk_skips(x: &Parts) -> Map<usize, (usize, usize)> {
+    let (p, st) = (x.p, x.st);
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut rpo = vec![usize::MAX; p.blocks.len()];
+    for (n, &b) in order.iter().enumerate() {
+        rpo[b] = n;
+    }
+    let quiet = |i: &Inst| {
+        let name = i.name();
+        match &i.fields {
+            Fields::Valu(_) => !name.contains("movrel"),
+            Fields::Sop { .. } => ![
+                "getpc", "setpc", "swappc", "rfe", "getreg", "setreg", "gpr_idx", "call",
+            ]
+            .iter()
+            .any(|n| name.contains(n)),
+            _ => matches!(name, "s_nop" | "s_branch") || name.starts_with("s_waitcnt"),
+        }
+    };
+    let wave = |i: &Inst| {
+        let name = i.name();
+        name.contains("permlane")
+            || name.contains("readlane")
+            || name.contains("readfirstlane")
+            || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+            || reads_mask_as_data(st, i)
+    };
+    let mut sunk = Map::default();
+    for &d in &order {
+        let LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } = st.exits[d]
+        else {
+            continue;
+        };
+        let atoms = st.bools.support(when);
+        if atoms.is_empty() || !atoms.iter().all(|a| matches!(a, Atom::Uniform(_))) {
+            continue;
+        }
+        for (body, to) in [(taken, not_taken), (not_taken, taken)] {
+            let block = &p.blocks[body];
+            if body != to
+                && block.preds == [d]
+                && block.phis.is_empty()
+                && st.exits[body] == LaneExit::Jump(to)
+                && rpo[d] < rpo[body]
+                && rpo[body] < rpo[to]
+                && block.insts.iter().all(quiet)
+                && block.insts.iter().any(wave)
+            {
+                sunk.insert(d, (body, to));
+            }
+        }
+    }
+    sunk
+}
+
 /// Wave64: the masks that hold at most one lane of a console wave, the one
 /// whose number is the first set bit of a mask (the console compiler's
 /// once-per-wave block: `v_mbcnt` of all lanes, `s_ff1_i32_b64`,
@@ -12645,12 +12891,30 @@ fn solo_blocks(x: &Parts, threads: [u32; 3], id_vgprs: u8) -> Vec<bool> {
             return 0;
         };
         // (a guarded write leaves the old value in the lanes it skips)
-        if inst.name() != "v_or_b32"
-            || depth == 0
-            || valu.sdwa.is_some()
-            || valu.dpp.is_some()
-            || x.st.guards[b][i].is_some()
-        {
+        if depth == 0 || valu.sdwa.is_some() || valu.dpp.is_some() || x.st.guards[b][i].is_some() {
+            return 0;
+        }
+        // The flat id of two components, `a << k | b` made as a sum: zero
+        // only where both are (thread ids are below 2^16, and so is `k`).
+        if inst.name() == "v_lshl_add_u32" {
+            let id = |op: Operand| match op {
+                Operand::Vector { reg, .. } => inst
+                    .read(Reg::V(reg))
+                    .and_then(|a| x.p.inputs.iter().find(|i| i.1 == a))
+                    .and_then(|i| match i.0 {
+                        Reg::V(k) if k < id_vgprs => Some(1 << k),
+                        _ => None,
+                    }),
+                _ => None,
+            };
+            return match valu.src[..] {
+                [a, k, b] if scalar_constant(k).is_some_and(|k| k <= 16) => {
+                    id(a).zip(id(b)).map_or(0, |(a, b)| a | b)
+                }
+                _ => 0,
+            };
+        }
+        if inst.name() != "v_or_b32" {
             return 0;
         }
         valu.src.iter().fold(0, |m, op| match *op {
@@ -12720,7 +12984,8 @@ struct Halves {
     /// Where the halves meet: `full`, and the [`Lower::group_blocks`] every
     /// thread that has not ended runs.
     meet: Vec<bool>,
-    /// [`Lower::group_blocks`]: an exchange there is not made again.
+    /// The [`Lower::group_blocks`] outside every loop: an exchange there
+    /// is not made again.
     once: Vec<bool>,
     /// [`solo_blocks`].
     solo: Vec<bool>,
@@ -14119,6 +14384,12 @@ mod tests {
 
     /// The same program, lowered.
     fn lowered(words: &[u32], lanes: u32, narrow_waves: bool) -> super::Lowered {
+        lowered_in(words, [lanes, 1, 1], narrow_waves)
+    }
+
+    /// The same program in a group of `threads`, its thread ids in v0 and
+    /// (with more than one row) v1.
+    fn lowered_in(words: &[u32], threads: [u32; 3], narrow_waves: bool) -> super::Lowered {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -14127,8 +14398,8 @@ mod tests {
             layout: vec![],
             used: vec![],
             io: StageIo::Cs(ComputeIo {
-                rsrc2: 1 << 15 | 2 << 1,
-                threads: [lanes, 1, 1],
+                rsrc2: 1 << 15 | u32::from(threads[1] > 1) << 11 | 2 << 1,
+                threads,
             }),
             code,
         };
@@ -14569,8 +14840,129 @@ mod tests {
         ]);
         let l = lowered(&w, 64, true);
         assert_eq!((l.wave_size, l.exchanges, l.barriers), (Some(32), 1, 2));
-        // A group of several console waves: each counts its own passes.
+        // A group of several console waves: all count the same passes
+        // (from one constant to another), so the group goes round together.
+        let l = lowered(&w, 128, true);
+        assert_eq!((l.wave_size, l.exchanges, l.barriers), (Some(32), 1, 2));
+        // Up to a count of the wave's own (its first lane's id), with code
+        // after the loop: a wave that has left it goes on while another
+        // goes round again, and the group does not meet there.
+        let at = w.len() - 3;
+        w[at] = 0xBF06_090A; // s_cmp_eq_u32 s10, s9
+        w.insert(2, 0x7E12_0500); // v_readfirstlane_b32 s9, v0
+        w.pop();
+        w.extend(DS_WRITE_V1_V0);
+        w.push(S_ENDPGM);
+        assert_eq!(halves(&w, 64), (Some(32), 2));
         assert_eq!(halves(&w, 128), (Some(64), 0));
+    }
+
+    #[test]
+    fn a_count_the_group_shares_is_one_all_waves_join_alike() {
+        // 25 passes, each a count of the lanes with a bit of their id
+        // (eae3498e6553afa8 at 0xf48), after `if (id & 1) return;`: the
+        // mask is exchanged each pass by the threads still running, which
+        // meet to store, to read, and to take back what they stored (a
+        // half's threads may all have ended by the next pass).
+        let mut w = vec![V_LSHLREV_V1_2_V0, V_AND_V1_1_V0];
+        w.extend(CMP_S0_V1_EQ_0);
+        w.extend([AND_SAVEEXEC_S2_S0, skip(12)]);
+        w.extend([
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x8F00_0581, // s_lshl_b32 s0, 1, s5
+            0x3606_0000, // v_and_b32 v3, s0, v0
+            0xD4C5_0000, // v_cmp_ne_u32 s[0:1], 0, v3
+            0x0002_0680,
+            BCNT_S0,
+            V_MOV_V2_S0,
+        ]);
+        w.extend(DS_WRITE_V1_V2);
+        w.extend([
+            0x8105_8105, // s_add_i32 s5, s5, 1
+            0xBF06_9905, // s_cmp_eq_u32 s5, 25
+            0xBF84_FFF5, // s_cbranch_scc0 -> the shift
+            S_ENDPGM,
+        ]);
+        for lanes in [64, 1024] {
+            let l = lowered(&w, lanes, true);
+            assert_eq!((l.wave_size, l.exchanges, l.barriers), (Some(32), 1, 3));
+        }
+        // The count joined with a wave's own number before the loop is no
+        // longer one all waves hold alike.
+        let mut w = vec![V_LSHLREV_V1_2_V0, 0xBE85_0380, READFIRST_S0_V0]; // s_mov_b32 s5, 0
+        w.extend([
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0xBF84_0001, // s_cbranch_scc0 +1
+            0xBE85_0381, // s_mov_b32 s5, 1
+            0x8F00_0581,
+            0x3606_0000,
+            0xD4C5_0000,
+            0x0002_0680,
+            BCNT_S0,
+            V_MOV_V2_S0,
+        ]);
+        w.extend(DS_WRITE_V1_V2);
+        w.extend([0x8105_8105, 0xBF06_9905, 0xBF84_FFF5]);
+        w.extend(DS_WRITE_V1_V0);
+        w.push(S_ENDPGM);
+        assert_eq!(halves(&w, 64), (Some(32), 2));
+        assert_eq!(halves(&w, 1024), (Some(64), 0));
+    }
+
+    #[test]
+    fn a_skip_of_wave_operations_one_wave_takes_is_sunk_below_them() {
+        // `if (WaveActiveCountBits(id & 1 == 0) != 0) v2 = WaveActiveSum(id)`
+        // (0c028454b58543f0 at 0x6e8): in a group of several console waves
+        // each takes the skip or not by its own count, so every lane runs
+        // the sum and the skip is taken after it; the group meets there.
+        let program = |write: bool| {
+            let mut w = vec![V_LSHLREV_V1_2_V0, V_MOV_V16_V0, 0x3604_0081]; // v_and_b32 v2, 1, v0
+            w.extend([0xD4C2_0000, 0x0002_0480]); // v_cmp_eq_u32 s[0:1], 0, v2
+            w.extend([BCNT_S0, 0x7E04_0280]); // v_mov_b32 v2, 0
+            w.push(0xBF84_0015 + 2 * u32::from(write)); // s_cbranch_scc0 over the sum
+            w.extend(WAVE_SUM_V16_S12);
+            w.extend([0x0001_0102, RESTORE_EXEC, V_MOV_V2_S12]);
+            if write {
+                w.extend(DS_WRITE_V1_V0);
+            }
+            w.extend(DS_WRITE_V1_V2);
+            w.push(S_ENDPGM);
+            w
+        };
+        let w = program(false);
+        let l = lowered(&w, 256, true);
+        assert_eq!((l.wave_size, l.exchanges, l.barriers), (Some(32), 2, 2));
+        // (one console wave meets under its own branch as it is)
+        assert_eq!(halves(&w, 64), (Some(32), 2));
+        // With a store in the skipped code a wave that skips must not run
+        // it: the skip stays, and several waves do not meet under it.
+        let w = program(true);
+        assert_eq!(halves(&w, 64), (Some(32), 2));
+        assert_eq!(halves(&w, 256), (Some(64), 0));
+    }
+
+    #[test]
+    fn the_thread_whose_flat_id_is_zero_runs_alone() {
+        // `if (id.y * 8 + id.x == 0)` with the flat id made as a shift and
+        // a sum (0c028454b58543f0 at 0x40, 0x820): one thread of the group.
+        let program = |first: [u32; 2]| {
+            let mut w = first.to_vec();
+            w.extend([0xD4C2_0000, 0x0002_0480]); // v_cmp_eq_u32 s[0:1], 0, v2
+            w.extend(QUAD_PERM_V2_V0);
+            w.extend([AND_SAVEEXEC_S2_S0, skip(2), READFIRST_S0_V0, V_MOV_V2_S0]);
+            w.extend([RESTORE_EXEC_S2, 0x3406_0082]); // v_lshlrev_b32 v3, 2, v0
+            w.extend([0xD834_0000, 0x0000_0203, S_ENDPGM]); // ds_write_b32 v3, v2
+            w
+        };
+        const FLAT: [u32; 2] = [0xD746_0002, 0x0401_0701]; // v_lshl_add_u32 v2, v1, 3, v0
+        let wave = |w: &[u32], threads| lowered_in(w, threads, true).wave_size;
+        assert_eq!(wave(&program(FLAT), [8, 8, 1]), Some(32));
+        assert_eq!(wave(&program(FLAT), [8, 16, 1]), Some(32));
+        // v1 holds no thread id in a group of one row; a sum with another
+        // register's value may be zero elsewhere.
+        assert_eq!(wave(&program(FLAT), [64, 1, 1]), Some(64));
+        const OTHER: [u32; 2] = [0xD746_0002, 0x0401_0703]; // v_lshl_add_u32 v2, v3, 3, v0
+        assert_eq!(wave(&program(OTHER), [8, 8, 1]), Some(64));
     }
 
     #[test]
@@ -14604,6 +14996,41 @@ mod tests {
         w.extend(DS_WRITE_V1_V2);
         w.push(S_ENDPGM);
         assert_eq!(halves(&w, 64), (Some(64), 0));
+    }
+
+    #[test]
+    fn the_first_lane_of_a_mask_is_read_by_the_halves_that_hold_it() {
+        // `if (id & 1) return;` then `v_readlane_b32` at `s_ff1_i32_b64` of
+        // the lanes left (0a5ecfee6b79e13b at 0x90): the mask's number,
+        // then each half's lanes of it and its first one's value.
+        let program = |mask: u32, skip_to_end: bool| {
+            let mut w = vec![V_LSHLREV_V1_2_V0, 0x3604_0081]; // v_and_b32 v2, 1, v0
+            w.extend([0xD4C2_0000, 0x0002_0480]); // v_cmp_eq_u32 s[0:1], 0, v2
+            w.push(AND_SAVEEXEC_S2_S0);
+            if skip_to_end {
+                w.push(skip(7));
+            }
+            w.extend([
+                0x8780_7E02,        // s_and_b64 s[0:1], s[2:3], exec
+                0xBE88_1400 | mask, // s_ff1_i32_b64 s8, the mask
+                0xD760_0004,        // v_readlane_b32 s4, v0, s8
+                0x0000_1100,
+                0x7E04_0204, // v_mov_b32 v2, s4
+            ]);
+            w.extend(DS_WRITE_V1_V2);
+            w.push(S_ENDPGM);
+            w
+        };
+        for lanes in [64, 256] {
+            assert_eq!(halves(&program(0, true), lanes), (Some(32), 3));
+        }
+        // The first lane of the lanes the wave began with may have ended:
+        // no half holds its value.
+        assert_eq!(halves(&program(2, true), 64), (Some(64), 0));
+        // Lanes out of EXEC that are still there: the mask may be empty,
+        // and the lane it then gives is read as any other (every lane is
+        // there to be read).
+        assert_eq!(halves(&program(0, false), 64), (Some(32), 2));
     }
 
     #[test]
