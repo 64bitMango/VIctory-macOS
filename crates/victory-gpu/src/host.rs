@@ -834,6 +834,13 @@ pub(crate) struct HostList {
     /// Clamped indirect arguments (`crate::indirect`), reused by each
     /// execution in turn; replaced by a bigger one when too small.
     arguments: Mutex<Option<ID3D12Resource>>,
+    /// Dispatches, buffer copies, clears and immediate writes recorded since
+    /// the reset: what may have written indirect arguments (hoisted clamps,
+    /// `crate::indirect`).
+    writes: std::sync::atomic::AtomicU64,
+    /// Clamped arguments of the list's indirect draws that the list before
+    /// it writes ([`HostList::clamp_room`]).
+    hoisted: Mutex<Hoisted>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -846,6 +853,17 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+}
+
+/// A list's buffers for hoisted clamped arguments, how many are in use
+/// since the reset, the bytes taken of the last of those, and whether the
+/// list before has left them readable as arguments.
+#[derive(Default)]
+struct Hoisted {
+    all: Vec<ID3D12Resource>,
+    used: usize,
+    at: u64,
+    readable: bool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; a host list is recorded by the
@@ -1143,6 +1161,8 @@ impl Host {
                 id,
                 budget: OnceLock::new(),
                 arguments: Mutex::new(None),
+                writes: Default::default(),
+                hoisted: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1863,6 +1883,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.clamp_done();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count =
@@ -1896,6 +1917,11 @@ impl HostList {
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
+        }
+        self.writes.store(0, Ordering::Relaxed);
+        {
+            let mut hoisted = self.hoisted.lock().unwrap_or_else(|e| e.into_inner());
+            (hoisted.used, hoisted.at, hoisted.readable) = (0, 0, false);
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
@@ -2161,6 +2187,7 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+        self.count_write();
         let mut deferred = self.deferred();
         deferred
             .copies
@@ -2241,6 +2268,7 @@ impl HostList {
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
+        self.count_write();
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
@@ -2366,6 +2394,99 @@ impl HostList {
             self.keep(&old);
         }
         Some(made)
+    }
+
+    /// Counts a dispatch, buffer copy, clear or immediate write: what may
+    /// write indirect arguments.
+    pub(crate) fn count_write(&self) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Dispatches, buffer copies, clears and immediate writes since the
+    /// reset.
+    pub(crate) fn writes(&self) -> u64 {
+        self.writes.load(Ordering::Relaxed)
+    }
+
+    /// Room for `bytes` of clamped arguments of one of this list's indirect
+    /// draws, which `clamps`, the list before it, writes: the buffer and the
+    /// offset. The buffers are this list's own: common between submissions,
+    /// moved to unordered access in `clamps` at their first use, to indirect
+    /// argument where it ends ([`HostList::clamp_end`]) and back to common
+    /// where this list ends, so their states are known whatever runs
+    /// between. None for more than a buffer may hold, or past the buffers a
+    /// list may have: that draw is clamped in place.
+    pub(crate) fn clamp_room(&self, clamps: &HostList, bytes: u64) -> Option<(ID3D12Resource, u64)> {
+        const MOST: u64 = 1 << 20;
+        const BUFFERS: usize = 32;
+        let bytes = bytes.next_multiple_of(16);
+        let mut hoisted = self.hoisted.lock().unwrap_or_else(|e| e.into_inner());
+        if bytes > MOST || hoisted.readable {
+            return None;
+        }
+        // SAFETY: a plain query on a live buffer.
+        let width = |b: &ID3D12Resource| unsafe { b.GetDesc() }.Width;
+        if let Some(last) = hoisted.used.checked_sub(1).map(|i| hoisted.all[i].clone())
+            && hoisted.at + bytes <= width(&last)
+        {
+            let at = hoisted.at;
+            hoisted.at += bytes;
+            return Some((last, at));
+        }
+        let next = hoisted.used;
+        if next == BUFFERS {
+            return None;
+        }
+        if hoisted.all.get(next).is_none_or(|b| width(b) < bytes) {
+            let (made, _) = host()?.shared_buffer(bytes.next_power_of_two().max(1 << 16))?;
+            name(&made, || "hoisted indirect arguments".into());
+            // Nothing recorded since the reset names the smaller one.
+            hoisted.all.truncate(next);
+            hoisted.all.push(made);
+        }
+        let buffer = hoisted.all[next].clone();
+        hoisted.used += 1;
+        hoisted.at = bytes;
+        clamps.keep(&buffer);
+        // SAFETY: an open list and a live buffer.
+        unsafe {
+            clamps.list.ResourceBarrier(&[transition(
+                &buffer,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )])
+        };
+        Some((buffer, 0))
+    }
+
+    /// Where `clamps` ends: the clamped arguments it wrote for this list
+    /// become readable as indirect arguments.
+    pub(crate) fn clamp_end(&self, clamps: &HostList) {
+        let mut hoisted = self.hoisted.lock().unwrap_or_else(|e| e.into_inner());
+        if hoisted.used == 0 || hoisted.readable {
+            return;
+        }
+        hoisted.readable = true;
+        let barriers: Vec<_> = hoisted.all[..hoisted.used]
+            .iter()
+            .map(|b| transition(b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT))
+            .collect();
+        // SAFETY: an open list and live buffers.
+        unsafe { clamps.list.ResourceBarrier(&barriers) };
+    }
+
+    /// Where this list ends: its hoisted arguments back to common.
+    fn clamp_done(&self) {
+        let hoisted = self.hoisted.lock().unwrap_or_else(|e| e.into_inner());
+        if !hoisted.readable {
+            return;
+        }
+        let barriers: Vec<_> = hoisted.all[..hoisted.used]
+            .iter()
+            .map(|b| transition(b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON))
+            .collect();
+        // SAFETY: an open list and live buffers.
+        unsafe { self.list.ResourceBarrier(&barriers) };
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -3140,6 +3261,8 @@ impl Meter {
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let [records, counted] = crate::indirect::take_records().map(|n| n as f64 / frames);
+        let hoisted = crate::indirect::take_hoisted() as f64 / frames;
+        let hoists = crate::list::take_hoists() as f64 / frames;
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
@@ -3152,7 +3275,8 @@ impl Meter {
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
-                 max records {records:.0}/frame ({counted:.0} under a count)",
+                 max records {records:.0}/frame ({counted:.0} under a count), {hoisted:.0} clamps/frame \
+                 in the list before their draw's ({hoists:.0} lists cut for them)",
                 making = crate::pipeline::making()
             );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
