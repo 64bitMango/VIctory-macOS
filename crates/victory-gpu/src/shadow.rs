@@ -592,10 +592,36 @@ impl Shadow {
         written
     }
 
-    /// Whether shaders of a submission not yet copied back may be writing
-    /// the copy.
-    pub(crate) fn written_by_shaders(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    /// Whether every byte of its memory is tracked: a refresh made early
+    /// leaves the one in its place little to copy (`Host::prewarm`).
+    pub(crate) fn tracked_whole(&self) -> bool {
+        self.dirty_bit().is_some()
+    }
+
+    /// [`Shadow::update`] while a submission not yet copied back is still
+    /// on the host GPU (`crate::unwaited`): only around the ranges its
+    /// shaders write. Title memory copied under them would overwrite what
+    /// the GPU is writing, and [`Shadow::update_busy`] would take it into
+    /// the snapshot as what the shaders started from. Returns the bytes
+    /// copied, and the ranges left out and their bytes: the refresh in its
+    /// place, after the copy-back, brings them.
+    pub(crate) fn update_around(&self, address: usize, len: usize) -> (usize, (usize, usize)) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return (0, (0, 0));
+        }
+        let busy: Vec<(usize, usize)> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .filter(|&(a, e)| a < to && e > from)
+            .collect();
+        let (free, left) = crate::ranges::around(from, to, busy);
+        let copied = if self.clean() { 0 } else { free.into_iter().map(|(a, b)| self.update_free(a, b)).sum() };
+        (copied, (left.len(), left.iter().map(|(a, b)| b - a).sum()))
     }
 
     /// Whether the title wrote none of the copy's memory since the copy took
@@ -1703,6 +1729,33 @@ pub(crate) mod tests {
         // SAFETY: a bit of the mapped bitmap; no submission runs (the caller
         // holds the submission lock).
         unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+    }
+
+    /// A shader's mark of the page of title address `address`, written
+    /// through a view of `copy` (the caller holds the submission lock).
+    pub(crate) fn mark_written(copy: &Shadow, address: usize) {
+        let (Some(b), Some((bit, _))) = (bitmap(false), copy.mark_entry(address as u64)) else {
+            return;
+        };
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+    }
+
+    /// Whether any page of `copy` is marked as written.
+    pub(crate) fn any_mark(copy: &Shadow) -> bool {
+        let (Some(b), Some(base)) = (bitmap(false), copy.marks) else {
+            return false;
+        };
+        // SAFETY: dwords of the mapped bitmap.
+        (base..base + pages(copy.start, copy.len)).any(|bit| unsafe { *(b.data as *const u32).add((bit / 32) as usize) } & 1 << (bit % 32) != 0)
+    }
+
+    /// The copy's bytes of `[address, address + len)`.
+    pub(crate) fn bytes(copy: &Shadow, address: usize, len: usize) -> Vec<u8> {
+        let at = address - copy.start as usize;
+        assert!(at + len <= copy.len as usize);
+        // SAFETY: inside the mapping (checked).
+        unsafe { std::slice::from_raw_parts(copy.data.add(at), len).to_vec() }
     }
 
     /// The title writes a constant under a range an earlier list of the

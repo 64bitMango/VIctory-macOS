@@ -259,7 +259,7 @@ fn pump(held: &mut Holding, why: Why) {
 /// Signals the title may wait for with no call of ours (it reads a fence's
 /// value in memory).
 #[cfg(windows)]
-fn timer() {
+pub(crate) fn timer() {
     static TIMER: std::sync::Once = std::sync::Once::new();
     TIMER.call_once(|| {
         let _ = std::thread::Builder::new().name("victory held work".into()).spawn(|| loop {

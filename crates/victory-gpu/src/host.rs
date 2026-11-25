@@ -4,7 +4,8 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run. With
 //! `VICTORY_ASYNC_SUBMIT=1` the title's submissions that owe nothing after
-//! their run are not (`crate::unwaited`).
+//! their run, or only shader writes to declared ranges, are not
+//! (`crate::unwaited`).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -76,6 +77,10 @@ struct Unwaited {
     lists: Vec<std::sync::Arc<HostList>>,
     /// What a waited submission holds until it has run.
     kept: Box<dyn std::any::Any + Send>,
+    /// When the call that made it returned.
+    left: std::time::Instant,
+    /// The early refreshes made while the host GPU still ran it.
+    refreshing: std::time::Duration,
 }
 
 // SAFETY: host lists are free-threaded objects, used by one thread at a
@@ -1147,6 +1152,10 @@ struct Deferred {
     /// What a title list owned that this one may read, left to it when the
     /// title list was reset or released first (`crate::list`).
     left: Vec<Box<dyn std::any::Any + Send>>,
+    /// Tests: what the host GPU does to host memory while it runs the list
+    /// (shaders' writes and marks), done once the list is with the queue.
+    #[cfg(test)]
+    gpu: Vec<Box<dyn Fn() + Send>>,
 }
 
 impl Host {
@@ -1356,42 +1365,77 @@ impl Host {
     }
 
     /// Brings the buffer ranges `runs` ask for up to date while the
-    /// unwaited submission still runs: the refreshes their steps make,
-    /// early. That submission writes no buffer copy, and what the title
-    /// changed since it was made it does not read (`crate::unwaited`). The
-    /// steps do it all again in their order once it is finished, and find
-    /// little left. Nothing else of the preparation is safe before then.
+    /// unwaited submission still runs: the refreshes their steps make
+    /// (those of ranges, and of what their heaps' views reach), early, and
+    /// only around the ranges that submission's shaders write
+    /// (`Shadow::update_around`; every range a copy holds as being written
+    /// is its: no step of `runs` has run). What the title changed since it
+    /// was made it does not read (`crate::unwaited`). The steps do it all
+    /// again in their order once it is finished, and find little left: only
+    /// copies tracked whole are refreshed early, others would be copied
+    /// whole twice. Nothing else of the preparation is safe before then.
     fn prewarm(&self, runs: &[&HostList]) {
+        let Some(value) = self.unwaited.lock().unwrap_or_else(|e| e.into_inner()).get().map(|u| u.value) else {
+            return;
+        };
         let started = std::time::Instant::now();
         let mut batch = Batch::default();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::Refresh(shadow, address, len) = step
-                    && !shadow.written_by_shaders()
-                {
-                    batch.add(shadow, *address, *len);
+                match step {
+                    Step::Refresh(shadow, address, len) if shadow.tracked_whole() => batch.add(shadow, *address, *len),
+                    Step::Heap(viewed) => crate::bindless::refresh(viewed, |s, a, l| {
+                        if s.tracked_whole() {
+                            batch.add(s, a, l)
+                        }
+                    }),
+                    _ => {}
                 }
             }
         }
-        let bytes = batch.flush();
-        crate::unwaited::note_prewarm(started.elapsed(), bytes);
+        // SAFETY: (both) our fence.
+        let running = || unsafe { self.fence.GetCompletedValue() } < value;
+        let (mut bytes, mut left, mut beside) = (0, (0, 0), std::time::Duration::ZERO);
+        for (shadow, ranges) in batch.refreshes.drain(..) {
+            let (at, ran) = (std::time::Instant::now(), running());
+            for (from, to) in ranges.iter() {
+                let (copied, out) = shadow.update_around(from, to - from);
+                bytes += copied;
+                left = (left.0 + out.0, left.1 + out.1);
+            }
+            if ran {
+                beside += at.elapsed();
+            }
+        }
+        if let Some(u) = self.unwaited.lock().unwrap_or_else(|e| e.into_inner()).get_mut() {
+            u.refreshing += beside;
+        }
+        crate::unwaited::note_prewarm(started.elapsed(), bytes, left);
     }
 
     /// Finishes the unwaited submission, if any: waits for it, then does
-    /// what a waited one does after its wait ([`Host::submit`]), less what
-    /// it cannot owe (it declared no shader writes, checks, work or
-    /// bottom-of-pipe writes), then makes the Signals kept behind it. The
-    /// caller holds the submission lock; the lists go into `finished`.
+    /// what a waited one does after its wait ([`Host::settle`]: what its
+    /// shaders wrote goes back; it has no checks, work or bottom-of-pipe
+    /// writes), then makes the Signals kept behind it. The caller holds the
+    /// submission lock; the lists go into `finished`.
     fn finish(&self, by: crate::unwaited::By, finished: &mut Finished) -> bool {
         let slot = || self.unwaited.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((value, lists)) = slot().get().map(|u| (u.value, u.lists.clone())) else {
+        let Some((value, lists, left, refreshing)) = slot().get().map(|u| (u.value, u.lists.clone(), u.left, u.refreshing)) else {
             return false;
         };
         let started = std::time::Instant::now();
         // The fence decides (its event may never be set, `Host::wait_for`).
         // SAFETY: our fence.
-        if unsafe { self.fence.GetCompletedValue() } < value {
+        let running = unsafe { self.fence.GetCompletedValue() } < value;
+        if running {
             self.wait_for(value);
+            // It ran beside the title's thread from the return until now.
+            crate::unwaited::note_overlap(started - left, refreshing);
+        } else {
+            // shortcut: when it ended is not known: its submission-to-now
+            // time counts as beside the title's thread only up to the early
+            // refreshes it was seen running through.
+            crate::unwaited::note_overlap(refreshing, refreshing);
         }
         let waited = started.elapsed();
         SUBMISSION_US[1].fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
@@ -1408,17 +1452,11 @@ impl Host {
                 removed_during(&runs, None)
             ));
         }
-        crate::memory::note_submission(false);
-        // Nothing of it is marked; the bitmaps are cleared as after any.
-        crate::shadow::copy_back_marks(&[], crate::memory::withholding());
-        let read = crate::shadow::take_reads();
-        if !read.is_empty() {
-            crate::descriptor::make_read(&read);
-        }
-        // The lists have run: the copies they used may be released when idle.
-        for list in &runs {
-            list.deferred().flying.clear();
-        }
+        // As after a waited one: marked pages and declared ranges go back
+        // (the bitmaps are read and cleared here alone), read views made.
+        let settling = std::time::Instant::now();
+        let settled = self.settle(&runs);
+        let back = settling.elapsed();
         drop(runs);
         release_retired();
         {
@@ -1431,272 +1469,22 @@ impl Host {
                     crate::fence::set(fence as crate::object::This, value);
                     crate::fence::let_go(fence as crate::object::This);
                 }
-                release_later(unwaited.kept);
+                release_later(Box::new((unwaited.kept, settled)));
                 finished.0.extend(unwaited.lists);
             }
         }
         finished.0.extend(lists);
         self.log_messages();
-        crate::unwaited::note_finished(by, started.elapsed(), waited);
+        crate::unwaited::note_finished(by, started.elapsed(), waited, back);
         true
     }
 
-    /// [`Host::execute`], or with `keep` (the lists of a submission of the
-    /// title's, to hold on to) [`Host::execute_title`].
-    fn submit(&self, runs: &[&HostList], keep: Option<&[std::sync::Arc<HostList>]>) -> Option<crate::unwaited::Waited> {
-        let mut finished = Finished::default();
-        // One submission at a time from preparation to copy-back: snapshots
-        // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        let _holding = Holding::enter();
-        // The unwaited submission is finished before anything of this one
-        // is prepared; while it still runs, the buffer copies this one's
-        // lists ask for are brought up to date.
-        if IN_FLIGHT.load(Ordering::Acquire) {
-            if keep.is_some() {
-                self.prewarm(runs);
-            }
-            let by = if keep.is_some() { crate::unwaited::By::Title } else { crate::unwaited::By::Ours };
-            self.finish(by, &mut finished);
-        }
-        // What the title's lists owe after their run, before ours join them.
-        let facts = keep.map(|_| runs.iter().fold(crate::unwaited::Facts::default(), |f, l| f.with(l.owes())));
-        let started = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
-        let faults = crate::copystat::page_faults();
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::Submissions, 1);
-        // Host textures the title has not used for a while (or past the
-        // card's budget) are given up first: the last submission has run.
-        crate::resource::evict_unused();
-        // Descriptors the title copied into its heaps itself, before the
-        // heaps' views are brought up to date below.
-        #[cfg(feature = "diagnostics")]
-        let syncing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
-        crate::descriptor::sync_heaps();
-        #[cfg(feature = "diagnostics")]
-        drop(syncing);
-        // Copies of title memory outside buffers nothing asked for in a
-        // while are released, after the heaps' slots are what the title
-        // wrote.
-        crate::shadow::idle_sweep();
-        // Textures heap-indexing shaders may read, uploaded first by a list
-        // of ours where their title memory changed.
-        let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
-            .iter()
-            .flat_map(|l| {
-                l.deferred()
-                    .copies
-                    .iter()
-                    .filter_map(|s| match s {
-                        Step::Heap(v) => Some(v.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        // And textures read through tables, uploaded by the same list.
-        let textures: Vec<_> = runs
-            .iter()
-            .flat_map(|l| {
-                l.deferred()
-                    .copies
-                    .iter()
-                    .filter_map(|s| match s {
-                        Step::Texture(staging, copy) => Some((staging.clone(), copy.clone())),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        #[cfg(feature = "diagnostics")]
-        let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
-        let uploads = (!heaps.is_empty() || !textures.is_empty())
-            .then(|| crate::bindless::uploads(&heaps, &textures))
-            .flatten();
-        #[cfg(feature = "diagnostics")]
-        drop(uploading);
-        let runs: Vec<&HostList> = uploads
-            .as_ref()
-            .map(|u| u.list())
-            .into_iter()
-            .chain(runs.iter().copied())
-            .collect();
-        let runs = &runs[..];
-        // A frame `crate::capture` lists: every command of every list, in
-        // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
-        // notes them).
-        #[cfg(feature = "diagnostics")]
-        let traced = crate::capture::listed(crate::queue::presented() + 1);
-        #[cfg(feature = "diagnostics")]
-        if traced {
-            for (i, r) in runs.iter().enumerate() {
-                let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
-                for (k, (note, _)) in notes.iter().enumerate() {
-                    tracing::info!(
-                        target: "victory_gpu::trace",
-                        "s{} l{i}/{} #{k}: {note}",
-                        *submitted + 1,
-                        runs.len()
-                    );
-                }
-            }
-        }
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
-        // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
-        for list in runs {
-            list.run_deferred(&mut batch);
-            firsts.push(lists.len());
-            #[cfg(feature = "diagnostics")]
-            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
-            }
-            lists.push(list.list.cast().ok());
-        }
-        batch.flush();
-        let prepared = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
-        // A submission of the title's that owes nothing after its run is
-        // not waited for (`crate::unwaited`).
-        #[cfg(feature = "diagnostics")]
-        let diagnosed = traced || groups.len() > 1;
-        #[cfg(not(feature = "diagnostics"))]
-        let diagnosed = false;
-        let mut waited = facts.and_then(|f| {
-            crate::unwaited::Facts { uploads: uploads.is_some(), diagnostics: diagnosed, ..f }.waited()
-        });
-        let leave = keep.filter(|_| waited.is_none());
-        let mut removed_in = None;
-        for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
-            let started = std::time::Instant::now();
-            #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
-                self.queue.ExecuteCommandLists(group);
-                let signalled = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match signalled {
-                    Ok(()) if leave.is_some() => {}
-                    Ok(()) => self.wait_for(*submitted),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "host submission not waited for");
-                        // Nothing would tell when it has run: as before.
-                        waited = waited.or(keep.map(|_| crate::unwaited::Waited::Host));
-                    }
-                }
-            }
-            if let Some(lists) = leave.filter(|_| waited.is_none()) {
-                crate::unwaited::note(None);
-                SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
-                // Kept as a waited submission keeps them until it has run.
-                let kept = Box::new((batch, heaps, textures));
-                let mut slot = self.unwaited.lock().unwrap_or_else(|e| e.into_inner());
-                slot.leave(Unwaited { value: *submitted, lists: lists.to_vec(), kept });
-                IN_FLIGHT.store(true, Ordering::Release);
-                return None;
-            }
-            #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
-            #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX).unwrap_or_default());
-            }
-            #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i]
-                    .notes
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .len();
-                tracing::warn!(
-                    ms = started.elapsed().as_millis(),
-                    commands,
-                    "slow host list"
-                );
-                match runs[i].slowest(frequency, 6) {
-                    Some(slowest) => {
-                        for (ms, op) in slowest {
-                            tracing::warn!("slow list command, {ms:.1} ms: {op}");
-                        }
-                    }
-                    None => {
-                        static SAID: std::sync::Once = std::sync::Once::new();
-                        SAID.call_once(|| {
-                            tracing::warn!(
-                                frequency,
-                                "GPU timestamps do not advance on this adapter: \
-                                 slow lists are timed whole, their commands are not"
-                            )
-                        });
-                    }
-                }
-            }
-            // SAFETY: a plain query.
-            if groups.len() > 1 && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-                removed_in = Some(i);
-            }
-            let _ = (i, started);
-        }
-        let _ = &firsts;
-        if keep.is_some() {
-            crate::unwaited::note(waited);
-        }
-        let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
-        SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
-        // The host resets a device whose submission runs for about 2 s.
-        if gpu > std::time::Duration::from_millis(250) {
-            let pipelines: std::collections::BTreeSet<String> = runs
-                .iter()
-                .flat_map(|l| {
-                    l.pipelines
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone()
-                })
-                .collect();
-            tracing::warn!(
-                ms = gpu.as_millis(),
-                lists = runs.len(),
-                ?pipelines,
-                "slow host submission"
-            );
-        }
-        // SAFETY: a plain query.
-        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-            fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}{}",
-                runs.len(),
-                self.removal_data(runs),
-                last_notes(runs),
-                removed_during(runs, removed_in)
-            ));
-        }
+    /// After a submission's lists have run, waited for at once or finished
+    /// later (`crate::unwaited`): what its shaders wrote goes back to title
+    /// memory, then its work for after the run and its bottom-of-pipe
+    /// writes. The caller holds the submission lock. Returns what must
+    /// live until the host has let go of it.
+    fn settle(&self, runs: &[&HostList]) -> Box<dyn std::any::Any + Send> {
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -1793,17 +1581,305 @@ impl Host {
         for list in runs {
             list.deferred().flying.clear();
         }
+        Box::new((back, withheld))
+    }
+
+    /// [`Host::execute`], or with `keep` (the lists of a submission of the
+    /// title's, to hold on to) [`Host::execute_title`].
+    fn submit(&self, runs: &[&HostList], keep: Option<&[std::sync::Arc<HostList>]>) -> Option<crate::unwaited::Waited> {
+        let mut finished = Finished::default();
+        // One submission at a time from preparation to copy-back: snapshots
+        // and the ranges shaders write are per host copy, not per submission.
+        let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _holding = Holding::enter();
+        self.submit_held(&mut Some(submitted), runs, keep, &mut finished)
+    }
+
+    /// [`Host::submit`] under the submission lock `held`, which it gives
+    /// back only for a listed frame's dumps (they submit lists of their
+    /// own).
+    fn submit_held<'a>(
+        &'a self,
+        held: &mut Option<std::sync::MutexGuard<'a, u64>>,
+        runs: &[&HostList],
+        keep: Option<&[std::sync::Arc<HostList>]>,
+        finished: &mut Finished,
+    ) -> Option<crate::unwaited::Waited> {
+        let submitted = held.as_mut().expect("the submission lock is held");
+        // The unwaited submission is finished before anything of this one
+        // is prepared; while it still runs, the buffer copies this one's
+        // lists ask for are brought up to date.
+        if IN_FLIGHT.load(Ordering::Acquire) {
+            if keep.is_some() {
+                self.prewarm(runs);
+            }
+            let by = if keep.is_some() { crate::unwaited::By::Title } else { crate::unwaited::By::Ours };
+            self.finish(by, finished);
+        }
+        // What the title's lists owe after their run, before ours join them.
+        let facts = keep.map(|_| runs.iter().fold(crate::unwaited::Facts::default(), |f, l| f.with(l.owes())));
+        let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let faults = crate::copystat::page_faults();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Submissions, 1);
+        // Host textures the title has not used for a while (or past the
+        // card's budget) are given up first: the last submission has run.
+        crate::resource::evict_unused();
+        // Descriptors the title copied into its heaps itself, before the
+        // heaps' views are brought up to date below.
+        #[cfg(feature = "diagnostics")]
+        let syncing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
+        crate::descriptor::sync_heaps();
+        #[cfg(feature = "diagnostics")]
+        drop(syncing);
+        // Copies of title memory outside buffers nothing asked for in a
+        // while are released, after the heaps' slots are what the title
+        // wrote.
+        crate::shadow::idle_sweep();
+        // Textures heap-indexing shaders may read, uploaded first by a list
+        // of ours where their title memory changed.
+        let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
+            .iter()
+            .flat_map(|l| {
+                l.deferred()
+                    .copies
+                    .iter()
+                    .filter_map(|s| match s {
+                        Step::Heap(v) => Some(v.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        // And textures read through tables, uploaded by the same list.
+        let textures: Vec<_> = runs
+            .iter()
+            .flat_map(|l| {
+                l.deferred()
+                    .copies
+                    .iter()
+                    .filter_map(|s| match s {
+                        Step::Texture(staging, copy) => Some((staging.clone(), copy.clone())),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        #[cfg(feature = "diagnostics")]
+        let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
+        let uploads = (!heaps.is_empty() || !textures.is_empty())
+            .then(|| crate::bindless::uploads(&heaps, &textures))
+            .flatten();
+        #[cfg(feature = "diagnostics")]
+        drop(uploading);
+        let runs: Vec<&HostList> = uploads
+            .as_ref()
+            .map(|u| u.list())
+            .into_iter()
+            .chain(runs.iter().copied())
+            .collect();
+        let runs = &runs[..];
+        // A frame `crate::capture` lists: every command of every list, in
+        // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
+        // notes them).
+        #[cfg(feature = "diagnostics")]
+        let traced = crate::capture::listed(crate::queue::presented() + 1);
+        #[cfg(feature = "diagnostics")]
+        if traced {
+            for (i, r) in runs.iter().enumerate() {
+                let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
+                for (k, (note, _)) in notes.iter().enumerate() {
+                    tracing::info!(
+                        target: "victory_gpu::trace",
+                        "s{} l{i}/{} #{k}: {note}",
+                        **submitted + 1,
+                        runs.len()
+                    );
+                }
+            }
+        }
+        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        // Where each run's lists start in `lists`.
+        let mut firsts = Vec::with_capacity(runs.len());
+        let mut batch = Batch::default();
+        for list in runs {
+            list.run_deferred(&mut batch);
+            firsts.push(lists.len());
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
+            if let Some(prelude) = list.prelude() {
+                lists.push(Some(prelude));
+            }
+            lists.push(list.list.cast().ok());
+        }
+        batch.flush();
+        let prepared = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
+        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        #[cfg(feature = "diagnostics")]
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+            firsts
+                .iter()
+                .zip(firsts.iter().skip(1).chain([&lists.len()]))
+                .map(|(&a, &b)| &lists[a..b])
+                .collect()
+        } else {
+            vec![&lists[..]]
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let groups = [&lists[..]];
+        // A submission of the title's that owes nothing after its run is
+        // not waited for (`crate::unwaited`).
+        #[cfg(feature = "diagnostics")]
+        let diagnosed = traced || groups.len() > 1;
+        #[cfg(not(feature = "diagnostics"))]
+        let diagnosed = false;
+        let facts = facts.map(|f| crate::unwaited::Facts { uploads: uploads.is_some(), diagnostics: diagnosed, ..f });
+        let mut waited = facts.and_then(|f| f.waited(crate::unwaited::shader_writes()));
+        let writes = facts.is_some_and(crate::unwaited::Facts::writes);
+        let leave = keep.filter(|_| waited.is_none());
+        let mut removed_in = None;
+        for (i, group) in groups.iter().enumerate() {
+            **submitted += 1;
+            let started = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            crate::resource::life::note(0, crate::resource::life::SUBMITTED, **submitted, 0);
+            // SAFETY: closed lists; the fence and event are ours.
+            unsafe {
+                self.queue.ExecuteCommandLists(group);
+                let signalled = self
+                    .queue
+                    .Signal(&self.fence, **submitted)
+                    .and_then(|()| self.fence.SetEventOnCompletion(**submitted, self.event));
+                // Tests: the lists' shaders, while the GPU runs them.
+                #[cfg(test)]
+                for list in runs {
+                    for work in &list.deferred().gpu {
+                        work();
+                    }
+                }
+                match signalled {
+                    Ok(()) if leave.is_some() => {}
+                    Ok(()) => self.wait_for(**submitted),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "host submission not waited for");
+                        // Nothing would tell when it has run: as before.
+                        waited = waited.or(keep.map(|_| (crate::unwaited::Waited::Host, true)));
+                    }
+                }
+            }
+            if let Some(lists) = leave.filter(|_| waited.is_none()) {
+                crate::unwaited::note(None, writes);
+                SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+                // Kept as a waited submission keeps them until it has run.
+                let kept = Box::new((batch, heaps, textures));
+                let mut slot = self.unwaited.lock().unwrap_or_else(|e| e.into_inner());
+                let left = std::time::Instant::now();
+                slot.leave(Unwaited { value: **submitted, lists: lists.to_vec(), kept, left, refreshing: Default::default() });
+                IN_FLIGHT.store(true, Ordering::Release);
+                drop(slot);
+                // What its shaders wrote reaches title memory soon after
+                // the GPU is done, whatever the title calls next.
+                if writes {
+                    crate::queue::timer();
+                }
+                return None;
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::resource::life::note(0, crate::resource::life::RAN, **submitted, 0);
+            #[cfg(feature = "diagnostics")]
+            if groups.len() > 1 {
+                // SAFETY: a plain query.
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX).unwrap_or_default());
+            }
+            #[cfg(feature = "diagnostics")]
+            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+                // SAFETY: a plain query.
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                let commands = runs[i]
+                    .notes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .len();
+                tracing::warn!(
+                    ms = started.elapsed().as_millis(),
+                    commands,
+                    "slow host list"
+                );
+                match runs[i].slowest(frequency, 6) {
+                    Some(slowest) => {
+                        for (ms, op) in slowest {
+                            tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                        }
+                    }
+                    None => {
+                        static SAID: std::sync::Once = std::sync::Once::new();
+                        SAID.call_once(|| {
+                            tracing::warn!(
+                                frequency,
+                                "GPU timestamps do not advance on this adapter: \
+                                 slow lists are timed whole, their commands are not"
+                            )
+                        });
+                    }
+                }
+            }
+            // SAFETY: a plain query.
+            if groups.len() > 1 && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                removed_in = Some(i);
+            }
+            let _ = (i, started);
+        }
+        let _ = &firsts;
+        if keep.is_some() {
+            crate::unwaited::note(waited, writes);
+        }
+        let gpu = prepared.elapsed();
+        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+        SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        // The host resets a device whose submission runs for about 2 s.
+        if gpu > std::time::Duration::from_millis(250) {
+            let pipelines: std::collections::BTreeSet<String> = runs
+                .iter()
+                .flat_map(|l| {
+                    l.pipelines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                })
+                .collect();
+            tracing::warn!(
+                ms = gpu.as_millis(),
+                lists = runs.len(),
+                ?pipelines,
+                "slow host submission"
+            );
+        }
+        // SAFETY: a plain query.
+        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            fail(format_args!(
+                "host GPU device removed after a submission of {} lists{}{}{}",
+                runs.len(),
+                self.removal_data(runs),
+                last_notes(runs),
+                removed_during(runs, removed_in)
+            ));
+        }
+        let settled = self.settle(runs);
         // The submission has run and the next waits for our lock. Host
         // copies the title gave up meanwhile may have their last holder here.
         release_retired();
-        release_later(Box::new((batch, back, withheld, heaps)));
+        release_later(Box::new((batch, settled, heaps)));
         self.log_messages();
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).
         #[cfg(feature = "diagnostics")]
         if traced {
-            let sub = *submitted;
-            drop(submitted);
+            let sub = **submitted;
+            drop(held.take());
             let mut targets: Vec<(usize, String)> = Vec::new();
             for r in runs {
                 for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -1814,7 +1890,7 @@ impl Host {
             }
             crate::capture::dump_submission(sub, &targets);
         }
-        waited
+        waited.map(|(why, _)| why)
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -2545,6 +2621,13 @@ impl HostList {
         self.deferred().heap_writes = true;
     }
 
+    /// Tests: `work` is what the host GPU does to host memory while it runs
+    /// the list.
+    #[cfg(test)]
+    pub(crate) fn defer_gpu(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().gpu.push(Box::new(work));
+    }
+
     /// Keeps `what` until the list is reset.
     pub(crate) fn keep_until_reset(&self, what: Box<dyn std::any::Any + Send>) {
         self.deferred().left.push(what);
@@ -2554,7 +2637,11 @@ impl HostList {
     fn owes(&self) -> crate::unwaited::Facts {
         let d = self.deferred();
         crate::unwaited::Facts {
-            shader_writes: d.heap_writes || d.copies.iter().any(|s| matches!(s, Step::GpuWrite(..) | Step::Memory(_))),
+            declared_writes: d.copies.iter().any(|s| matches!(s, Step::GpuWrite(..))),
+            heap_writes: d.heap_writes,
+            // A list recorded as one whose programs use title memory
+            // declares its ranges as theirs too.
+            title_memory: d.copies.iter().any(|s| matches!(s, Step::Memory(_) | Step::GpuWrite(_, _, _, _, true))),
             after: !d.after.is_empty() || !d.missed.is_empty(),
             bottom_of_pipe: !d.writes.is_empty(),
             ..Default::default()
@@ -4783,9 +4870,9 @@ mod unwaited {
         assert!(ran.load(Ordering::Acquire));
     }
 
-    /// Two submissions' shaders write one page: each is waited for, so what
-    /// they wrote reaches title memory in the order they were made; an
-    /// unwaited one between them changes nothing.
+    /// Two submissions' shaders write one page: each is finished before the
+    /// next is made, so what they wrote reaches title memory in the order
+    /// they were made.
     #[test]
     fn shader_writes_of_two_submissions_go_back_in_order() {
         use crate::watch::PAGE;
@@ -4807,9 +4894,10 @@ mod unwaited {
                 c.write_host(p as u64 + 8, &[second]);
             });
             list.close();
-            assert_eq!(host.execute_title(std::slice::from_ref(&list)), Some(Waited::ShaderWrites));
-            assert_eq!((title(0), title(8)), (first, second), "back when the call returns");
+            assert_eq!(host.execute_title(std::slice::from_ref(&list)), None, "declared writes: unwaited");
+            // The next one finishes it before it runs.
             assert_eq!(host.execute_title(std::slice::from_ref(&plain(host))), None);
+            assert_eq!((title(0), title(8)), (first, second), "back once it is finished");
         }
         finish_unwaited(By::Ours);
         assert_eq!((title(0), title(8)), (0x33, 0x34));
@@ -4852,5 +4940,422 @@ mod unwaited {
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
+    }
+    /// The submission lock held across several submissions of a test, so
+    /// that no other test's submission finishes the unwaited one between
+    /// them: the title's and waited ones made under it, the early refreshes
+    /// and the finish on their own.
+    struct Alone<'a> {
+        // Dropped in this order: the mark, the lock, the lists.
+        _holding: super::Holding,
+        held: Option<std::sync::MutexGuard<'a, u64>>,
+        finished: super::Finished,
+        host: &'a Host,
+    }
+
+    impl<'a> Alone<'a> {
+        fn new(host: &'a Host) -> Self {
+            let mut finished = super::Finished::default();
+            let held = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let holding = super::Holding::enter();
+            host.finish(By::Ours, &mut finished);
+            Alone { _holding: holding, held: Some(held), finished, host }
+        }
+
+        /// A submission of the title's: why it was waited for, if it was.
+        fn title(&mut self, lists: &[Arc<HostList>]) -> Option<Waited> {
+            let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
+            self.host.submit_held(&mut self.held, &runs, Some(lists), &mut self.finished)
+        }
+
+        /// A waited submission, as with the switch off.
+        fn waited(&mut self, lists: &[Arc<HostList>]) {
+            let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
+            self.host.submit_held(&mut self.held, &runs, None, &mut self.finished);
+        }
+
+        fn prewarm(&self, lists: &[Arc<HostList>]) {
+            let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
+            self.host.prewarm(&runs);
+        }
+
+        fn finish(&mut self) -> bool {
+            self.host.finish(By::Ours, &mut self.finished)
+        }
+
+        fn in_flight(&self) -> bool {
+            self.host.unwaited.lock().unwrap_or_else(|e| e.into_inner()).get().is_some()
+        }
+    }
+
+    /// A tracked pool of `pages` pages with a buffer over it and its copy;
+    /// none without a host GPU.
+    fn pool(pages: usize) -> Option<(usize, Arc<crate::shadow::Shadow>)> {
+        let p = crate::watch::tests::pool(pages);
+        let len = (pages * crate::watch::PAGE) as u64;
+        crate::shadow::register(p, p as u64, len);
+        let copy = crate::shadow::find(p as u64, len);
+        if copy.is_none() {
+            crate::shadow::unregister(p, p as u64);
+            crate::watch::tests::free(p);
+        }
+        copy.map(|c| (p, c))
+    }
+
+    fn done(p: usize, copy: Arc<crate::shadow::Shadow>) {
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    fn title_byte(at: usize) -> u8 {
+        // SAFETY: a byte of the caller's pool.
+        unsafe { (at as *const u8).read_volatile() }
+    }
+
+    fn title_write(at: usize, byte: u8) {
+        // SAFETY: a byte of the caller's pool.
+        unsafe { (at as *mut u8).write_volatile(byte) }
+    }
+
+    fn host_byte(copy: &crate::shadow::Shadow, at: usize) -> u8 {
+        crate::shadow::tests::bytes(copy, at, 1)[0]
+    }
+
+    /// A list that refreshes `[at, at + len)` of `copy`.
+    fn reads(host: &Host, copy: &Arc<crate::shadow::Shadow>, at: usize, len: usize) -> Arc<HostList> {
+        let list = Arc::new(host.new_list().unwrap());
+        copy.refresh(&list, at as u64, len as u64);
+        list.close();
+        list
+    }
+
+    /// A list whose shaders write `bytes` (address, value) inside the range
+    /// `[at, at + len)` it declares (`marked`: marking their pages), after
+    /// a refresh of the range.
+    fn writes(host: &Host, copy: &Arc<crate::shadow::Shadow>, (at, len): (usize, usize), marked: bool, bytes: Vec<(usize, u8)>) -> Arc<HostList> {
+        let list = Arc::new(host.new_list().unwrap());
+        copy.refresh(&list, at as u64, len as u64);
+        copy.gpu_writes(&list, at as u64, len as u64, marked);
+        let c = copy.clone();
+        list.defer_gpu(move || {
+            for &(at, byte) in &bytes {
+                c.write_host(at as u64, &[byte]);
+                if marked {
+                    crate::shadow::tests::mark_written(&c, at);
+                }
+            }
+        });
+        list.close();
+        list
+    }
+
+    /// B's early refresh does not touch what A's shaders are writing, nor
+    /// take title memory under A's range for what A started from: the
+    /// title's bytes outside A's range reach the copy early, those inside
+    /// with A's copy-back and B's own refresh; A's bytes reach title memory
+    /// at the finish and stay in the copy.
+    #[test]
+    fn an_early_refresh_goes_around_what_shaders_in_flight_write() {
+        use crate::watch::PAGE;
+        let Some(host) = host() else { return };
+        let Some((p, copy)) = pool(3) else { return };
+        {
+            let mut alone = Alone::new(host);
+            let a = writes(host, &copy, (p + PAGE, PAGE), false, vec![(p + PAGE + 10, 0xaa)]);
+            assert_eq!(alone.title(std::slice::from_ref(&a)), None, "declared writes: unwaited");
+            assert!(alone.in_flight());
+            assert_eq!((host_byte(&copy, p + PAGE + 10), title_byte(p + PAGE + 10)), (0xaa, 0), "written, not back yet");
+            // The title writes beside A's range and inside it.
+            title_write(p + 5, 0x11);
+            title_write(p + PAGE + 20, 0x22);
+            title_write(p + 2 * PAGE + 30, 0x33);
+            let b = reads(host, &copy, p, 3 * PAGE);
+            alone.prewarm(std::slice::from_ref(&b));
+            assert!(alone.in_flight(), "an early refresh finishes nothing");
+            assert_eq!((host_byte(&copy, p + 5), host_byte(&copy, p + 2 * PAGE + 30)), (0x11, 0x33), "around A's range: early");
+            assert_eq!(host_byte(&copy, p + PAGE + 10), 0xaa, "A's byte is not overwritten");
+            assert_eq!(host_byte(&copy, p + PAGE + 20), 0, "under A's range: left for after the finish");
+            assert_eq!(title_byte(p + PAGE + 10), 0, "nothing goes back early");
+            assert!(alone.finish());
+            assert_eq!((title_byte(p + PAGE + 10), title_byte(p + PAGE + 20)), (0xaa, 0x22), "A's byte back, the title's kept");
+            alone.title(std::slice::from_ref(&b));
+            let page = crate::shadow::tests::bytes(&copy, p + PAGE, PAGE);
+            assert_eq!((page[10], page[20]), (0xaa, 0x22), "B's shaders see both");
+            assert!(!alone.finish() || !alone.in_flight());
+        }
+        done(p, copy);
+    }
+
+    /// A title write to a page A's shaders write, made while A is in
+    /// flight, resolves as when A is waited for: other bytes of the page
+    /// keep the title's, A's bytes are A's; with marks (the page's bytes
+    /// from before the title's write are the old side) and with a snapshot
+    /// alike. A page A declared, the title wrote and no shader marked
+    /// keeps the title's bytes. Marks are consumed once: the bitmap is
+    /// clear after the finish, and a title write over A's byte after it is
+    /// not undone by the submissions that follow.
+    #[test]
+    fn a_title_write_to_a_page_in_flight_resolves_as_when_waited() {
+        use crate::watch::PAGE;
+        let Some(host) = host() else { return };
+        for marked in [true, false] {
+            let Some((p, copy)) = pool(3) else { return };
+            {
+                let mut alone = Alone::new(host);
+                // What it holds before: both sides start from the same bytes.
+                title_write(p + PAGE + 41, 0x01);
+                let a = writes(host, &copy, (p, 2 * PAGE), marked, vec![(p + PAGE + 10, 0xbb)]);
+                assert_eq!(alone.title(std::slice::from_ref(&a)), None);
+                title_write(p + PAGE + 40, 0x11);
+                title_write(p + 7, 0x33);
+                let b = reads(host, &copy, p, 3 * PAGE);
+                alone.prewarm(std::slice::from_ref(&b));
+                assert_eq!(host_byte(&copy, p + PAGE + 10), 0xbb, "A's byte is not overwritten");
+                assert_eq!(title_byte(p + PAGE + 10), 0);
+                assert!(alone.finish());
+                let read = |at: usize| title_byte(p + at);
+                assert_eq!((read(PAGE + 10), read(PAGE + 40), read(PAGE + 41), read(7)), (0xbb, 0x11, 0x01, 0x33), "marked: {marked}");
+                assert!(!crate::shadow::tests::any_mark(&copy), "the marks are read and cleared at the finish");
+                assert!(!alone.finish(), "finished once");
+                // The title overwrites A's byte: later submissions leave it.
+                title_write(p + PAGE + 10, 0x44);
+                alone.title(std::slice::from_ref(&b));
+                alone.waited(std::slice::from_ref(&b));
+                assert_eq!(read(PAGE + 10), 0x44, "A's byte goes back once");
+                let all = crate::shadow::tests::bytes(&copy, p, 3 * PAGE);
+                assert_eq!((all[PAGE + 10], all[PAGE + 40], all[7]), (0x44, 0x11, 0x33), "the copy follows title memory");
+            }
+            done(p, copy);
+        }
+    }
+
+    /// Nothing tells the title that A ran before what A's shaders wrote is
+    /// in title memory: a Signal made behind A moves its fence only at the
+    /// finish, after the copy-back.
+    #[test]
+    fn no_fence_moves_before_what_shaders_wrote_is_back() {
+        let Some(host) = host() else { return };
+        let Some((p, copy)) = pool(1) else { return };
+        let mut fence = std::ptr::null();
+        crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence);
+        {
+            let mut alone = Alone::new(host);
+            let a = writes(host, &copy, (p, 64), false, vec![(p + 10, 0xaa)]);
+            assert_eq!(alone.title(std::slice::from_ref(&a)), None);
+            crate::fence::keep(fence);
+            assert!(signal_after_unwaited(fence as usize, 5), "kept behind A");
+            assert_eq!((crate::fence::value(fence), title_byte(p + 10)), (0, 0), "neither the fence nor the bytes yet");
+            assert!(alone.finish());
+            assert_eq!((crate::fence::value(fence), title_byte(p + 10)), (5, 0xaa));
+        }
+        crate::fence::let_go(fence);
+        done(p, copy);
+    }
+
+    /// Shader writes with no bound (through the heap's own views, by
+    /// programs using title memory) and those of a list with anything else
+    /// owed are in title memory when the call returns.
+    #[test]
+    fn shader_writes_with_no_bound_wait() {
+        let Some(host) = host() else { return };
+        let Some((p, copy)) = pool(1) else { return };
+        {
+            let mut alone = Alone::new(host);
+            let heap = writes(host, &copy, (p, 64), false, vec![(p + 1, 0x51)]);
+            heap.heap_writes();
+            assert_eq!(alone.title(std::slice::from_ref(&heap)), Some(Waited::HeapWrites));
+            assert_eq!(title_byte(p + 1), 0x51);
+            let memory = Arc::new(host.new_list().unwrap());
+            let _uses = memory.writer_uses_memory(true);
+            copy.refresh(&memory, p as u64, 64);
+            copy.gpu_writes(&memory, p as u64, 64, false);
+            let c = copy.clone();
+            memory.defer_gpu(move || c.write_host(p as u64 + 2, &[0x52]));
+            memory.close();
+            assert_eq!(alone.title(std::slice::from_ref(&memory)), Some(Waited::TitleMemory));
+            assert_eq!(title_byte(p + 2), 0x52);
+            let after = writes(host, &copy, (p, 64), false, vec![(p + 3, 0x53)]);
+            after.defer_after(|| {});
+            assert_eq!(alone.title(std::slice::from_ref(&after)), Some(Waited::After));
+            assert_eq!(title_byte(p + 3), 0x53);
+            assert!(!alone.in_flight());
+        }
+        done(p, copy);
+    }
+
+    /// A small generator (xorshift), the same numbers for both runs.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) as usize % n
+        }
+    }
+
+    /// One run of `rounds` rounds of title writes and submissions over a
+    /// copy of memory at `p`, every submission waited for (`unwaited`
+    /// false: the switch off) or made as the title's with the switch on.
+    /// Returns what each submission's shaders saw of the ranges it asked
+    /// for, title memory at each point where both orders have finished
+    /// everything, and at the end title memory and the copy brought up to
+    /// date.
+    ///
+    /// The title keeps to the console's rule: it does not write bytes the
+    /// last submission's shaders wrote until that submission is finished
+    /// (pages, yes). Each round: title writes; a submission of one or two
+    /// lists with ranges read and ranges written, a few bytes written in
+    /// each by its shaders; then sometimes a point where everything is
+    /// finished (a fence wait, a present).
+    ///
+    /// Marked ranges are of whole pages here. A marked page the title wrote
+    /// that no refresh took whole keeps the title's bytes and drops the
+    /// shaders' (`Shadow::copy_back_marked`'s shortcut); an early refresh
+    /// may take such a page whole where the steps' takes it in part, and
+    /// the unwaited order then puts back bytes the waited order drops.
+    #[allow(clippy::type_complexity)]
+    fn run(host: &Host, p: usize, copy: &Arc<crate::shadow::Shadow>, len: usize, seed: u64, marked: bool, unwaited: bool) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<u8>, Vec<u8>, usize) {
+        use std::sync::Mutex;
+        let mut rng = Rng(seed);
+        let mut alone = Alone::new(host);
+        let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let (mut points, mut left) = (Vec::new(), 0);
+        // Bytes the submission in flight (in the unwaited order) writes.
+        let mut flying: Vec<usize> = Vec::new();
+        let title = || -> Vec<u8> { (0..len).map(|at| title_byte(p + at)).collect() };
+        for round in 0..24 {
+            for _ in 0..rng.below(6) {
+                // Often beside a byte in flight: the same page, the next word.
+                let at = match flying.is_empty() || rng.below(2) == 0 {
+                    true => rng.below(len),
+                    false => (flying[rng.below(flying.len())] + 1 + rng.below(64)) % len,
+                };
+                let byte = 1 + rng.below(255) as u8;
+                if !flying.contains(&at) {
+                    title_write(p + at, byte);
+                }
+            }
+            let mut lists = Vec::new();
+            let mut written = Vec::new();
+            for _ in 0..1 + rng.below(2) {
+                let list = Arc::new(host.new_list().unwrap());
+                let mut asked = Vec::new();
+                for _ in 0..1 + rng.below(3) {
+                    let at = rng.below(len - 1);
+                    let n = 1 + rng.below((len - at).min(crate::watch::PAGE + 4096));
+                    copy.refresh(&list, (p + at) as u64, n as u64);
+                    asked.push((at, n));
+                }
+                let mut bytes = Vec::new();
+                for _ in 0..rng.below(3) {
+                    let at = rng.below(len - 1);
+                    let n = 1 + rng.below((len - at).min(crate::watch::PAGE + 4096));
+                    // Marked ranges hold their pages whole: see `run`.
+                    let (at, n) = match marked {
+                        true => (at / crate::watch::PAGE * crate::watch::PAGE, n.next_multiple_of(crate::watch::PAGE).min(len - at / crate::watch::PAGE * crate::watch::PAGE)),
+                        false => (at, n),
+                    };
+                    copy.refresh(&list, (p + at) as u64, n as u64);
+                    copy.gpu_writes(&list, (p + at) as u64, n as u64, marked);
+                    for _ in 0..1 + rng.below(4) {
+                        bytes.push((p + at + rng.below(n), 1 + rng.below(255) as u8));
+                    }
+                }
+                written.extend(bytes.iter().map(|&(at, _)| at - p));
+                let (c, seen) = (copy.clone(), seen.clone());
+                list.defer_gpu(move || {
+                    // What the shaders read, then what they write.
+                    let mut read = Vec::new();
+                    for &(at, n) in &asked {
+                        read.extend(crate::shadow::tests::bytes(&c, p + at, n));
+                    }
+                    seen.lock().unwrap().push(read);
+                    for &(at, byte) in &bytes {
+                        c.write_host(at as u64, &[byte]);
+                        if marked {
+                            crate::shadow::tests::mark_written(&c, at);
+                        }
+                    }
+                });
+                list.close();
+                lists.push(list);
+            }
+            if unwaited {
+                if alone.title(&lists).is_none() {
+                    left += 1;
+                }
+            } else {
+                alone.waited(&lists);
+            }
+            flying = written;
+            // Something tells the title that all of it ran.
+            if rng.below(3) == 0 || round == 23 {
+                alone.finish();
+                flying.clear();
+                points.push(title());
+            }
+        }
+        assert!(!alone.in_flight());
+        // The copy brought up to date whole: where the trackers took a page
+        // for current that is not, it differs from title memory.
+        alone.waited(&[reads(host, copy, p, len)]);
+        let seen = std::mem::take(&mut *seen.lock().unwrap());
+        (seen, points, title(), crate::shadow::tests::bytes(copy, p, len), left)
+    }
+
+    /// The same title writes and submissions with every submission waited
+    /// for and with them unwaited: what each submission's shaders see, and
+    /// title memory wherever the title may look, are the same byte for
+    /// byte, with marked ranges and with snapshots, on tracked memory and
+    /// (snapshots only) on memory that is not tracked.
+    #[test]
+    fn unwaited_runs_leave_the_bytes_waited_ones_do() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let Some(host) = host() else { return };
+        let len = 4 * PAGE;
+        for (tracked, marked) in [(true, false), (true, true), (false, false)] {
+            for seed in [0x9e37_79b9_7f4a_7c15u64, 0x1234_5678_9abc_def1, 0x0f0f_1e1e_2d2d_3c3c, 0x7777_0000_3333_1111] {
+                let both: Vec<_> = [false, true]
+                    .into_iter()
+                    .map(|unwaited| {
+                        let p = match tracked {
+                            true => crate::watch::tests::pool(4),
+                            // Private memory without write watching is not the runtime's.
+                            // SAFETY: a fresh allocation, freed below.
+                            false => unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize },
+                        };
+                        assert!(p != 0);
+                        crate::shadow::register(p, p as u64, len as u64);
+                        let copy = crate::shadow::find(p as u64, len as u64).unwrap();
+                        assert_eq!(copy.marked(), tracked);
+                        let out = run(host, p, &copy, len, seed, marked, unwaited);
+                        done(p, copy);
+                        out
+                    })
+                    .collect();
+                let (waited, unwaited) = (&both[0], &both[1]);
+                let case = format!("tracked {tracked}, marked {marked}, seed {seed:#x}");
+                assert_eq!(waited.4, 0);
+                assert!(unwaited.4 > 12, "most go unwaited ({}): {case}", unwaited.4);
+                assert_eq!(waited.0.len(), unwaited.0.len());
+                for (i, (w, u)) in waited.0.iter().zip(&unwaited.0).enumerate() {
+                    if let Some(k) = w.iter().zip(u).position(|(a, b)| a != b) {
+                        eprintln!("list {i} byte {k:#x} of what it read: waited {:#x} unwaited {:#x}", w[k], u[k]);
+                    }
+                    assert!(w == u, "what list {i}'s shaders read: {case}");
+                }
+                assert_eq!(waited.1.len(), unwaited.1.len());
+                for (i, (w, u)) in waited.1.iter().zip(&unwaited.1).enumerate() {
+                    assert!(w == u, "title memory at point {i}: {case}");
+                }
+                assert!(waited.2 == unwaited.2, "title memory at the end: {case}");
+                assert!(waited.3 == unwaited.3, "the copy at the end: {case}");
+                assert!(unwaited.2 == unwaited.3, "the copy holds title memory: {case}");
+            }
+        }
     }
 }

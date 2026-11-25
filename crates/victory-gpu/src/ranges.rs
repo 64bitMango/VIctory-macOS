@@ -68,9 +68,35 @@ impl Ranges {
     }
 }
 
+/// `[from, to)` around the ranges `busy` (any order, overlapping or not):
+/// its parts outside all of them, and its parts inside some, each in order
+/// and apart.
+pub(crate) fn around(from: usize, to: usize, busy: Vec<(usize, usize)>) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    let mut inside = Ranges::default();
+    for (a, b) in busy {
+        inside.insert(a.max(from), b.min(to), 0);
+    }
+    (inside.missing(from, to), inside.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::Ranges;
+
+    /// A refresh goes around what shaders in flight write: every byte is
+    /// in one part or the other, none in both.
+    #[test]
+    fn a_range_falls_apart_around_busy_ones() {
+        use super::around;
+        assert_eq!(around(10, 50, vec![]), (vec![(10, 50)], vec![]));
+        assert_eq!(around(10, 50, vec![(0, 100)]), (vec![], vec![(10, 50)]));
+        assert_eq!(around(10, 50, vec![(60, 70), (0, 10)]), (vec![(10, 50)], vec![]), "touching is outside");
+        let (free, left) = around(10, 50, vec![(30, 35), (0, 12), (33, 40), (48, 90)]);
+        assert_eq!(free, [(12, 30), (40, 48)]);
+        assert_eq!(left, [(10, 12), (30, 40), (48, 50)]);
+        let bytes = |r: &[(usize, usize)]| r.iter().map(|(a, b)| b - a).sum::<usize>();
+        assert_eq!(bytes(&free) + bytes(&left), 40);
+    }
 
     fn set(ranges: &[(usize, usize)]) -> Ranges {
         let mut r = Ranges::default();
