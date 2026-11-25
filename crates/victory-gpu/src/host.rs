@@ -2408,10 +2408,18 @@ impl HostList {
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
+            // SAFETY: the list's own mapped words (the budget spent, the
+            // unfilled records run empty), written before it runs.
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
-                (at as *mut u32).write_volatile(0)
+                (at as *mut u32).write_volatile(0);
+                (at as *mut u32).add(1).write_volatile(0)
             })));
+            deferred.after.push(Box::new(move || {
+                // SAFETY: the same words, read once the list has run; the
+                // buffer lives as long as the list.
+                let unfilled = unsafe { (at as *const u32).add(1).read_volatile() };
+                crate::indirect::note_unfilled(unfilled);
+            }));
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
@@ -3366,6 +3374,7 @@ impl Meter {
         let indirect = crate::list::take_indirect() as f64 / frames;
         let [records, counted] = crate::indirect::take_records().map(|n| n as f64 / frames);
         let hoisted = crate::indirect::take_hoisted() as f64 / frames;
+        let unfilled = crate::indirect::take_unfilled() as f64 / frames;
         let hoists = crate::list::take_hoists() as f64 / frames;
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
         // Over the same frames as the counts above.
@@ -3379,7 +3388,8 @@ impl Meter {
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
-                 max records {records:.0}/frame ({counted:.0} under a count), {hoisted:.0} clamps/frame \
+                 max records {records:.0}/frame ({counted:.0} under a count, {unfilled:.0} unfilled \
+                 run empty), {hoisted:.0} clamps/frame \
                  in the list before their draw's ({hoists:.0} lists cut for them)",
                 making = crate::pipeline::making()
             );
