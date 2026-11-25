@@ -175,6 +175,10 @@ fn sync_runs() -> bool {
 /// the slot holds is not what it would hold; whether that is ever seen is
 /// not known, and how many such slots there are is counted first.
 fn null_once() -> bool {
+    #[cfg(test)]
+    if tests::NULL_ONCE.with(|once| once.get()) {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_NULL_ONCE"))
 }
@@ -2291,6 +2295,99 @@ pub(crate) mod tests {
         /// look and each slot a sync makes (as `VICTORY_SLOT_LOCKS=0` and
         /// `VICTORY_SYNC_RUNS=0`).
         pub(crate) static ONE_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// This thread leaves the null view of a slot that shows nothing (as
+        /// `VICTORY_NULL_ONCE=1`).
+        pub(crate) static NULL_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    const HEAP_IID: crate::object::Iid =
+        crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+
+    /// A draw reading a table entry whose slot is made from its record
+    /// waits for no lock: with every slot lock of the heap held it comes
+    /// back with the view. One whose record changed waits for the lock, and
+    /// then makes the slot from the new record.
+    #[test]
+    fn a_draw_reads_a_made_slot_without_its_lock_and_waits_to_make_one() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        // A shader-visible sampler heap of 4 slots, in memory of its own.
+        let heap_desc: [u32; 8] = [1, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &HEAP_IID, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let (start, at) = (title_heap.start, heap as usize);
+        let sampler = |address: u32| [21, address, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+        crate::descriptor::create_sampler(null, &sampler(1), start);
+        let slots = title_heap.host().expect("a host sampler heap");
+        let first = slots.made_key(0);
+        assert!(first != 0, "made when written");
+        // As a draw on another thread would read the entry.
+        let read = move || {
+            let (done, result) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let slots = crate::descriptor::heap(at as crate::object::This).host().expect("made");
+                let _ = done.send(slots.mirror(0, start, true));
+            });
+            result
+        };
+        let held = slots.hold_slots();
+        let found = read().recv_timeout(std::time::Duration::from_secs(20));
+        assert_eq!(found, Ok(Some(View::Sampler(sampler(1)))), "read while every slot lock is held");
+        // Another record, copied in as bytes: the slot is to be made.
+        let elsewhere = [0u64; 2];
+        crate::descriptor::create_sampler(null, &sampler(2), elsewhere.as_ptr() as u64);
+        // SAFETY: a record of ours into the heap's first slot.
+        unsafe { std::ptr::copy_nonoverlapping(elsewhere.as_ptr().cast::<u8>(), start as *mut u8, 16) };
+        let waiting = read();
+        assert!(waiting.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "waits for the slot's lock");
+        assert_eq!(slots.made_key(0), first, "not made meanwhile");
+        drop(held);
+        let found = waiting.recv_timeout(std::time::Duration::from_secs(20));
+        assert_eq!(found, Ok(Some(View::Sampler(sampler(2)))));
+        assert!(slots.made_key(0) != first && slots.made_key(0) != 0, "made from the new record");
+    }
+
+    /// A slot whose record comes to name no view is made null whether or
+    /// not it showed anything: it is noted as made from nothing, and views
+    /// nothing. With `VICTORY_NULL_ONCE=1` too, which only leaves the null
+    /// view of a slot that showed nothing where it is.
+    #[test]
+    fn a_slot_whose_record_names_no_view_is_made_null() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        for once in [false, true] {
+            NULL_ONCE.with(|n| n.set(once));
+            let null = std::ptr::null();
+            let heap_desc: [u32; 8] = [0, 1024, 1, 0, 0, 0, 0, 0];
+            // A slot no other test's pass over read slots names.
+            const SLOT: u32 = 777;
+            let at = |title: &crate::descriptor::Heap| title.start + u64::from(SLOT) * 32;
+            let mut heap = null;
+            assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &HEAP_IID, &mut heap), 0);
+            let title_heap = crate::descriptor::heap(heap);
+            // A placed texture's view: left null until read, so the slot
+            // shows nothing.
+            let memory = vec![0u8; 1 << 16];
+            let address = memory.as_ptr() as u64;
+            let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+            let mut view = [0u32; 16];
+            view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+            (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+            crate::descriptor::create_placed_srv(null, &words, &view, at(title_heap));
+            let slots = title_heap.host().expect("a host view heap");
+            assert!(slots.made(SLOT) && !slots.kept(SLOT) && !slots.holds(SLOT), "noted, showing nothing");
+            assert_eq!(slots.viewed.slots(), 1);
+            // SAFETY: a slot of the heap.
+            unsafe { std::ptr::write_bytes(at(title_heap) as *mut u8, 0, 32) };
+            assert!(slots.mirror(SLOT, at(title_heap), false).is_none());
+            assert!(!slots.made(SLOT), "made from nothing (leaving its null view: {once})");
+            assert_eq!(slots.viewed.slots(), 0);
+            NULL_ONCE.with(|n| n.set(false));
+        }
     }
 
     /// Work to run while a view's texture is prepared, once (tests).
