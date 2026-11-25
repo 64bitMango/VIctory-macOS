@@ -220,6 +220,34 @@ fn heaps_alone() -> std::sync::RwLockWriteGuard<'static, Vec<Registration>> {
     SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// [`heaps_alone`] for a pass over the heaps' slots: how long it holds them
+/// is counted (diagnostics), every title thread writing a view waits it out.
+#[cfg(windows)]
+fn heaps_for_pass() -> Pass {
+    Pass {
+        heaps: heaps_alone(),
+        #[cfg(feature = "diagnostics")]
+        _held: crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::HeapsAloneUs),
+    }
+}
+
+/// The heaps held alone by a pass (fields drop in order: the time held
+/// ends when the lock is given back).
+#[cfg(windows)]
+struct Pass {
+    #[cfg(feature = "diagnostics")]
+    _held: crate::watch::Timed,
+    heaps: std::sync::RwLockWriteGuard<'static, Vec<Registration>>,
+}
+
+#[cfg(windows)]
+impl std::ops::Deref for Pass {
+    type Target = Vec<Registration>;
+    fn deref(&self) -> &Vec<Registration> {
+        &self.heaps
+    }
+}
+
 #[cfg(any(windows, test))]
 type Registration = (u64, u64, usize);
 
@@ -263,11 +291,13 @@ fn heap_at(heaps: &[Registration], handle: u64) -> Option<usize> {
 /// duration so `Heap::drop` cannot free the heap concurrently.
 #[cfg(windows)]
 fn mirror(handle: u64) {
-    #[cfg(feature = "diagnostics")]
-    let waited = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MirrorWaitUs);
-    let heaps = heaps();
-    #[cfg(feature = "diagnostics")]
-    drop(waited);
+    // Its wait is counted (diagnostics: "title threads waiting to write
+    // views").
+    let heaps = if heaps_shared() {
+        Heaps::Shared(crate::contend::read(&SHADER_HEAPS, crate::contend::Lock::Heaps))
+    } else {
+        Heaps::Alone(crate::contend::write(&SHADER_HEAPS, crate::contend::Lock::Heaps))
+    };
     let Some(at) = heap_at(&heaps, handle) else {
         return;
     };
@@ -301,6 +331,7 @@ pub(crate) fn sync_heaps() {
     // Held throughout: a heap is not dropped while its slots are made.
     // Shared: title threads write views meanwhile (`SHADER_HEAPS`).
     let heaps = heaps();
+    let _syncing = crate::contend::syncing();
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -343,7 +374,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     // runs evict2, noevict1). They are never released, so they outlive it;
     // the lock is held only to look the slots up and to make the views.
     let placed: Vec<View> = {
-        let heaps = heaps_alone();
+        let heaps = heaps_for_pass();
         heaps
             .iter()
             // SAFETY: registered heaps are live (removed when dropped).
@@ -360,7 +391,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     crate::texture::in_parallel(placed.len(), |i| {
         let _ = host::placed_texture(&placed[i]);
     });
-    let heaps = heaps_alone();
+    let heaps = heaps_for_pass();
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -398,7 +429,7 @@ pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
 /// (`crate::resource::evict` gives those textures up).
 #[cfg(windows)]
 pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
-    let heaps = heaps_alone();
+    let heaps = heaps_for_pass();
     for &(_, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -419,7 +450,7 @@ pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
 pub(crate) fn with_slots_still<R>(
     f: impl FnOnce(&dyn Fn(&std::collections::HashSet<usize>) -> std::collections::HashSet<usize>) -> R,
 ) -> R {
-    let heaps = heaps_alone();
+    let heaps = heaps_for_pass();
     let hosts: Vec<&host::HostHeap> = heaps
         .iter()
         // SAFETY: registered heaps are live (removed when dropped, which
@@ -647,21 +678,27 @@ fn record(handle: u64, view: View) {
     // with the table held, as below: its generation is the entry's own
     // then (`forget` holds the table alone).
     if record_shared() {
-        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
         if let Some(&i) = views.index.get(&view) {
             let generation = views.list[i as usize].1;
             // SAFETY: the handle is a descriptor slot, at least 16 bytes.
             unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
             drop(views);
+            #[cfg(all(windows, feature = "diagnostics"))]
+            crate::copystat::add(crate::copystat::C::RecordFound, 1);
             #[cfg(windows)]
             mirror(handle);
             return;
         }
     }
-    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+    let mut views = crate::contend::write(&VIEWS, crate::contend::Lock::Views);
     // Looked up again: another thread may have entered it meanwhile.
     let i = match views.index.get(&view) {
-        Some(&i) => i,
+        Some(&i) => {
+            #[cfg(all(windows, feature = "diagnostics"))]
+            crate::copystat::add(crate::copystat::C::RecordFound, 1);
+            i
+        }
         None => {
             let i = match views.free.pop() {
                 Some(i) => {
@@ -678,6 +715,8 @@ fn record(handle: u64, view: View) {
                 views.by_resource.entry(r).or_default().push(i);
             }
             views.index.insert(view, i);
+            #[cfg(all(windows, feature = "diagnostics"))]
+            crate::copystat::add(crate::copystat::C::RecordNew, 1);
             i
         }
     };
@@ -725,7 +764,7 @@ pub(crate) fn forget(resource: usize) {
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
 }
@@ -737,7 +776,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 /// `VICTORY_SLOT_GENERATIONS=0`.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
-    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
     if generations_alone() {
         let generations = &views.generations;
         return records
@@ -772,7 +811,7 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
     let (view, current) = views.list.get(i as usize)?;
     (tag == VIEW_TAG && *current == generation).then(|| view.clone())
 }

@@ -681,25 +681,46 @@ impl HostHeap {
         let records: Vec<[u32; 3]> =
             (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
         let current = views_current(&records);
+        // Why each is made (diagnostics).
+        let mut why = [0u64; 3];
         let stale: Vec<u32> = {
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let made = crate::contend::lock(&self.made, crate::contend::Lock::Slot);
             (first..last)
                 .zip(records.iter().zip(current))
-                .filter(|&(i, (&[_, view, generation], current))| match made.get(i as usize) {
-                    Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
-                    Some(&m) => m != 0,
-                    None => true,
+                .filter(|&(i, (&[_, view, generation], current))| {
+                    let key = u64::from(generation) << 32 | u64::from(view);
+                    let due = due(made.get(i as usize).copied(), current.then_some(key));
+                    if let Some(Some(reason)) = due {
+                        why[reason as usize] += 1;
+                    }
+                    due.is_some()
                 })
                 .map(|(i, _)| i)
                 .collect()
         };
         #[cfg(feature = "diagnostics")]
         {
+            use crate::copystat::{C, add};
             drop(looking);
-            crate::copystat::add(crate::copystat::C::SyncMade, stale.len() as u64);
+            add(C::SyncMade, stale.len() as u64);
+            add(C::SyncFirst, why[Due::First as usize]);
+            add(C::SyncRewrote, why[Due::Rewrote as usize]);
+            add(C::SyncStale, why[Due::Stale as usize]);
         }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = why;
         for i in stale {
-            self.mirror(i, at(i), false);
+            let _view = self.mirror(i, at(i), false);
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                match &_view {
+                    None => add(C::SyncNulled, 1),
+                    Some(View::Constant(..)) => add(C::SyncConstant, 1),
+                    Some(view) if is_placed_texture(view) => add(C::SyncLeft, 1),
+                    Some(_) => {}
+                }
+            }
         }
     }
 
@@ -722,7 +743,7 @@ impl HostHeap {
             }
             return None;
         }
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut made = crate::contend::lock(&self.made, crate::contend::Lock::Slot);
         // Read with the slot lock held: whichever thread makes the slot
         // last read its record last. A title thread's write is followed by
         // its own call here, so a heap sync or draw that read the record
@@ -767,7 +788,7 @@ impl HostHeap {
             // binding and writing views wait on (run evict5).
             drop(made);
             prepare(&view);
-            made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            made = crate::contend::lock(&self.made, crate::contend::Lock::Slot);
             // The title may have written another record there meanwhile (and
             // another thread made it): that one is the slot's.
             // SAFETY: as above.
@@ -921,6 +942,31 @@ impl HostHeap {
     #[cfg(test)]
     pub(crate) fn kept(&self, index: u32) -> bool {
         self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some()
+    }
+}
+
+/// Why a heap sync makes a slot again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Due {
+    /// Nothing was made there, and the title's record names a view.
+    First,
+    /// The title's record names another view than the slot was made from.
+    Rewrote,
+    /// The slot was made from a view, and the title's record names none
+    /// now: its resource was released, or the title wrote something else.
+    Stale,
+}
+
+/// Whether a heap sync makes a slot again, and why: `made` is the record
+/// the slot was last made from (0: none; `None`: a title slot past the host
+/// heap, passed on to [`HostHeap::mirror`], which makes nothing there),
+/// `record` the title's record if it names a current view.
+fn due(made: Option<u64>, record: Option<u64>) -> Option<Option<Due>> {
+    match (made, record) {
+        (None, _) => Some(None),
+        (Some(0), Some(_)) => Some(Some(Due::First)),
+        (Some(made), Some(record)) => (made != record).then_some(Some(Due::Rewrote)),
+        (Some(made), None) => (made != 0).then_some(Some(Due::Stale)),
     }
 }
 
@@ -1792,6 +1838,22 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A heap sync makes a slot whose record differs from what it was made
+    /// from, and passes by one that holds what its record says: a view
+    /// where none was made, another view, no view where one was made; the
+    /// same view, and nothing where nothing was made, are left.
+    #[test]
+    fn a_sync_makes_the_slots_whose_record_differs() {
+        let (a, b) = (1 << 32 | 7, 2 << 32 | 7);
+        assert_eq!(due(Some(0), Some(a)), Some(Some(Due::First)));
+        assert_eq!(due(Some(a), Some(b)), Some(Some(Due::Rewrote)));
+        assert_eq!(due(Some(a), None), Some(Some(Due::Stale)));
+        assert_eq!(due(Some(a), Some(a)), None);
+        assert_eq!(due(Some(0), None), None);
+        assert_eq!(due(None, Some(a)), Some(None));
+        assert_eq!(due(None, None), Some(None));
+    }
 
     /// Typed buffer views of integer formats carry their kind in the
     /// view-stride table; float, normalized, raw and structured ones none.

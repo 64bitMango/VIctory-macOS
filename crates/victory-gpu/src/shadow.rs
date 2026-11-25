@@ -1177,7 +1177,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // shared. A copy to make is made below with them held alone, the
     // buffer looked up again.
     if lookups_shared() {
-        let map = BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+        let map = crate::contend::read(&BUFFERS, crate::contend::Lock::Copies);
         match holding(&map, address, end) {
             None => {
                 drop(map);
@@ -1190,7 +1190,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
             }
         }
     }
-    let mut map = buffers();
+    let mut map = crate::contend::write(&BUFFERS, crate::contend::Lock::Copies);
     let key = holding(&map, address, end);
     let Some(key) = key else {
         drop(map);
@@ -1243,14 +1243,14 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
     if lookups_shared()
-        && let Some(shadow) = LOOSE.read().unwrap_or_else(|e| e.into_inner()).get(&(start, len))
+        && let Some(shadow) = crate::contend::read(&LOOSE, crate::contend::Lock::Copies).get(&(start, len))
     {
         // Under the lock (shared), which a release holds alone.
         shadow.ask();
         return Some(shadow.clone());
     }
     // Looked up again: another thread may have made it meanwhile.
-    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let mut map = crate::contend::write(&LOOSE, crate::contend::Lock::Copies);
     if let Some(shadow) = map.get(&(start, len)) {
         // Under the lock, where a release checks it.
         shadow.ask();

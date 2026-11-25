@@ -131,7 +131,7 @@ impl Viewed {
     /// host (`made`) or left without a host view.
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
         let seen = view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) });
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = crate::contend::lock(&self.inner, crate::contend::Lock::Viewed);
         if let Some(old) = inner.slots.remove(&index) {
             inner.count(&old, false);
         }

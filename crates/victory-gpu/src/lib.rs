@@ -26,6 +26,7 @@ mod composite;
 #[cfg(windows)]
 mod compute;
 pub mod console;
+mod contend;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
