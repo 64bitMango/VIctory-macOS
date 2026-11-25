@@ -8,7 +8,7 @@
 use std::sync::Mutex;
 #[cfg(feature = "diagnostics")]
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::{AtomicU64, Ordering::{Acquire, Release}};
+use std::sync::atomic::{AtomicU64, Ordering::{Acquire, Release, SeqCst}};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -56,10 +56,15 @@ pub(crate) struct HostHeap {
     ///   texture where it needs one, takes no lock
     ///   ([`HostHeap::made_already`]): it makes nothing, so it cannot undo
     ///   another thread's making, and what it finds was complete when it
-    ///   looked. While a slot is made again its entry is still the old
-    ///   record's: a draw holding the old record got it from a table the
-    ///   title was rewriting, as it could under the mutex; one holding the
-    ///   new record takes the lock and waits.
+    ///   looked. While a slot is looked at under its lock its entry is
+    ///   [`BUSY`], set before the record is read: a thread that wrote a
+    ///   record and then finds the entry that record's key (after a fence,
+    ///   so that its write is seen by whoever sets `BUSY` next) knows that
+    ///   no thread is making the slot from a record read before its write.
+    ///   Without that a slot written back to what it was made from, while
+    ///   another thread made it from the record in between, was taken for
+    ///   made and ended as the record in between (seen once in six runs of
+    ///   `the_last_of_several_threads_writing_a_slot_at_once_makes_it`).
     /// - Passes that need every slot still ([`HostHeap::hold_slots`]: the
     ///   release of idle copies, giving textures up, the first fill of the
     ///   view addresses) hold every stripe.
@@ -111,6 +116,10 @@ pub(crate) struct HostHeap {
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
 }
+
+/// What a slot's entry in [`HostHeap::made`] holds while a thread looks at
+/// the slot under its lock: no record's key (no view has this index).
+const BUSY: u64 = u64::MAX;
 
 /// Slot locks to a heap ([`HostHeap::made`]).
 const STRIPES: usize = 256;
@@ -979,6 +988,21 @@ impl HostHeap {
         }
     }
 
+    /// What title slot `index` is made from (0: nothing, or past the heap),
+    /// waiting out a thread that looks at it under its lock.
+    fn made_from(&self, index: u32) -> u64 {
+        let Some(entry) = self.made.get(index as usize) else {
+            return 0;
+        };
+        match entry.load(SeqCst) {
+            BUSY => {
+                let _slot = self.lock_slot(index, false);
+                entry.load(SeqCst)
+            }
+            made => made,
+        }
+    }
+
     /// Whether `kept` holds a host resource for title slot `index`.
     fn holds(&self, index: u32) -> bool {
         self.held.get(index as usize / 64).is_some_and(|bits| bits.load(Acquire) >> (index % 64) & 1 != 0)
@@ -1022,7 +1046,12 @@ impl HostHeap {
     fn made_already(&self, index: u32, handle: u64, for_draw: bool) -> Option<Option<View>> {
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-        let made = self.made[index as usize].load(Acquire);
+        // The record this thread (or the title, for it) wrote is seen by
+        // any thread that sets the entry `BUSY` after the load below, which
+        // then reads the record: one of the two sees the other
+        // ([`HostHeap::made`]).
+        std::sync::atomic::fence(SeqCst);
+        let made = self.made[index as usize].load(SeqCst);
         let Some(view) = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten() else {
             return (made == 0).then_some(None);
         };
@@ -1094,6 +1123,10 @@ impl HostHeap {
     /// ([`Made::Needs`]).
     fn make_locked(&self, index: u32, handle: u64, for_draw: bool, prepared: Option<[u32; 3]>) -> Made {
         let entry = &self.made[index as usize];
+        // Before the record is read: a thread that finds the entry its
+        // record's key meanwhile does not take the slot for made
+        // ([`HostHeap::made`]). `was`: what the slot is made from.
+        let was = entry.swap(BUSY, SeqCst);
         // Read with the slot lock held: whichever thread makes the slot
         // last read its record last. A title thread's write is followed by
         // its own call here, so a heap sync or draw that read the record
@@ -1108,7 +1141,7 @@ impl HostHeap {
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            if entry.load(Acquire) != 0 {
+            if was != 0 {
                 // A slot that shows nothing has a null view already.
                 let shows = self.sampler || self.holds(index);
                 #[cfg(feature = "diagnostics")]
@@ -1117,16 +1150,17 @@ impl HostHeap {
                 }
                 self.make_null_view(index, shows || !null_once());
                 self.note_address(index, None);
-                // Last: the slot is whole for whoever finds this.
-                entry.store(0, Release);
             }
+            // Last: the slot is whole for whoever finds this.
+            entry.store(0, SeqCst);
             return Made::Is(None);
         };
         // A placed texture's view left null below is made when a draw reads
         // the slot through a table; until then the slot is not made again
         // (heap syncs revisit it at every submission).
         let lazy = for_draw && is_texture(&view) && !self.holds(index);
-        if entry.load(Acquire) == key && !lazy {
+        if was == key && !lazy {
+            entry.store(was, SeqCst);
             return Made::Is(Some(view));
         }
         // Shaders index the heap itself (`crate::bindless`): buffer views
@@ -1137,6 +1171,7 @@ impl HostHeap {
         // ran the host out of memory (run b2).
         let later = !for_draw && is_placed_texture(&view);
         if !later && prepared != Some(record) {
+            entry.store(was, SeqCst);
             return Made::Needs(view, record);
         }
         self.set_stride(index, Some(&view));
@@ -1159,7 +1194,7 @@ impl HostHeap {
         }
         self.keep(index, kept.flatten());
         // Last: the slot is whole for whoever finds this (`made`).
-        entry.store(key, Release);
+        entry.store(key, SeqCst);
         Made::Is(Some(view))
     }
 
@@ -1186,7 +1221,7 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = self.made.get(index as usize)?.load(Acquire);
+        let key = self.made_from(index);
         // A view the host could not make leaves a null view, its record
         // noted all the same; it keeps no resource.
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some();
@@ -1251,7 +1286,7 @@ impl HostHeap {
     /// The view of slot `index` if it is a placed texture's left without a
     /// host view (made when read).
     pub(crate) fn unmade_placed(&self, index: u32) -> Option<View> {
-        let key = self.made.get(index as usize)?.load(Acquire);
+        let key = self.made_from(index);
         let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some();
         (is_placed_texture(&view) && !kept).then_some(view)
@@ -1260,7 +1295,7 @@ impl HostHeap {
     /// A shader read slot `index` through the heap: the texture it views
     /// was used now.
     pub(crate) fn stamp_read(&self, index: u32) {
-        let key = self.made.get(index as usize).map_or(0, |made| made.load(Acquire));
+        let key = self.made_from(index);
         let Some(view) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten() else {
             return;
         };
@@ -1275,13 +1310,13 @@ impl HostHeap {
     /// Whether slot `index` was made from a record (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
-        self.made[index as usize].load(Acquire) != 0
+        self.made_from(index) != 0
     }
 
     /// The record slot `index` was last made from, 0 for none (tests).
     #[cfg(test)]
     pub(crate) fn made_key(&self, index: u32) -> u64 {
-        self.made[index as usize].load(Acquire)
+        self.made_from(index)
     }
 
     /// Whether slot `index` holds a host view of a resource (tests).

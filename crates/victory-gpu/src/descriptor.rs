@@ -1106,6 +1106,12 @@ pub(crate) mod tests {
         pub(crate) static HEAPS_ALONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
+    /// Held by tests that count on entries' generations: one releases and
+    /// makes views thousands of times, which moves freed entries'
+    /// generations on by any number while another looks at a generation
+    /// "never given".
+    static GENERATIONS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Whether the generations kept alone are the entries' own.
     fn generations_match() -> bool {
         let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
@@ -1120,6 +1126,7 @@ pub(crate) mod tests {
     /// past the entries.
     #[test]
     fn records_are_current_by_the_generations_kept_alone_as_by_the_entries() {
+        let _alone = GENERATIONS.lock().unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         let slots = [0u64; 4 * 64];
         let at = |i: usize| slots.as_ptr() as u64 + 32 * i as u64;
@@ -1176,6 +1183,7 @@ pub(crate) mod tests {
     /// recorded before, and taken alone for each.
     #[test]
     fn views_recorded_and_released_from_several_threads_read_back_as_recorded() {
+        let _alone = GENERATIONS.lock().unwrap_or_else(|e| e.into_inner());
         const THREADS: usize = 6;
         const ROUNDS: usize = if cfg!(debug_assertions) { 20_000 } else { 200_000 };
         // Resources no other test names.
@@ -1647,6 +1655,54 @@ pub(crate) mod tests {
                     true => u64::from(record[2]) << 32 | u64::from(record[1]),
                     false => 0,
                 };
+                assert_eq!(host.made_key(i), key, "round {round}, slot {i}");
+            }
+        }
+    }
+
+    /// A slot made from one record is written, at once, another record by
+    /// one thread and the record it is made from again by a second: it ends
+    /// made from whichever record it holds. (The second thread finds the
+    /// slot made from its record while the first is making it from the
+    /// other: it must not take the slot for made.)
+    #[cfg(windows)]
+    #[test]
+    fn a_slot_written_back_to_what_it_is_made_from_while_another_record_is_made_ends_as_its_record() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        const SLOTS: u32 = 96;
+        const FIRST: u32 = 64;
+        let title = owner(
+            HeapDesc { kind: SAMPLERS, count: SLOTS, flags: SHADER_VISIBLE, nodes: 1 },
+            Placement { address: 0, size: 0 },
+        );
+        let start = heap(title.0).start;
+        let Some(host) = heap(title.0).host() else { return };
+        let sampler = |k: u32| [21, 1 + k, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+        for i in FIRST..SLOTS {
+            create_sampler(std::ptr::null(), &sampler(0), start + u64::from(i) * 16);
+        }
+        for round in 0..1500u32 {
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                // Each slot is made from one of the two: one thread writes
+                // it that one again, the other the other.
+                for k in 0..2 {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for i in FIRST..SLOTS {
+                            create_sampler(std::ptr::null(), &sampler(k), start + u64::from(i) * 16);
+                        }
+                    });
+                }
+            });
+            for i in FIRST..SLOTS {
+                // SAFETY: a slot of the heap.
+                let record = unsafe { ((start + u64::from(i) * 16) as *const [u32; 3]).read_unaligned() };
+                assert!(views_current(&[record])[0]);
+                let key = u64::from(record[2]) << 32 | u64::from(record[1]);
                 assert_eq!(host.made_key(i), key, "round {round}, slot {i}");
             }
         }
