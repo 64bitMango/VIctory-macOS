@@ -513,6 +513,10 @@ pub(crate) enum View {
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
+    /// Each entry's generation again, alone: heap syncs ask about every
+    /// record of the pages written ([`views_current`]), and an entry of
+    /// `list` is 136 bytes, a cache line fetched per slot asked about.
+    generations: Vec<u32>,
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
@@ -521,6 +525,7 @@ struct Views {
 
 static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     list: Vec::new(),
+    generations: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
@@ -553,6 +558,7 @@ fn record(handle: u64, view: View) {
                 }
                 None => {
                     views.list.push((view.clone(), 1));
+                    views.generations.push(1);
                     views.list.len() as u32 - 1
                 }
             };
@@ -586,6 +592,7 @@ pub(crate) fn forget(resource: usize) {
         }
         views.index.remove(&view);
         views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+        views.generations[i as usize] = views.list[i as usize].1;
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
@@ -601,15 +608,38 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 }
 
 /// For each record (tag, index, generation): whether it names a view that
-/// is current, as [`view_at`] would find it (one lock for them all).
+/// is current, as [`view_at`] would find it (one lock for them all). Asked
+/// of the generations kept alone, which are the entries' own (written with
+/// them, under the lock); of the entries themselves with
+/// `VICTORY_SLOT_GENERATIONS=0`.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    if generations_alone() {
+        let generations = &views.generations;
+        return records
+            .iter()
+            .map(|&[tag, i, generation]| tag == VIEW_TAG && generations.get(i as usize) == Some(&generation))
+            .collect();
+    }
     records
         .iter()
         .map(|&[tag, i, generation]| {
             tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
         })
         .collect()
+}
+
+/// Whether [`views_current`] reads the generations kept alone: on unless
+/// `VICTORY_SLOT_GENERATIONS=0`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn generations_alone() -> bool {
+    #[cfg(test)]
+    if tests::FROM_ENTRIES.with(|off| off.get()) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_SLOT_GENERATIONS"))
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -899,6 +929,74 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    thread_local! {
+        /// This thread asks the view entries themselves whether records are
+        /// current (as `VICTORY_SLOT_GENERATIONS=0`).
+        pub(crate) static FROM_ENTRIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Whether the generations kept alone are the entries' own.
+    fn generations_match() -> bool {
+        let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        views.generations.len() == views.list.len()
+            && views.list.iter().zip(&views.generations).all(|((_, own), alone)| own == alone)
+    }
+
+    /// The generations kept alone follow the entries' through views made,
+    /// released and made again at freed entries, and records are found
+    /// current or stale the same from either: records of live views, of
+    /// released ones, of an entry's next generation, with another tag, and
+    /// past the entries.
+    #[test]
+    fn records_are_current_by_the_generations_kept_alone_as_by_the_entries() {
+        let null = std::ptr::null();
+        let slots = [0u64; 4 * 64];
+        let at = |i: usize| slots.as_ptr() as u64 + 32 * i as u64;
+        // SAFETY: slots of `slots`.
+        let record = |i: usize| unsafe { (at(i) as *const [u32; 3]).read_unaligned() };
+        let both = |records: &[[u32; 3]]| {
+            let alone = views_current(records);
+            FROM_ENTRIES.with(|f| f.set(true));
+            let entries = views_current(records);
+            FROM_ENTRIES.with(|f| f.set(false));
+            assert_eq!(alone, entries);
+            alone
+        };
+        // Resources no other test names: other tests' views come and go
+        // meanwhile, these only here.
+        let resource = |k: usize| 0x5eed_0000_0000 + 0x100 * k;
+        for k in 0..32 {
+            create_srv(null, resource(k) as This, std::ptr::null(), at(k));
+        }
+        assert!(generations_match());
+        let mut records: Vec<[u32; 3]> = (0..32).map(record).collect();
+        assert_eq!(both(&records), [true; 32]);
+        // Every other resource released: its records are stale.
+        (0..32).step_by(2).for_each(|k| forget(resource(k)));
+        assert!(generations_match());
+        let stale: Vec<bool> = (0..32).map(|k| k % 2 == 1).collect();
+        assert_eq!(both(&records), stale);
+        // Made again (freed entries are reused): new records are current,
+        // the old ones stay stale.
+        for k in (0..32).step_by(2) {
+            create_srv(null, resource(k) as This, std::ptr::null(), at(32 + k));
+        }
+        assert!(generations_match());
+        assert_eq!(both(&records), stale);
+        records.extend((0..32).step_by(2).map(|k| record(32 + k)));
+        // Not records of ours: another tag, an entry that does not exist, a
+        // generation never given.
+        let [tag, i, generation] = records[1];
+        records.extend([[tag ^ 1, i, generation], [tag, u32::MAX, 1], [tag, i, generation.wrapping_add(7)], [0; 3]]);
+        let mut expected = stale;
+        expected.extend([true; 16]);
+        expected.extend([false; 4]);
+        assert_eq!(both(&records), expected);
+        (0..32).for_each(|k| forget(resource(k)));
+        assert!(generations_match());
+        assert_eq!(both(&records), [false; 52]);
+    }
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.

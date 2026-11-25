@@ -675,6 +675,8 @@ impl HostHeap {
     /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms).
     pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
         let at = |i: u32| start + u64::from(i) * step;
+        #[cfg(feature = "diagnostics")]
+        let looking = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncLookUs);
         // SAFETY: records in title heap memory the caller found mapped.
         let records: Vec<[u32; 3]> =
             (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
@@ -691,6 +693,11 @@ impl HostHeap {
                 .map(|(i, _)| i)
                 .collect()
         };
+        #[cfg(feature = "diagnostics")]
+        {
+            drop(looking);
+            crate::copystat::add(crate::copystat::C::SyncMade, stale.len() as u64);
+        }
         for i in stale {
             self.mirror(i, at(i), false);
         }
@@ -2020,6 +2027,15 @@ mod tests {
         if host().is_none() {
             return; // no host GPU here
         }
+        // Whichever way records are found current.
+        for from_entries in [false, true] {
+            crate::descriptor::tests::FROM_ENTRIES.with(|f| f.set(from_entries));
+            heap_sync_of_changed_records();
+        }
+        crate::descriptor::tests::FROM_ENTRIES.with(|f| f.set(false));
+    }
+
+    fn heap_sync_of_changed_records() {
         let null = std::ptr::null();
         let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
         let mut heap = null;
@@ -2041,6 +2057,20 @@ mod tests {
         unsafe { std::ptr::write_bytes((start + 32) as *mut u8, 0, 32) };
         host.sync_slots(0, 4, start, 32);
         assert!(host.made(0) && !host.made(1), "a cleared record leaves its slot");
+        // A record naming a generation its view does not have (as one of a
+        // view whose resource the title released): not made, and a slot made
+        // from the record before leaves it.
+        // SAFETY: slots 0, 1 and 2 of the heap's memory.
+        unsafe {
+            std::ptr::copy_nonoverlapping(start as *const u8, (start + 32) as *mut u8, 32);
+            let [tag, view, generation] = (start as *const [u32; 3]).read_unaligned();
+            ((start + 64) as *mut [u32; 3]).write_unaligned([tag, view, generation.wrapping_add(7)]);
+            host.sync_slots(0, 4, start, 32);
+            assert!(host.made(0) && host.made(1) && !host.made(2), "a stale record makes nothing");
+            ((start + 32) as *mut [u32; 3]).write_unaligned([tag, view, generation.wrapping_add(7)]);
+        }
+        host.sync_slots(0, 4, start, 32);
+        assert!(host.made(0) && !host.made(1), "a record gone stale leaves its slot");
     }
 
     /// The world's 16-byte view of 0 elements removed the device.
