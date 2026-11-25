@@ -21,11 +21,46 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 /// lists frames counted from the first one that ran 500 draws (the world's
 /// first, whose number depends on how fast the title loaded).
 pub(crate) fn listed(n: u64) -> bool {
-    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| numbers("VICTORY_CAPTURE_FRAMES")).contains(&n)
+    frames().contains(&n)
         || WORLD
             .get()
             .is_some_and(|&w| world_offsets().iter().any(|&k| w + k == n))
+}
+
+fn frames() -> &'static [u64] {
+    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| numbers("VICTORY_CAPTURE_FRAMES"))
+}
+
+/// Whether any frame is listed at all (by number or from the world's
+/// first): what a list records may then run in a listed frame.
+pub(crate) fn lists_frames() -> bool {
+    !frames().is_empty() || !world_offsets().is_empty()
+}
+
+/// How many frames ahead of the one that runs it a list is taken to be
+/// recorded at most, by diagnostics too costly to prepare in every frame.
+const AHEAD: u64 = 2;
+
+/// Whether a list recorded now may run in a listed frame. The title
+/// records lists ahead of the frame that submits them (held work runs
+/// later still), so what a listed frame logs is prepared when recorded and
+/// logged at submission, if `listed(presented() + 1)` holds then (the
+/// test the dumps use).
+pub(crate) fn listed_soon() -> bool {
+    soon(crate::queue::presented() + 1, frames(), WORLD.get().copied(), world_offsets())
+}
+
+/// [`listed_soon`] for a list recorded in frame `n`: a listed frame lies
+/// in `n..=n + AHEAD`. Before the world's first frame (some frame from `n`
+/// on) only its nearest offsets can.
+fn soon(n: u64, frames: &[u64], world: Option<u64>, offsets: &[u64]) -> bool {
+    let near = |f: u64| (n..=n + AHEAD).contains(&f);
+    frames.iter().any(|&f| near(f))
+        || match world {
+            Some(w) => offsets.iter().any(|&k| near(w + k)),
+            None => offsets.iter().any(|&k| k <= AHEAD),
+        }
 }
 
 fn numbers(var: &str) -> Vec<u64> {
@@ -957,6 +992,25 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// Run 21: world frame 10 of a world starting at 2076 is frame 2086,
+    /// whose lists were recorded before `presented() + 1` reached 2086.
+    #[test]
+    fn a_list_recorded_ahead_of_a_listed_frame_is_prepared() {
+        use super::soon;
+        let world = |n| soon(n, &[], Some(2076), &[10]);
+        assert!(!world(2083));
+        assert!(world(2084) && world(2085) && world(2086));
+        assert!(!world(2087));
+        // By number.
+        assert!(soon(98, &[7, 100], None, &[]) && soon(100, &[7, 100], None, &[]));
+        assert!(!soon(97, &[7, 100], None, &[]) && !soon(101, &[7, 100], None, &[]));
+        // Before the world's first frame is known, only offsets it can
+        // still reach from a list recorded now.
+        assert!(!soon(500, &[], None, &[10]));
+        assert!(soon(500, &[], None, &[10, 1]));
+        assert!(!soon(500, &[], None, &[]));
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
