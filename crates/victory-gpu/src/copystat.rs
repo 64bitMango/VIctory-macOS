@@ -176,6 +176,21 @@ pub(crate) enum C {
     SlotBehindTitleUs,
     SlotBehindDrawUs,
     SlotBehindSyncUs,
+    /// Heap syncs: runs of slots made under one hold of their lock; of the
+    /// slots made null for a record that names no view, those whose record
+    /// is a view of a released resource, zeros, other bytes; those made
+    /// null so in the two frames before too; those that showed nothing
+    /// already; such slots whose null view was kept (`VICTORY_NULL_ONCE`);
+    /// and of the slots made for a new record, those a draw read through a
+    /// table in the last eight frames.
+    SyncRuns,
+    SyncStaleReleased,
+    SyncStaleZeros,
+    SyncStaleOther,
+    SyncStaleAgain,
+    SyncStaleNothing,
+    NullKept,
+    SyncTabled,
     /// Not a counter: how many there are.
     Count,
 }
@@ -432,6 +447,17 @@ pub(crate) fn log(frames: f64) {
         ms(behind_t),
         ms(behind_d),
         ms(behind_s),
+    );
+    tracing::info!(
+        "  heap sync slots per frame: made under {:.0} holds of a run's lock; records naming no view: {:.0} views of released resources, {:.0} zeros, {:.0} other bytes, {:.0} at slots made null so in the two frames before too, {:.0} at slots that showed nothing already ({:.0} null views kept, VICTORY_NULL_ONCE); new records at slots a draw read through a table in the last eight frames: {:.0}",
+        c[C::SyncRuns as usize],
+        c[C::SyncStaleReleased as usize],
+        c[C::SyncStaleZeros as usize],
+        c[C::SyncStaleOther as usize],
+        c[C::SyncStaleAgain as usize],
+        c[C::SyncStaleNothing as usize],
+        c[C::NullKept as usize],
+        c[C::SyncTabled as usize],
     );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
