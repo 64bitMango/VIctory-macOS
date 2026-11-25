@@ -523,7 +523,10 @@ struct Views {
     free: Vec<u32>,
 }
 
-static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
+// Read by every list recorder for every descriptor it binds: readers share
+// it. As a mutex it made the title's recording threads take turns (Belobug
+// ff920f2: 6,600 context switches a second each in a PIX timing capture).
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     generations: Vec::new(),
     index: std::collections::BTreeMap::new(),
@@ -547,7 +550,7 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let i = match views.index.get(&view) {
         Some(&i) => i,
         None => {
@@ -579,7 +582,7 @@ fn record(handle: u64, view: View) {
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
@@ -602,7 +605,7 @@ pub(crate) fn forget(resource: usize) {
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
 }
@@ -614,7 +617,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 /// `VICTORY_SLOT_GENERATIONS=0`.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     if generations_alone() {
         let generations = &views.generations;
         return records
@@ -649,7 +652,7 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     (tag == VIEW_TAG && *current == generation).then(|| view.clone())
 }
@@ -938,7 +941,7 @@ pub(crate) mod tests {
 
     /// Whether the generations kept alone are the entries' own.
     fn generations_match() -> bool {
-        let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
         views.generations.len() == views.list.len()
             && views.list.iter().zip(&views.generations).all(|((_, own), alone)| own == alone)
     }
