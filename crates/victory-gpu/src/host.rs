@@ -1053,6 +1053,12 @@ struct Deferred {
     /// The buffer copies its commands use (by address), until it has run:
     /// not released for idleness meanwhile (`crate::shadow::Flight`).
     flying: std::collections::HashMap<usize, crate::shadow::Flight>,
+    /// Whether a shader of the list writes through views it takes from the
+    /// heap itself: ranges no step declares (`crate::unwaited`).
+    heap_writes: bool,
+    /// What a title list owned that this one may read, left to it when the
+    /// title list was reset or released first (`crate::list`).
+    left: Vec<Box<dyn std::any::Any + Send>>,
 }
 
 impl Host {
@@ -2286,6 +2292,17 @@ impl HostList {
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
         self.deferred().after.push(Box::new(work));
+    }
+
+    /// A shader of the list writes through views it takes from the heap
+    /// itself.
+    pub(crate) fn heap_writes(&self) {
+        self.deferred().heap_writes = true;
+    }
+
+    /// Keeps `what` until the list is reset.
+    pub(crate) fn keep_until_reset(&self, what: Box<dyn std::any::Any + Send>) {
+        self.deferred().left.push(what);
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
