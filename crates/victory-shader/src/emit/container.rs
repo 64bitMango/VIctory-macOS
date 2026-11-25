@@ -198,6 +198,34 @@ pub(crate) fn metal_packed_order(elements: &[SigElement]) -> Vec<usize> {
     order
 }
 
+/// Mesh output `elements` without the clip and cull distances at the end
+/// of their order (clip then cull, by index, as the console's distance
+/// vectors carry them) whose channels `idle` names (element, channels):
+/// distances that are +0.0 at every vertex, which clip and cull nothing.
+/// Only from the end, so that the others keep their places in the vectors;
+/// an element left without channels goes. `None` when there are none.
+pub(crate) fn without_idle_distances(
+    elements: &[SigElement],
+    idle: &[(usize, u8)],
+) -> Option<Vec<SigElement>> {
+    let mut distances: Vec<usize> = (0..elements.len())
+        .filter(|&i| matches!(elements[i].kind, 6 | 7))
+        .collect();
+    distances.sort_by_key(|&i| (elements[i].kind, elements[i].index));
+    let mut out = elements.to_vec();
+    'elements: for &i in distances.iter().rev() {
+        let channels = idle.iter().find(|x| x.0 == i).map_or(0, |x| x.1);
+        while out[i].cols > 0 {
+            if channels >> (out[i].cols - 1) & 1 == 0 {
+                break 'elements;
+            }
+            out[i].cols -= 1;
+        }
+    }
+    out.retain(|e| e.cols > 0);
+    (out != elements).then_some(out)
+}
+
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend((elements.len() as u32).to_le_bytes());
@@ -714,6 +742,90 @@ mod tests {
         let mut sorted = order.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, (0..els.len()).collect::<Vec<_>>());
+    }
+
+    /// The vertex outputs of a title shader (1c451759513efb4c) and of
+    /// a title shader (78683826ba8dd8a6): four clip
+    /// distances, of which the last three are +0.0 at every vertex.
+    fn transform_lit() -> Vec<SigElement> {
+        let mut spec = vec![("SV_Position", 3, 4), ("SV_ClipDistance", 6, 4)];
+        let cols = [4, 4, 4, 1, 2, 1, 4, 3, 1, 3, 3, 3, 3, 3, 3, 2, 4, 3, 3];
+        spec.extend(cols.map(|c| ("TEXCOORD", 0, c)));
+        outputs(&spec)
+    }
+
+    /// The vertex outputs of the DeferredPedDecal meshes (ac82b7984c664350,
+    /// 36a9c81f635373e5): one clip distance; element 4 is TEXCOORD3, of
+    /// which a title shader reads the last channel only.
+    fn ped_decal() -> Vec<SigElement> {
+        let mut spec = vec![("SV_Position", 3, 4)];
+        let cols = [4, 4, 4, 4, 3, 1, 3, 1, 3, 1, 4, 3, 1, 3, 1, 4, 4, 3, 1, 4];
+        spec.extend(cols.map(|c| ("TEXCOORD", 0, c)));
+        spec.push(("SV_ClipDistance", 6, 1));
+        outputs(&spec)
+    }
+
+    fn packed_bytes(els: &[SigElement]) -> u32 {
+        let packed: Vec<SigElement> = metal_packed_order(els)
+            .into_iter()
+            .map(|i| els[i].clone())
+            .collect();
+        metal_mesh_bytes(&packed, &[], 128, 128)
+    }
+
+    /// The five mesh pipelines Metal refused with packed and kept outputs
+    /// (25 November: "Total mesh size (33792)" twice, "(33280)" three
+    /// times) are within its limit without the idle clip distances, or with
+    /// TEXCOORD3 as narrow as its pixel shader reads it.
+    #[test]
+    fn title_meshes_over_metals_limit_packed_fit_without_what_nothing_reads() {
+        // TransformLit and MirrorReflectionTransformLit with pixel shaders
+        // that read every output (43fba4644854c38e, 5f7ce6c17312f149).
+        let els = transform_lit();
+        assert_eq!(packed_bytes(&els), 33792);
+        let fewer = without_idle_distances(&els, &[(1, 0b1110)]).unwrap();
+        assert_eq!((fewer.len(), fewer[1].cols), (els.len(), 1));
+        assert_eq!(packed_bytes(&fewer), 32256);
+        // TransformLit without TEXCOORD16 (element 10), which
+        // 64d9a8c65c927eaf does not read.
+        let mut kept = els.clone();
+        kept.remove(10);
+        assert_eq!(packed_bytes(&kept), 33280);
+        let fewer = without_idle_distances(&kept, &[(1, 0b1110)]).unwrap();
+        assert_eq!(packed_bytes(&fewer), 31744);
+        // The DeferredPedDecal meshes: their one distance is live.
+        let mut els = ped_decal();
+        assert_eq!(packed_bytes(&els), 33280);
+        assert_eq!(without_idle_distances(&els, &[(21, 0)]), None);
+        (els[4].col, els[4].cols) = (3, 1);
+        assert_eq!(packed_bytes(&els), 31744);
+    }
+
+    /// Only the distances at the end of the clip-then-cull order go: the
+    /// console's vectors carry the others by position.
+    #[test]
+    fn idle_distances_go_from_the_end_only() {
+        let els = outputs(&[
+            ("SV_Position", 3, 4),
+            ("SV_CullDistance", 7, 2),
+            ("TEXCOORD", 0, 4),
+            ("SV_ClipDistance", 6, 4),
+        ]);
+        let cols = |idle: &[(usize, u8)]| {
+            without_idle_distances(&els, idle)
+                .map(|e| e.iter().map(|e| (e.kind, e.cols)).collect::<Vec<_>>())
+        };
+        // Clip distances before a live cull distance stay.
+        assert_eq!(cols(&[(3, 0b1111)]), None);
+        assert_eq!(cols(&[(1, 0b01), (3, 0b1111)]), None);
+        assert_eq!(cols(&[(1, 0b10)]), Some(vec![(3, 4), (7, 1), (0, 4), (6, 4)]));
+        // An element left without channels goes, and the one before it is
+        // then the end.
+        assert_eq!(
+            cols(&[(1, 0b11), (3, 0b1010)]),
+            Some(vec![(3, 4), (0, 4), (6, 3)])
+        );
+        assert_eq!(cols(&[(1, 0b11), (3, 0b1111)]), Some(vec![(3, 4), (0, 4)]));
     }
 
     #[test]

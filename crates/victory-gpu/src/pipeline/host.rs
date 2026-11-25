@@ -307,7 +307,8 @@ const QUADS: i32 = 32;
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
     /// Its own translation in place of the shader's: a mesh shader's
-    /// without the outputs the pixel shader does not read ([`pruned_mesh`]).
+    /// without the outputs the pixel shader does not read, or that pixel
+    /// shader's with its inputs as narrow ([`pruned_mesh`]).
     pub(crate) own: Option<Arc<Translated>>,
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
@@ -363,32 +364,58 @@ pub(crate) struct HostPipeline {
 /// when Metal counts more output of the mesh shader's own than it allows
 /// even packed (`emit::mesh_over_metal_limit`; D3DMetal then makes the
 /// pipeline a no-op) and the pixel shader leaves some of it unread: one
-/// without those outputs (`shader_cache::mesh_prune`).
-fn pruned_mesh(ms: &Shader, ps: &Shader) -> Option<Arc<Translated>> {
+/// without those outputs (`shader_cache::mesh_prune`). If that is over the
+/// limit too, one that also narrows the outputs to the channels the pixel
+/// shader reads, and with it the pixel shader's own translation with its
+/// inputs as narrow (the stages link by semantic, and each element is as
+/// wide as its stage declares it).
+fn pruned_mesh(ms: &Shader, ps: &Shader) -> (Option<Arc<Translated>>, Option<Arc<Translated>>) {
     use victory_shader::emit;
     if !crate::shader_cache::mesh_prune() {
-        return None;
+        return (None, None);
     }
-    let mesh = &ms.translated()?.host.dxil;
+    let (Some(mesh), Some(pixel)) = (ms.translated(), ps.translated()) else {
+        return (None, None);
+    };
+    let (mesh, pixel) = (&mesh.host.dxil, &pixel.host.dxil);
     if !emit::mesh_over_metal_limit(mesh) {
-        return None;
+        return (None, None);
     }
-    let kept = match emit::pixel_reads(&ps.translated()?.host.dxil) {
-        Ok(kept) => kept,
-        Err(e) => {
+    let kept = match (emit::pixel_reads(pixel), emit::pixel_reads_channels(pixel)) {
+        (Ok(kept), Ok(channels)) => [kept, channels],
+        (Err(e), _) | (_, Err(e)) => {
             tracing::warn!(error = %e, ?ps, "pixel shader inputs not read");
-            return None;
+            return (None, None);
         }
     };
-    if !emit::mesh_outputs_unread(mesh, &kept) {
-        tracing::warn!(
-            ?ms,
-            ?ps,
-            "mesh pipeline over Metal's output limit; its pixel shader reads all of it"
-        );
-        return None;
+    let [whole, channels] = kept.each_ref().map(|k| emit::mesh_outputs_unread(mesh, k));
+    let mut own = None;
+    if whole {
+        own = ms.translated_keeping(&kept[0]);
+        match &own {
+            Some(t) if !emit::mesh_over_metal_limit(&t.host.dxil) => return (own, None),
+            Some(_) => {}
+            None => return (None, None),
+        }
     }
-    ms.translated_keeping(&kept)
+    if channels
+        && let (Some(m), Some(p)) = (
+            ms.translated_keeping(&kept[1]),
+            ps.translated_keeping(&kept[1]),
+        )
+    {
+        if !emit::stages_link(&m.host.dxil, &p.host.dxil) {
+            tracing::warn!(?ms, ?ps, "narrowed mesh outputs and pixel inputs do not link");
+        } else if !emit::mesh_over_metal_limit(&m.host.dxil) {
+            return (Some(m), Some(p));
+        }
+    }
+    tracing::warn!(
+        ?ms,
+        ?ps,
+        "mesh pipeline over Metal's output limit; its pixel shader reads too much of it"
+    );
+    (own, None)
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -444,10 +471,15 @@ impl HostPipeline {
             s.translated()?;
         }
         // Per stage, a translation of its own (`Stage::own`).
+        let pruned = match (mesh, find("pixel")) {
+            (Some(ms), Some(ps)) => pruned_mesh(ms, ps),
+            _ => (None, None),
+        };
         let own: Vec<Option<Arc<Translated>>> = stages
             .iter()
-            .map(|(s, _)| match (s.stage, find("pixel")) {
-                ("mesh", Some(ps)) => pruned_mesh(s, ps),
+            .map(|(s, _)| match s.stage {
+                "mesh" => pruned.0.clone(),
+                "pixel" => pruned.1.clone(),
                 _ => None,
             })
             .collect();

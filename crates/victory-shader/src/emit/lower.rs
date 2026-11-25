@@ -54,6 +54,9 @@ pub(crate) struct Lowered {
     pub view_marks: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    /// Mesh: per clip or cull distance output (its element), the channels
+    /// every store gives +0.0: distances that clip and cull nothing.
+    pub idle_distances: Vec<(usize, u8)>,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -1706,6 +1709,19 @@ impl<'a> Lower<'a> {
         let memory_writes = self.s.memory_dirty.is_some();
         let view_addresses = self.s.view_addresses.is_some();
         let cmp_samplers = self.s.cmp_samplers;
+        let idle_distances = match self.s.mesh {
+            Some(_) => (0..self.s.outputs.len())
+                .filter(|&id| matches!(self.s.outputs[id].kind, 6 | 7))
+                .map(|id| {
+                    let (stored, live) = self
+                        .s
+                        .m
+                        .stored_channels("dx.op.storeVertexOutput", id as u32);
+                    (id, stored & !live)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         if compact {
             let interface = if self.s.pixel {
                 &mut self.s.inputs
@@ -1749,6 +1765,7 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            idle_distances,
         })
     }
 

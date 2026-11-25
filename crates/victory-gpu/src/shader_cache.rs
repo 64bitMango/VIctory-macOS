@@ -220,8 +220,10 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
 /// Whether mesh pipelines whose mesh shader Metal counts too much output of
 /// even packed ([`mesh_pack_outputs`]) get a translation of their own,
 /// without the vertex outputs their pixel shader does not read: under
-/// Wine (`emit::translate_keeping`). `VICTORY_MESH_PRUNE=0` or `1`
-/// overrides.
+/// Wine (`emit::translate_keeping`). Where that is still too much, both
+/// stages get translations narrowed to the channels the pixel shader reads
+/// (pixel shaders keep their containers for it). `VICTORY_MESH_PRUNE=0` or
+/// `1` overrides.
 pub fn mesh_prune() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| match std::env::var("VICTORY_MESH_PRUNE").as_deref() {
@@ -232,7 +234,8 @@ pub fn mesh_prune() -> bool {
 }
 
 /// [`host_shader`]; a mesh shader with `kept` without the vertex outputs it
-/// does not name. Those translations have entries of their own, by what
+/// does not name, a pixel shader with its inputs narrowed to the channels
+/// it names. Those translations have entries of their own, by what
 /// they keep, so one is never taken for a pixel shader that reads more.
 pub fn host_shader_keeping(
     container: &[u8],
