@@ -567,17 +567,20 @@ fn dump_one(
         // A 24-bit depth plane copies out as 32-bit words (`R32_TYPELESS`):
         // decode it as depth, not as floats (all denormals, shown black).
         let format = if matches!(d.Format.0, 44..=47) { d.Format.0 } else { f.Format.0 };
-        if let Some(rgba) = to_rgba(format as u32, f.Width as usize, f.Height as usize, pitch, rows) {
-            let mut name = format!(
-                "{prefix}-{i:02}-{resource:?}-{}x{}-f{}",
-                d.Width, d.Height, d.Format.0
-            );
-            // The pipeline's hashes (its name is "[stage hash, ...]").
-            let by: String = by.chars().filter(char::is_ascii_alphanumeric).collect();
-            if !by.is_empty() {
-                name.push_str("-by-");
-                name.push_str(&by);
-            }
+        let mut name = format!(
+            "{prefix}-{i:02}-{resource:?}-{}x{}-f{}",
+            d.Width, d.Height, d.Format.0
+        );
+        // The pipeline's hashes (its name is "[stage hash, ...]").
+        let by: String = by.chars().filter(char::is_ascii_alphanumeric).collect();
+        if !by.is_empty() {
+            name.push_str("-by-");
+            name.push_str(&by);
+        }
+        if crate::switch::on("VICTORY_DUMP_RAW") {
+            save_raw(&name, f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows);
+        }
+        if let Some(rgba) = to_rgba_named(&name, format as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             // Whether anything but zeros is there (a dump is normalized).
             if rgba.chunks(4).all(|p| p[..3] == [0, 0, 0]) {
                 name.push_str("-black");
@@ -615,11 +618,67 @@ fn small_float(bits: u32, man: u32) -> f32 {
     }
 }
 
+/// `VICTORY_DUMP_RAW=1`: a dumped texture's texels as they are, rows packed
+/// (no pitch), as `<name>-<width>x<height>-f<host format>.raw`, to read
+/// exact values (a G-buffer channel, an exposure) that a PNG scales away.
+fn save_raw(name: &str, format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) {
+    let Some(folder) = folder() else { return };
+    let Some((bytes, block)) = crate::resource::element(format) else {
+        tracing::info!(format, name, "raw texels not saved: format");
+        return;
+    };
+    // Block-compressed formats: rows of 4x4 blocks.
+    let (row, rows_n) = ((w as u64).div_ceil(block) * bytes, (h as u64).div_ceil(block));
+    let row = row as usize;
+    let mut out = Vec::with_capacity(row * rows_n as usize);
+    for y in 0..rows_n as usize {
+        out.extend_from_slice(&rows[y * pitch..][..row]);
+    }
+    let path = folder.join(format!("{name}-{w}x{h}-f{format}.raw"));
+    match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, out)) {
+        Ok(()) => tracing::info!(path = %path.display(), "raw texels saved"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "raw texels not saved"),
+    }
+}
+
+/// Counts of a dump's channel values (diagnostics): not a number, infinite,
+/// finite but past half-float range (65504: infinite in a 16-bit float
+/// target), and the largest finite one.
+#[derive(Debug, Default, PartialEq)]
+struct Odd {
+    nan: usize,
+    inf: usize,
+    past_half: usize,
+    max: f32,
+}
+
+fn odd(values: &[[f32; 3]]) -> Odd {
+    let mut o = Odd::default();
+    for &v in values.iter().flatten() {
+        if v.is_nan() {
+            o.nan += 1;
+        } else if v.is_infinite() {
+            o.inf += 1;
+        } else {
+            o.past_half += usize::from(v.abs() > 65504.0);
+            o.max = o.max.max(v);
+        }
+    }
+    o
+}
+
+/// As [`to_rgba_named`], for a dump with no name.
+#[cfg(test)]
+fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
+    to_rgba_named("", format, w, h, pitch, rows)
+}
+
 /// Rows of a host format as 8-bit RGBA: 8-bit color as is, everything else
 /// as channel values scaled so the largest finite one is white (single
 /// channels: lowest black, highest white, as grey). `None` for formats not
-/// handled.
-fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
+/// handled. Values are logged under `name`: their range and how many are
+/// NaN, infinite or past half-float range.
+fn to_rgba_named(name: &str, format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
@@ -749,10 +808,11 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         *set.select_nth_unstable_by(k, f32::total_cmp).1
     };
     let (p50, p99) = (at(0.5), at(0.99));
-    let not_finite = values.iter().flatten().filter(|v| !v.is_finite()).count();
+    let Odd { nan, inf, past_half, .. } = odd(&values);
+    let not_finite = nan + inf;
     let high = if grey || p99 == 0.0 { max } else { p99 };
     let range = (high - low).max(1e-20);
-    tracing::info!(format, low, high = max, p50, p99, nonzero, not_finite, "target values");
+    tracing::info!(name, format, low, high = max, p50, p99, nonzero, not_finite, nan, inf, past_half, "target values");
     for v in values {
         let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
         out.extend([c[0], c[1], c[2], 255]);
@@ -922,6 +982,17 @@ mod tests {
         assert_eq!(
             super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]),
             Some(vec![3, 2, 1, 255])
+        );
+    }
+
+    /// NaN, infinities and values a half-float target could not hold are
+    /// told apart in a dump's counts.
+    #[test]
+    fn odd_values_are_counted_apart() {
+        let values = [[f32::NAN, f32::INFINITY, 1.0], [70000.0, -f32::INFINITY, 2.0]];
+        assert_eq!(
+            super::odd(&values),
+            super::Odd { nan: 1, inf: 2, past_half: 1, max: 70000.0 }
         );
     }
 }

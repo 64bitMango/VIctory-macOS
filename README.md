@@ -141,6 +141,10 @@ These need a diagnostics build (`VICTORY_DIAGNOSTICS=1 tools/macos/victory.sh ..
 | `VICTORY_STACKS_FILE=<path>` | Writes those dumps to a file without taking locks, for freezes. |
 | `VICTORY_SKIP_TITLE_INT3=<rva>,...` | Steps over the game's own `int3` asserts at those hex RVAs and logs each one. Every other assert still stops the run. |
 | `VICTORY_GPU_TIMING=1` | Submits and times each GPU list on its own. |
+| `VICTORY_CAPTURE=<folder>` | Saves presented frames (power-of-two numbers and listed ones) as half-size PNGs. |
+| `VICTORY_CAPTURE_WORLD=<n>,...` | Lists frames counted from the world's first (the first with 500 draws); `VICTORY_CAPTURE_FRAMES=<n>,...` lists absolute ones. A listed frame's commands are logged (`victory_gpu::trace`), dropped draws among them. |
+| `VICTORY_DUMP_TARGETS=1` | With `VICTORY_CAPTURE`: after each submission of a listed frame, every texture it drew or wrote is saved (`frame-<n>-s<sub>-<i>-<texture>-<w>x<h>-f<format>-by-<shaders>.png`, scaled) and its values logged (`target values`: range, NaN, infinite, past half-float range); targets of 16 texels or fewer (exposure) are logged as values. |
+| `VICTORY_DUMP_RAW=1` | With `VICTORY_DUMP_TARGETS`: each dumped texture's texels also as they are (`.raw`, rows packed). |
 
 ### Every variable
 
