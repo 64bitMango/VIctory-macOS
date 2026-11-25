@@ -8,11 +8,9 @@
 //! buffer's descriptor from the program's table (a resource of the host,
 //! [`crate::resource::BvhNodes::Resource`]), and the title's way, a
 //! descriptor of numbers over title memory with the structure's address in
-//! the node pointer or in the descriptor. These tests have no host that
-//! keeps copies of title memory and their directory, so for the second
-//! they put a stand-in under the node reader
-//! (`lower::intersect::TEST_MEMORY`); without it the same program reads
-//! through the directory, which is only checked to lower and validate.
+//! the node pointer or in the descriptor. The reference batches use a
+//! stand-in under the node reader (`lower::intersect::TEST_MEMORY`). The
+//! reflected-ray test binds an actual root page directory and fault UAV.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
 use super::lower::intersect::TEST_MEMORY;
@@ -598,6 +596,207 @@ fn the_64_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
 #[test]
 fn the_32_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
     run(false, Descriptor::Table, u64::from(NODES), true);
+}
+
+/// A secondary ray uses the previous GPU result. All node loads run through the
+/// production root-SRV page directory and its bindless raw UAV, including the
+/// negative case for a guest page without a resident copy.
+#[test]
+fn reflected_rays_walk_linked_nodes_through_the_guest_directory() {
+    use windows::Win32::Graphics::Dxgi::*;
+    const PAGE: u64 = 0x1_0002_0000;
+    const MEMORY_BASE: u32 = 2;
+    // Page zero in the host copy is padding. A guest byte's address must
+    // include the directory's start offset as well as the byte in its page.
+    const START: usize = 128;
+    let vertices = [
+        [[-1., -1., -1.], [1., -1., 1.], [0., 1., 0.]], // diagonal mirror
+        [[3., -1., -1.], [3., 1., -1.], [3., 0., 1.]],  // side mirror
+        [[-1., -1., 8.], [1., -1., 8.], [0., 1., 8.]],  // farther primary hit
+        [[-1., -1., -1.], [1., -1., -1.], [0., 1., -1.]], // nearer, unlinked
+    ];
+    let mut scene = Scene::new();
+    for triangle in &vertices {
+        scene.add(nodes::triangles(triangle, 9), 16);
+    }
+    let children = [
+        scene.pointer(2, 0),
+        scene.pointer(1, 0),
+        scene.pointer(0, 0),
+        bvh::NONE,
+    ];
+    let root_node = scene.add(
+        nodes::box32(
+            children,
+            [
+                [-1., -1., 8., 1., 1., 8.],
+                [3., -1., -1., 3., 1., 1.],
+                [-1., -1., -1., 1., 1., 1.],
+                [f32::NAN; 6],
+            ],
+        ),
+        32,
+    );
+    let mut memory = vec![0u32; START / 4];
+    memory.extend_from_slice(&scene.words);
+    let page = (PAGE >> 16) as usize;
+    let mut directory = vec![0; (page + 2) * 2];
+    directory[page * 2..page * 2 + 2].copy_from_slice(&[1, START as u32]);
+    let (shader, _) = build(true, WHOLE).unwrap();
+    assert_eq!(shader.root_uavs, [super::SLOT_FAULTS]);
+    assert_eq!(shader.root_srvs, [super::SLOT_MEMORY]);
+    assert!(shader.root_cbvs.is_empty());
+    let mut constants = vec![0; shader.user_data_dwords() as usize];
+    let base = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(super::USER_MEMORY_BASE))
+        .unwrap();
+    constants[base.index as usize] = MEMORY_BASE;
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else { continue };
+        // SAFETY: a factory query for this live D3D12 device's adapter.
+        let desc = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            factory
+                .EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid())
+                .unwrap()
+                .GetDesc1()
+                .unwrap()
+        };
+        let adapter = String::from_utf16_lossy(&desc.Description);
+        let adapter = adapter.trim_end_matches('\0');
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        let query = |cases: &[Case], address: u64| {
+            let input = buffer(&scene, cases, address);
+            host.dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    // Root signature after the constants: fault UAV u253, directory SRV t254.
+                    roots: vec![
+                        (0, Root::Constants(constants.clone())),
+                        (1, Root::Uav(3)),
+                        (
+                            2,
+                            Root::View {
+                                srv: true,
+                                data: directory.clone(),
+                            },
+                        ),
+                    ],
+                    views: &[
+                        View::Buffer {
+                            data: &input[..NODES as usize / 4],
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(THREADS * 4),
+                        View::RawUav(16), // zero sink for absent pages
+                        View::RawUavData(&memory),
+                        View::RawUav(super::MEMORY_FAULTS),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap()
+        };
+        let mut ray = Ray::new([0., 0., -2.], [0., 0., 1.], 20.);
+        let outside = Ray::new([0., 4., -2.], ray.direction, ray.extent);
+        let controls = query(&[Some((root_node, 5, outside)), Some((3, 0, ray))], PAGE);
+        assert_eq!(controls[0][..4], [bvh::NONE; 4], "outside all boxes");
+        assert_eq!(
+            f32::from_bits(controls[0][4]) / f32::from_bits(controls[0][5]),
+            1.,
+            "the unlinked leaf really intersects"
+        );
+        let absent = query(&[Some((0, 0, ray))], PAGE + (1 << 16));
+        assert_eq!(absent[0][..4], bvh::MISS.map(f32::to_bits));
+        let fault_slot = 1 + (page + 1) % (super::MEMORY_FAULTS as usize - 1);
+        assert_eq!(
+            absent[3][fault_slot],
+            page as u32 + 1,
+            "missing page reported"
+        );
+        for (step, expected) in [Some((0, 2.)), Some((1, 3.)), Some((0, 3.)), None]
+            .into_iter()
+            .enumerate()
+        {
+            let boxes = query(&[Some((root_node, 5, ray))], PAGE);
+            let mut leaves = Vec::new();
+            for &child in &boxes[0][..4] {
+                if child == bvh::NONE {
+                    continue;
+                }
+                let id = (0..vertices.len())
+                    .find(|&i| scene.pointer(i, 0) == child)
+                    .expect("linked leaf pointer");
+                leaves.push(id);
+            }
+            if step == 0 {
+                assert_eq!(
+                    leaves,
+                    [0, 2],
+                    "GPU sorts both primary candidates nearest first"
+                );
+            }
+            let cases: Vec<_> = leaves.iter().map(|&i| Some((i, 0, ray))).collect();
+            let tri = query(&cases, PAGE);
+            assert!(
+                tri[3][1..].iter().all(|&p| p == 0),
+                "resident rays should not fault"
+            );
+            let mut hits = Vec::new();
+            for (&id, words) in leaves.iter().zip(tri[0].chunks_exact(4)) {
+                let [t, det, u, v] = <[u32; 4]>::try_from(words).unwrap().map(f32::from_bits);
+                let distance = t / det;
+                if distance > 1e-4 && distance <= ray.extent {
+                    hits.push((id, distance, u / det, v / det));
+                }
+            }
+            if step == 0 {
+                assert_eq!(hits.iter().map(|h| h.1).collect::<Vec<_>>(), [2., 10.]);
+            }
+            let nearest = hits.into_iter().min_by(|a, b| a.1.total_cmp(&b.1));
+            assert_eq!(
+                nearest.map(|h| (h.0, h.1)),
+                expected,
+                "{adapter}, bounce {step}"
+            );
+            eprintln!(
+                "{adapter}, bounce {step}: {:?}",
+                nearest.map(|h| (h.0, h.1))
+            );
+            let Some((id, distance, u, v)) = nearest else {
+                break;
+            };
+            let [a, b, c] = vertices[id];
+            let ab: [f32; 3] = std::array::from_fn(|i| b[i] - a[i]);
+            let ac: [f32; 3] = std::array::from_fn(|i| c[i] - a[i]);
+            let hit = std::array::from_fn(|i| a[i] + u * ab[i] + v * ac[i]);
+            assert_eq!(
+                hit,
+                std::array::from_fn(|i| ray.origin[i] + distance * ray.direction[i])
+            );
+            let normal: [f32; 3] = std::array::from_fn(|i| {
+                ab[(i + 1) % 3] * ac[(i + 2) % 3] - ab[(i + 2) % 3] * ac[(i + 1) % 3]
+            });
+            let dot =
+                |a: [f32; 3], b: [f32; 3]| a.into_iter().zip(b).map(|(a, b)| a * b).sum::<f32>();
+            let factor = 2. * dot(ray.direction, normal) / dot(normal, normal);
+            ray = Ray::new(
+                hit,
+                std::array::from_fn(|i| ray.direction[i] - factor * normal[i]),
+                ray.extent,
+            );
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
 }
 
 /// Where the tests' title memory puts the buffer: past 4 GiB, on 256 bytes.

@@ -3034,6 +3034,64 @@ mod tests {
         slot::<Release>(allocator, 0x10)(allocator);
     }
 
+    /// Alternating render-target writes and copy-source readbacks on the
+    /// same texture must retain their order across CPU recording workers.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn submission_preludes_preserve_each_intermediate_texture_value() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else { return };
+        let null = std::ptr::null();
+        let mut desc = texture(4, 4, 28, 1);
+        desc.flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 as u32;
+        // 32 textures over eight lists exercise the worker batch threshold.
+        let images: Vec<_> = (0..32).map(|_| {
+            let mut image = null;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut image),
+                S_OK
+            );
+            image
+        }).collect();
+        let mut lists = Vec::new();
+        let mut readbacks = Vec::new();
+        for red in [17u8, 97, 181, 249] {
+            let draw = host.new_list().unwrap();
+            for &image in &images {
+                assert!(draw.transition(image, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32).is_none());
+                let rtv = host.rtv(Some(host_resource(image).unwrap()), None);
+                // SAFETY: a live texture and an open list. The prelude
+                // puts the texture in the render-target state.
+                unsafe { draw.list.ClearRenderTargetView(rtv, &[f32::from(red) / 255.0, 0.0, 0.0, 1.0], None) };
+            }
+            draw.close();
+            lists.push(draw);
+            let copy = host.new_list().unwrap();
+            for &image in &images {
+                assert!(copy.transition(image, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32).is_none());
+                let (buffer, _) = crate::capture::read_back(
+                    &host.device, &copy.list, host_resource(image).unwrap(),
+                ).unwrap();
+                readbacks.push((red, buffer));
+            }
+            copy.close();
+            lists.push(copy);
+        }
+        host.execute(&lists.iter().collect::<Vec<_>>());
+        for (red, buffer) in readbacks {
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: execute has completed all eight lists. The first
+            // four mapped bytes contain the first RGBA8 texel.
+            unsafe {
+                buffer.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 4 }), Some(&mut ptr)).unwrap();
+                let pixel = *ptr.cast::<[u8; 4]>();
+                buffer.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+                assert_eq!(pixel, [red, 0, 0, 255]);
+            }
+        }
+        for image in images { resource_release(image); }
+    }
+
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
     #[cfg(windows)]
@@ -3928,6 +3986,72 @@ float4 lit() : SV_Target { return 1.0; }
             let covered = read[i / 4 * 256 + i % 4] != 0;
             let drawn = matches!(class, 65 | 129);
             assert_eq!(covered, drawn, "texel {i}, class {class}");
+        }
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn sparse_input_capture_preserves_the_bound_state_and_pre_dispatch_pixels() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            assert!(std::env::var_os("VICTORY_D3D12_WARP").is_none(), "requested WARP device unavailable");
+            return;
+        };
+        let null = std::ptr::null();
+        let mut title = null;
+        let desc = texture(2, 2, 28, 1);
+        assert_eq!(create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut title), S_OK);
+        let texture = host_copy(title).unwrap();
+        let list = host.new_list().unwrap();
+        // An unbound texture has no known state in this list; leave it alone.
+        assert!(list.read_bound_input(&host.device, &texture).is_none());
+        let read_state = (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE).0 as u32;
+        let mut reads = Vec::new();
+        for rgba in [0x12345678_u32, 0xdeadbeef] {
+            let (upload, data) = host.upload_buffer(512).unwrap();
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: unsafe { std::mem::transmute_copy(&texture.texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let footprint = D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                Width: 2, Height: 2, Depth: 1, RowPitch: 256,
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: unsafe { std::mem::transmute_copy(&upload) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, Footprint: footprint },
+                },
+            };
+            crate::list::ensure_state(&list, title, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+            assert!(list.read_bound_input(&host.device, &texture).is_none());
+            // SAFETY: two rows of two RGBA texels, each row 256 bytes apart.
+            unsafe {
+                for offset in [0, 4, 256, 260] { data.add(offset).cast::<u32>().write(rgba); }
+                list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            }
+            list.keep(&upload);
+            crate::list::ensure_state(&list, title, read_state);
+            let (buffer, footprint) = list.read_bound_input(&host.device, &texture).unwrap();
+            assert!(list.transition(title, read_state).is_none(), "restore both reader bits");
+            reads.push((buffer, footprint.Footprint.RowPitch as usize, rgba));
+        }
+        resource_release(title);
+        drop(texture);
+        list.close();
+        host.execute(&[&list]);
+        for (buffer, pitch, rgba) in reads {
+            let mut data = std::ptr::null_mut();
+            // SAFETY: the readback completed; its footprint contains the two rows.
+            unsafe {
+                buffer.Map(0, None, Some(&mut data)).unwrap();
+                for offset in [0, 4, pitch, pitch + 4] {
+                    assert_eq!(data.cast::<u8>().add(offset).cast::<u32>().read(), rgba);
+                }
+                buffer.Unmap(0, None);
+            }
         }
     }
 

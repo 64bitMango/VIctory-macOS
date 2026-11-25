@@ -708,9 +708,10 @@ impl Staging {
     fn refresh_timed(&self) -> usize {
         let size = self.size;
         let start = self.memory as usize;
+        let Some(end) = start.checked_add(size) else { return 0 };
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        if let Some((now, written)) = waited(1, || crate::watch::writes(start, end, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -742,7 +743,7 @@ impl Staging {
         // another on the screen).
         let mut unseen = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+            && let Some((now, written)) = waited(1, || crate::watch::writes(start, end, true))
         {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
@@ -758,22 +759,19 @@ impl Staging {
             }
             unseen = unwritten;
         }
-        // From here on the texture's memory may be read in place. Held until
-        // that read is done: the runtime changes what title memory shows
-        // only with this taken alone, so what `committed` finds mapped
-        // stays mapped (see `crate::watch::title_memory_reading`; without
-        // it a page went between the asking and the read in runs 71 and
-        // 74).
+        // Pin the exact span through the committed check, hash and detile.
+        // Windows temporarily removes whole physical views on a partial
+        // remap; xmem includes those old extents in its writer range.
         let _mapped = if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+            let Some(mapped) = crate::watch::title_memory_reading_now(start..end) else {
                 return self.refresh_unlocked(last, size);
             };
             mapped
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            waited(2, || crate::watch::title_memory_reading_range(start..end))
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
@@ -1332,6 +1330,64 @@ mod first_mip_tests {
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn a_texture_refresh_waits_only_for_its_own_mapping() {
+        use std::sync::{atomic::{AtomicBool, Ordering}, mpsc};
+        use std::time::{Duration, Instant};
+        use windows::core::{IUnknown, Interface};
+        use windows_sys::Win32::System::Memory::*;
+
+        if crate::host::host().is_none() {
+            return; // no D3D12 device
+        }
+        let words: [u32; 14] = [3, 0, 0, 0, 16, 0, 4, 65537, 10, 1, 0, 256, 3_145_728, 0];
+        // SAFETY: a known title texture description. These private pages are
+        // committed and live until its resource and staging have been released.
+        let desc = unsafe { std::mem::transmute::<[u32; 14], crate::resource::ResourceDesc>(words) };
+        let page = 64 << 10;
+        let memory = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        assert!(!memory.is_null());
+        let at = memory as usize;
+        unsafe { memory.cast::<u8>().write_bytes(0x57, 2 * page) };
+        let mut title = std::ptr::null();
+        assert_eq!(crate::resource::create_at_address(std::ptr::null_mut(), at as u64, &desc,
+            0, std::ptr::null(), &crate::resource::PAGEABLE_IIDS[0], &mut title), 0);
+        // SAFETY: take ownership of the resource's initial COM reference.
+        let owner = unsafe { IUnknown::from_raw(title.cast_mut().cast()) };
+        let host = crate::resource::host_copy(title).unwrap();
+        let staging = super::staging(title, &host.texture, 0).unwrap();
+        assert!(staging.size <= page);
+        for (range, overlapping) in [(at + page..at + 2 * page, false), (at..at + page, true)] {
+            *staging.last.lock().unwrap() = super::Last::default();
+            let finished = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                let (started, ready) = mpsc::channel();
+                let finished = &finished;
+                s.spawn(move || {
+                    let _writer = crate::watch::title_memory_remapping_range(range);
+                    started.send(()).unwrap();
+                    std::thread::sleep(Duration::from_secs(1));
+                    finished.store(true, Ordering::Release);
+                });
+                ready.recv().unwrap();
+                let start = Instant::now();
+                assert_eq!(staging.refresh_timed(), staging.size);
+                eprintln!("texture refresh, overlap={overlapping}: {:?}", start.elapsed());
+                assert_eq!(finished.load(Ordering::Acquire), overlapping && !super::no_wait());
+                // SAFETY: the first texel has been staged, and nothing is writing it.
+                assert_eq!(unsafe { *staging.data }, 0x57);
+            });
+        }
+        drop(staging);
+        drop(host);
+        drop(owner);
+        crate::watch::title_memory_remapped(at, 2 * page);
+        // SAFETY: no remaining resource, reader, or writer uses this reservation.
+        assert_ne!(unsafe { VirtualFree(memory, 0, MEM_RELEASE) }, 0);
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does

@@ -44,7 +44,6 @@
 //! compared on the CPU afterwards, as for any unordered access view): a
 //! dirty-page mask written by the shader would bound both.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
@@ -56,11 +55,24 @@ use crate::shadow::Shadow;
 
 /// Copies that can be numbered (the run of heap slots is one longer). A
 /// listed frame of the opening cutscene names about 50 windows.
-const COPIES: u32 = 1023;
+pub(crate) const COPIES: u32 = 1023;
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
+
+/// Byte index used by translated shaders in a raw UAV starting at byte zero
+/// of the Windows resource. An in-place resource can begin before the guest
+/// allocation, and a directory entry must cover its complete 64 KiB page.
+fn page_byte(page: u64, start: u64, len: u64, prefix: u64) -> Option<u32> {
+    let at = page.checked_sub(start)?;
+    if at.checked_add(PAGE)? > len {
+        return None;
+    }
+    let byte = prefix.checked_add(at)?;
+    u32::try_from(byte.checked_add(PAGE - 1)?).ok()?;
+    Some(byte as u32)
+}
 
 struct Memory {
     /// Buffer, its mapping, its GPU address.
@@ -68,9 +80,6 @@ struct Memory {
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
-    /// Per host view heap (by address): the first slot of its run, and how
-    /// many copies have their view there.
-    heaps: HashMap<usize, (u32, u32)>,
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
@@ -108,7 +117,6 @@ impl Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
             copies: Vec::new(),
-            heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
         })
@@ -152,6 +160,9 @@ impl Memory {
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             return;
         }
+        let (first, len) = shadow.span();
+        let prefix = shadow.offset(first);
+        let Some(offset) = page_byte(start, first, len, prefix) else { return };
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
             None if self.copies.len() < COPIES as usize => {
@@ -161,15 +172,15 @@ impl Memory {
                 // for: a structure is more than 64 KiB.
                 // shortcut: a page of a title buffer inside this one that
                 // has a copy of its own is given this copy too.
-                let (first, len) = shadow.span();
                 let mut at = first.next_multiple_of(PAGE);
-                while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
+                while at / PAGE < u64::from(MEMORY_PAGES) - 1 {
+                    let Some(byte) = page_byte(at, first, len, prefix) else { break };
                     // SAFETY: inside the directory's mapping.
                     let other = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
                     // SAFETY: as above; the offset first, as below.
                     unsafe {
                         if other.read() == 0 {
-                            other.add(1).write_volatile((at - first) as u32);
+                            other.add(1).write_volatile(byte);
                             other.write_volatile(n as u32 + 1);
                         }
                     }
@@ -185,11 +196,10 @@ impl Memory {
                 return;
             }
         };
-        let offset = shadow.offset_in(start).unwrap_or(0);
         // The offset first: a shader that sees the number sees it too.
         // SAFETY: inside the directory's mapping.
         unsafe {
-            entry.add(1).write_volatile(offset as u32);
+            entry.add(1).write_volatile(offset);
             entry.write_volatile(n as u32 + 1);
         }
     }
@@ -257,7 +267,6 @@ pub(crate) fn ready(
         m.refused.clear();
         m.take_faults();
     }
-    let numbered = m.copies.len();
     for &address in addresses {
         m.name(address);
     }
@@ -275,39 +284,20 @@ pub(crate) fn ready(
             m.name(u64::from(c) << 8);
         }
     }
-    let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
-        Some(&run) => run,
-        None => {
-            // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
-            heap.null_raw_uav_at(base);
-            (base, 0)
-        }
-    };
-    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
-    }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
-    // Once per list, and for copies numbered since: the builder alone
-    // dispatches hundreds of times a frame.
-    // shortcut: a copy another list numbers meanwhile is brought up to date
-    // by that list's submission, which may run after this one's.
+    let base = heap.raw_page_views(&m.copies)?;
+    // A list may submit before the other recording list that numbered a
+    // copy. Each must prepare all copies visible at its own bind.
     const READ: usize = usize::MAX - 0x6d;
-    const WRITE: usize = usize::MAX - 0x6e;
-    let first_read = list.first_use(READ);
-    let first_write = writes && list.first_use(WRITE);
-    for (n, shadow) in m.copies.iter().enumerate() {
+    let (reads, written) = list.raw_memory_ranges(m.copies.len(), writes);
+    for shadow in &m.copies[reads] {
         let (start, len) = shadow.span();
-        if first_read || n >= numbered {
-            shadow.refresh(list, start, len);
-        }
-        if writes && (first_write || n >= numbered) {
-            shadow.gpu_writes(list, start, len);
-        }
+        shadow.refresh(list, start, len);
     }
-    if first_read {
+    for shadow in &m.copies[written] {
+        let (start, len) = shadow.span();
+        shadow.gpu_writes(list, start, len);
+    }
+    if list.first_use(READ) {
         list.keep(&m.directory.0);
         list.keep(&m.faults.0);
     }
@@ -316,4 +306,24 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{page_byte, PAGE};
+
+    #[test]
+    fn directory_pages_index_the_same_bytes_as_bound_buffer_views() {
+        let heap = 0x1_0000_0000;
+        let start = heap + 0x1230;
+        let len = 3 * PAGE - 0x1230;
+        // The first full guest page is at resource byte 0x10000, even
+        // though it lies just 0xedd0 bytes into the guest allocation.
+        assert_eq!(page_byte(heap + PAGE, start, len, 0x1230), Some(0x10000));
+        assert_eq!(page_byte(heap + 2 * PAGE, start, len, 0x1230), Some(0x20000));
+        assert_eq!(page_byte(heap + PAGE, start, len, 0), Some(0xedd0));
+        assert_eq!(page_byte(heap, start, len, 0x1230), None);
+        assert_eq!(page_byte(heap + 3 * PAGE, start, len, 0x1230), None);
+        assert_eq!(page_byte(heap + PAGE, start, len, u32::MAX.into()), None);
+    }
 }

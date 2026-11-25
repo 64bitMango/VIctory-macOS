@@ -18,3 +18,26 @@ The City interior can render with an overexposed doorway and a silhouetted chara
 - A full archive run with the sampler change translated 25,742 of 25,758 shaders. A follow-up test recovered one more pixel shader used for voxel visibility. The corrected translator recognized both halves of a restored wave64 lane mask. Retesting all 56 original refusals produced 41 validated shaders and 15 remaining refusals. The visual effect in the City interior still needs a gameplay comparison.
 - On an RX 7900 XTX the original windshield-wiper pipeline failed creation with blending enabled on an integer target. The corrected pipeline created successfully with the same shaders and framebuffer formats. The other active targets retained their blending state and all three write masks were preserved.
 - A clean Windows installation built all three programs, resolved all static imports of the tested game executable, and executed a synthetic title through the Start-menu shortcut. Re-running setup preserved existing state.
+
+## City streaming and CPU submission
+
+- Of 2,191 distinct vertex shaders in the tested archive, 39 originally emitted bytecode that failed the Microsoft DXIL validator. Correcting signature order and respecting the declared interpolation validated all 2,191. Eighteen of the corrected shaders rasterize water or its proxy geometry. The 92 shaders selected by temporal and anti-aliasing names also passed validation.
+- In the City capture, the native temporal resolve dispatched 320 by 180 groups of 8 by 8 threads. The output was 2560 by 1440. Both bloom and the final composite consumed that output. Temporal blend weights and visual quality across the whole game remain unverified.
+- One fixed-camera waterfront capture showed dark materials while thousands of texture slots waited for upload. The queue regression test verifies that new textures get service alongside retries even when the per-pass limit is one. An interior lighting defect persisted after the queue drained.
+- In a CPU-only release benchmark of 28,279 small upload reads batched 512 at a time, four workers took 11.67 ms compared with 17.64 ms for one. A separate WARP regression submitted eight interdependent command lists and verified all 128 intermediate texture readbacks with and without parallel prelude recording. These tests measure CPU work and command ordering. Gameplay FPS depends on the scene.
+
+## City save reload and dark objects
+
+During a City save reload, the waterfront house, dock and trees gained detail over 18 seconds. The number of texture views due for upload fell from 10,577 to 5,916 to 36. At the middle sample, shader pipeline creation had already caught up and uploads still averaged 391 MB per frame. The translation cache was cold after a translator change. These measurements include diagnostic captures.
+
+Six seconds before a later patio screenshot, the tabletop item and upright weight plate were already dark in both native TAA outputs. Both objects had similar colors in the final image and the screenshot. That capture did not record the incoming scene color. The same interval averaged 317 skipped ray-tracing structure-builder dispatches per frame, with zero pipelines being built. The game's ray-traced lighting remains incomplete, and the cause of these two objects' color is unresolved.
+
+On an RX 7900 XTX, a standalone DXR 1.1 reflection test hit the first triangle at 2 units, the second at 3 units, and the first again at 3 units. The escaping ray and an outside control ray both missed. All 52 compute shaders from the game's ray-tracing builder also validated and created pipelines on this card. Gameplay needs additional verification of the geometry those shaders build, the rays that traverse it and the resulting lighting.
+
+Five previously refused shadow compute shaders now pass Microsoft's DXIL validator. The runtime created all five compute pipelines on the RX 7900 XTX. Their lighting output still needs comparison in the affected scene.
+
+A second test ran a translated Xbox 64-bit ray-node instruction on the RX 7900 XTX and WARP. Both returned hits at 2, 3 and 3 units across two mirrored triangles, followed by a miss. A closer triangle outside the linked tree was ignored, and a deliberately unmapped guest page produced the expected fault. The GPU read nodes through the runtime's guest-page directory. The test driver used the returned distance and barycentric coordinates to construct each reflected ray between dispatches.
+
+The shader cache now fingerprints 30 translation source files. A controlled change to the host test harness or the standalone intersection tests preserved that fingerprint. Changing either the lowering code or the intersection translator changed it. The revised key requires a fresh translation on first use.
+
+One City texture staging sample spent 846 ms waiting on the global memory mapping lock. The updated staging path takes a lock over the source address range. In a test with a one-second remap, staging an unrelated texture took 77 microseconds. A texture inside the affected range waited for the remap and retained the expected texels.
