@@ -2213,7 +2213,7 @@ impl<'a> Lower<'a> {
         let r = self.s.m.bin(c, Bin::Or, ex, m);
         // Round to nearest, ties to even (a carry into the exponent is
         // right, up to infinity).
-        let above = self.s.m.cmp(c, pred::UGT, rest, half);
+        let above = self.s.m.cmp(c, pred::IUGT, rest, half);
         let tie = self.s.m.cmp(c, pred::EQ, rest, half);
         let odd = self.s.m.bin(c, Bin::And, m, one);
         let z = k(self, 0);
