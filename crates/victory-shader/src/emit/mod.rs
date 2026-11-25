@@ -217,6 +217,7 @@ mod flow_tests;
 pub mod host;
 mod lower;
 mod rect;
+pub use lower::kept_wide;
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
 mod memory_tests;
@@ -455,11 +456,55 @@ pub fn translate_keeping(
         })?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
-    let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let code = native.patched_code();
+    let (p, st) = crate::range::build(&code, native.wave64, native.vgprs)?;
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit_keeping(&c, &native, &p, &st, &io, &res, options, kept)
+    lower::take_wide();
+    let made = emit_keeping(&c, &native, &p, &st, &io, &res, options, kept);
+    let Some(why) = lower::take_wide() else {
+        return made;
+    };
+    // A wave64 program whose wave operations sit where the halves of a
+    // wave cannot meet: again without the skips no lane sees, so that every
+    // lane runs that code under EXEC. Kept only if it then runs in halves.
+    if let Some(again) = without_idle_skips(&c, &native, &code, &p, &st, options, kept) {
+        return Ok(again);
+    }
+    lower::count_wide(why);
+    made
+}
+
+/// The translation of `p` without its [`lower::idle_skips`], if that one
+/// runs in 32-lane host waves ([`Options::narrow_waves`]).
+fn without_idle_skips(
+    c: &Container,
+    native: &NativeProgram,
+    code: &[u8],
+    p: &ir::Program,
+    st: &structure::Structured,
+    options: Options,
+    kept: Option<&Kept>,
+) -> Option<HostShader> {
+    const S_NOP: u32 = 0xBF80_0000;
+    let skips = lower::idle_skips(p, st);
+    if skips.is_empty() {
+        return None;
+    }
+    let mut code = code.to_vec();
+    for at in skips {
+        code[at..at + 4].copy_from_slice(&S_NOP.to_le_bytes());
+    }
+    let (p, st) = crate::range::build(&code, native.wave64, native.vgprs).ok()?;
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok()).ok()?;
+    let io = io::raise(&p, native).ok()?;
+    let st = st.ok()?;
+    let made = emit_keeping(c, native, &p, &st, &io, &res, options, kept);
+    match lower::take_wide() {
+        None => made.ok(),
+        Some(_) => None,
+    }
 }
 
 /// The vertex outputs a mesh translation keeps besides its system values:

@@ -163,6 +163,22 @@ pub(crate) fn under_wine() -> bool {
     false
 }
 
+/// Says, once, that a wave64 compute program has no exact form in 32-lane
+/// waves: it keeps `WaveSize(64)`, and a host of narrow waves does not run
+/// it (`victory_shader::emit::kept_wide` counts them).
+fn warn_kept_wide() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let (n, why) = victory_shader::emit::kept_wide();
+    if n > 0 {
+        ONCE.call_once(|| {
+            tracing::warn!(
+                why = why.unwrap_or_default(),
+                "a wave64 compute program keeps WaveSize(64): its dispatches do nothing on a host of 32-lane waves"
+            );
+        });
+    }
+}
+
 /// [`build`] for translations with host workarounds (atomic locks, bias
 /// as gradients, mesh stores last, mesh outputs packed, narrow waves): their own cache
 /// entries, one per combination.
@@ -236,7 +252,12 @@ pub fn host_shader_keeping(
         narrow_waves: narrow_waves(),
     };
     let translate = |c: &[u8]| {
-        victory_shader::emit::translate_keeping(c, options, kept).map_err(|e| e.to_string())
+        let r =
+            victory_shader::emit::translate_keeping(c, options, kept).map_err(|e| e.to_string());
+        if options.narrow_waves {
+            warn_kept_wide();
+        }
+        r
     };
     let build = if options.atomic_locks
         || options.bias_as_gradients
