@@ -104,8 +104,13 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
 /// 2^16 ran out seconds into the world (every world run on an RX 9070 XT,
-/// each a device removal shortly after; #59).
-const DYNAMIC: u32 = 1 << 18;
+/// each a device removal shortly after; #59). On the sister fork a world
+/// frame of some 7,000 draws held over 400,000 slots, and tables of 150
+/// slots no longer fit: the draws that needed them were dropped (the
+/// subsurface resolve, tree imposters). 2^19 with the title's 1,245,184
+/// slots stays below `victory_shader::emit::HEAP_VIEWS` (2^21), so the
+/// heap keeps its size; the host copies' slot pairs get what is left.
+const DYNAMIC: u32 = 1 << 19;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
