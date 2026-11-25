@@ -217,6 +217,7 @@ mod flow_tests;
 pub mod host;
 mod lower;
 mod rect;
+pub use lower::kept_wide;
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
 mod memory_tests;
