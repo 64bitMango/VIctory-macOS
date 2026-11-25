@@ -1798,6 +1798,8 @@ pub(crate) mod tests {
         };
         let base = copy.marks.expect("tracked memory gets mark bits") as usize;
         assert_eq!(copy.mark_entry(p as u64 + PAGE as u64 + 8), Some((base as u32 + 1, 8)));
+        // No submission takes the marks meanwhile.
+        let _one = host().map(|h| h.alone());
         copy.update(p, len);
         copy.writing(p, len, true);
         assert!(copy.before.lock().unwrap().0.is_empty(), "no snapshot");
@@ -1844,6 +1846,8 @@ pub(crate) mod tests {
             return; // no host GPU here
         };
         let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        // No submission takes the marks meanwhile.
+        let _one = host().map(|h| h.alone());
         copy.update(p, len);
         copy.writing(p, len, true);
         copy.write_host((p + 10) as u64, &[0xaa]);

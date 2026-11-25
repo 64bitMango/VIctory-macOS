@@ -4608,3 +4608,189 @@ mod withholding {
         }
     }
 }
+
+/// Submissions of the title's that may go unwaited (`crate::unwaited`).
+/// Other tests submit meanwhile, and any submission finishes the unwaited
+/// one: what is tested holds whoever finished it.
+#[cfg(test)]
+mod unwaited {
+    use super::{Host, HostList, finish_unwaited, host, signal_after_unwaited};
+    use crate::unwaited::{By, Waited};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A closed list that owes nothing after its run.
+    fn plain(host: &Host) -> Arc<HostList> {
+        let list = Arc::new(host.new_list().unwrap());
+        list.close();
+        list
+    }
+
+    /// The host fence value of the unwaited submission that holds `list`,
+    /// if it is still unwaited.
+    fn unwaited_value(host: &Host, list: &Arc<HostList>) -> Option<u64> {
+        let slot = host.unwaited.lock().unwrap_or_else(|e| e.into_inner());
+        slot.get().filter(|u| u.lists.iter().any(|l| Arc::ptr_eq(l, list))).map(|u| u.value)
+    }
+
+    fn completed(host: &Host) -> u64 {
+        // SAFETY: our fence.
+        unsafe { host.fence.GetCompletedValue() }
+    }
+
+    /// A buffer is not freed or reused with a copy pending: the unwaited
+    /// submission keeps its list, the queue's giving it back does not reset
+    /// it, and the copy lands.
+    #[test]
+    fn an_unwaited_submission_keeps_its_list_and_what_it_holds() {
+        let Some(host) = host() else { return };
+        let list = Arc::new(host.new_list().unwrap());
+        let (up, src) = list.upload(host, 256).unwrap();
+        let (back, dst) = list.readback(host, 256).unwrap();
+        // SAFETY: our mapped buffer; an open list and live buffers.
+        unsafe {
+            std::ptr::write_bytes(src, 0x5a, 256);
+            list.list.CopyBufferRegion(&back, 0, &up, 0, 256);
+        }
+        // Only the list holds the source now.
+        drop(up);
+        list.close();
+        let held = list.clone();
+        assert_eq!(host.execute_title(std::slice::from_ref(&list)), None, "it owes nothing: unwaited");
+        // As the queue does once the call returns.
+        crate::list::recycle(list);
+        {
+            let slot = host.unwaited.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.get().is_some_and(|u| u.lists.iter().any(|l| Arc::ptr_eq(l, &held))) {
+                assert_eq!(held.deferred().uploads.len(), 2, "not reset while it is unwaited");
+            }
+        }
+        drop(held);
+        finish_unwaited(By::Ours);
+        // SAFETY: the mapped read-back buffer, which `back` holds.
+        let copied = unsafe { std::slice::from_raw_parts(dst, 256) };
+        assert!(copied.iter().all(|&b| b == 0x5a), "the copy ran from a live buffer");
+        drop(back);
+    }
+
+    /// A Signal made behind an unwaited submission moves its fence only
+    /// once the host GPU has run that submission and it is finished.
+    #[test]
+    fn a_fence_moves_only_once_the_unwaited_work_before_it_is_finished() {
+        let Some(host) = host() else { return };
+        let mut fence = std::ptr::null();
+        crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence);
+        let list = plain(host);
+        assert_eq!(host.execute_title(std::slice::from_ref(&list)), None);
+        let value = unwaited_value(host, &list);
+        crate::fence::keep(fence);
+        if !signal_after_unwaited(fence as usize, 5) {
+            // Another test's submission finished it first: signalled at once.
+            assert!(unwaited_value(host, &list).is_none());
+            crate::fence::set(fence, 5);
+            crate::fence::let_go(fence);
+        }
+        if crate::fence::value(fence) == 5
+            && let Some(value) = value
+        {
+            assert!(completed(host) >= value, "signalled: the host GPU has run it");
+            assert!(unwaited_value(host, &list).is_none(), "signalled: it is finished");
+        }
+        finish_unwaited(By::FenceWait);
+        assert_eq!(crate::fence::value(fence), 5, "finished: its Signals are made");
+        assert!(value.is_none_or(|v| completed(host) >= v));
+        // Nothing is unwaited behind which to keep this one.
+        assert!(unwaited_value(host, &list).is_none());
+        crate::fence::let_go(fence);
+    }
+
+    /// Bottom-of-pipe writes and work for after the run (read-backs) are
+    /// there when the call returns: such submissions wait.
+    #[test]
+    fn what_the_title_reads_after_a_run_is_there_when_the_call_returns() {
+        let Some(host) = host() else { return };
+        let word = Box::leak(Box::new(0u64));
+        let list = Arc::new(host.new_list().unwrap());
+        list.defer_write(std::ptr::from_mut(word).cast(), crate::queue::Written::Value(7), 8);
+        list.close();
+        assert_eq!(host.execute_title(std::slice::from_ref(&list)), Some(Waited::BottomOfPipe));
+        assert_eq!(*word, 7);
+        let ran: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let list = Arc::new(host.new_list().unwrap());
+        list.defer_after(move || ran.store(true, Ordering::Release));
+        list.close();
+        assert_eq!(host.execute_title(std::slice::from_ref(&list)), Some(Waited::After));
+        assert!(ran.load(Ordering::Acquire));
+    }
+
+    /// Two submissions' shaders write one page: each is waited for, so what
+    /// they wrote reaches title memory in the order they were made; an
+    /// unwaited one between them changes nothing.
+    #[test]
+    fn shader_writes_of_two_submissions_go_back_in_order() {
+        use crate::watch::PAGE;
+        let Some(host) = host() else { return };
+        let p = crate::watch::tests::pool(1);
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        // SAFETY: bytes of our pool.
+        let title = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        // (bytes written at +0 and +8)
+        for (first, second) in [(0x22, 0x23), (0x33, 0x34)] {
+            let list = Arc::new(host.new_list().unwrap());
+            copy.refresh(&list, p as u64, 32);
+            copy.gpu_writes(&list, p as u64, 32, false);
+            let c = copy.clone();
+            // The shader's writes, after the step that keeps the range's bytes.
+            list.defer_host(move || {
+                c.write_host(p as u64, &[first]);
+                c.write_host(p as u64 + 8, &[second]);
+            });
+            list.close();
+            assert_eq!(host.execute_title(std::slice::from_ref(&list)), Some(Waited::ShaderWrites));
+            assert_eq!((title(0), title(8)), (first, second), "back when the call returns");
+            assert_eq!(host.execute_title(std::slice::from_ref(&plain(host))), None);
+        }
+        finish_unwaited(By::Ours);
+        assert_eq!((title(0), title(8)), (0x33, 0x34));
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// The next submission, the title's or ours, finishes the unwaited one
+    /// before it runs; the title's has its buffer copies brought up to
+    /// date meanwhile and again in its steps' order, with the same result.
+    #[test]
+    fn the_next_submission_finishes_the_unwaited_one_first() {
+        use crate::watch::PAGE;
+        let Some(host) = host() else { return };
+        let p = crate::watch::tests::pool(1);
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        for ours in [false, true] {
+            let first = plain(host);
+            assert_eq!(host.execute_title(std::slice::from_ref(&first)), None);
+            let value = unwaited_value(host, &first);
+            // The title writes what the next submission reads.
+            let byte = if ours { 0x77 } else { 0x66 };
+            // SAFETY: a byte of our pool.
+            unsafe { ((p + 16) as *mut u8).write_volatile(byte) };
+            let next = Arc::new(host.new_list().unwrap());
+            copy.refresh(&next, p as u64, PAGE as u64);
+            next.close();
+            if ours {
+                host.execute(&[&next]);
+            } else {
+                host.execute_title(std::slice::from_ref(&next));
+            }
+            assert!(unwaited_value(host, &first).is_none(), "finished");
+            assert!(value.is_none_or(|v| completed(host) >= v), "and run");
+            let _alone = host.alone();
+            assert_eq!(copy.read_host(p as u64 + 16, 1)[0] & 0xff, u32::from(byte));
+        }
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+}

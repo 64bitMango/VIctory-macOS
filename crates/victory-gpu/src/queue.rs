@@ -1078,6 +1078,8 @@ mod tests {
         );
         let signal = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q));
         assert_eq!(signal(q, fence, 7), S_OK);
+        // Or behind another test's unwaited submission (`crate::unwaited`).
+        crate::unwaited::finish(crate::unwaited::By::Ours);
         assert_eq!(
             slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence),
             7
