@@ -97,20 +97,25 @@ enum Stop {
 
 #[cfg(any(test, windows))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_with_layout(parts, false, false)
+    lower_with_layout(parts, false, false, false)
 }
 
 /// [`lower`], with the trial interface layout and the mesh store order
-/// [`super::Options`] chooses.
+/// [`super::Options`] chooses; `barycentrics`: the barycentric input VGPRs
+/// read as values are `SV_Barycentrics` (else reading one stops the
+/// program with [`BARYCENTRICS_READ`]; only a program that cannot do
+/// without them is made again with them, `super::emit_with`).
 pub(crate) fn lower_with_layout(
     parts: &Parts,
     compact: bool,
     mesh_stores_last: bool,
+    barycentrics: bool,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
         let mut l = Lower::new(parts, &bad);
         l.mesh_stores_last = mesh_stores_last;
+        l.barycentrics = barycentrics;
         match l.run(compact) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
@@ -127,6 +132,9 @@ pub(crate) fn lower_with_layout(
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
+/// Why a program that reads the barycentric input VGPRs as values stops
+/// (before it runs again with `SV_Barycentrics`).
+pub(crate) const BARYCENTRICS_READ: Why = "barycentrics read directly";
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
 
@@ -277,6 +285,9 @@ struct Lower<'a> {
     /// Mesh: an export's output stores all come after the values they
     /// store ([`Options::mesh_stores_last`](super::Options)).
     mesh_stores_last: bool,
+    /// Barycentric input VGPRs read as values are `SV_Barycentrics`
+    /// ([`lower_with_layout`]); else reading one stops the program.
+    barycentrics: bool,
     /// How lane masks become data.
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
@@ -709,6 +720,7 @@ impl<'a> Lower<'a> {
             no_barrier,
             half_outputs: half_outputs(&x.native.io),
             mesh_stores_last: false,
+            barycentrics: false,
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
@@ -1447,6 +1459,14 @@ impl<'a> Lower<'a> {
         for &(reg, v) in &self.x.p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
+                // Most programs only interpolate with them: loaded on first
+                // use as a value (`get`).
+                Reg::V(_)
+                    if self.barycentrics
+                        && matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) =>
+                {
+                    continue;
+                }
                 Reg::S(n) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
                     // Above the SGPRs the hardware initializes, a register
@@ -1496,7 +1516,10 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+            Input::Barycentric { .. } if !self.barycentrics => {
+                return Val::Missing(BARYCENTRICS_READ);
+            }
+            Input::Barycentric { kind, index } => return self.barycentric(kind, index),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -1661,7 +1684,88 @@ impl<'a> Lower<'a> {
             self.vals.insert(v, val);
             return Ok(val);
         }
+        if let Some(loaded) = self.lazy_barycentric(v) {
+            loaded?;
+            return Ok(self.vals[&v]);
+        }
         Err("a value defined after its use")
+    }
+
+    /// Loads `v` if it is a barycentric input VGPR not loaded yet (see
+    /// `inputs`): `None` if it is not one.
+    fn lazy_barycentric(&mut self, v: Value) -> Option<Result<(), Why>> {
+        if !self.barycentrics {
+            return None;
+        }
+        let (kind, index) = self.x.io.inputs.iter().find_map(|&(w, i)| match i {
+            Input::Barycentric { kind, index } if w == v => Some((kind, index)),
+            _ => None,
+        })?;
+        let val = self.barycentric(kind, index);
+        self.vals.insert(v, val);
+        Some(match val {
+            Val::Missing(w) => Err(w),
+            _ => Ok(()),
+        })
+    }
+
+    /// Barycentric `index` (0 i, 1 j) of `kind` as a value: a channel of
+    /// `SV_Barycentrics` declared with the same interpolation mode.
+    ///
+    /// GFX10 interpolates P0 + i (P1 - P0) + j (P2 - P0), so i and j are
+    /// the weights of vertices 1 and 2. The host's weights (x, y, z) are
+    /// those of vertices 0, 1 and 2, vertex 0 being the provoking vertex,
+    /// which is the console's P0 (`v_interp_mov` P0 is lowered to a flat
+    /// input): i is y and j is z.
+    /// shortcut: triangles only; on lines and points the console's i and j
+    /// are not checked against the host's weights.
+    fn barycentric(&mut self, kind: Barycentric, index: u8) -> Val {
+        let Some(mode) = interp_mode(kind) else {
+            return Val::Missing("pull-model barycentrics");
+        };
+        if index > 1 {
+            return Val::Missing("pull-model barycentrics");
+        }
+        // One element per interpolation mode (the console's own, if its
+        // signature declares one): DXIL allows two.
+        let bary = |e: &SigElement| e.kind == 28;
+        let id = match self
+            .s
+            .inputs
+            .iter()
+            .position(|e| bary(e) && (e.interp == mode || e.usage == 0))
+        {
+            Some(id) => id,
+            None => {
+                let index = self.s.inputs.iter().filter(|e| bary(e)).count() as u32;
+                if index >= 2 {
+                    return Val::Missing("barycentrics of a third interpolation mode");
+                }
+                // A system value the validator wants unpacked (packing
+                // location -1), like other non-packed system values.
+                self.s.inputs.push(SigElement {
+                    name: "SV_Barycentrics".into(),
+                    index,
+                    kind: 28,
+                    comp: 9,
+                    interp: mode,
+                    row: None,
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        let e = &mut self.s.inputs[id];
+        if e.col != 0 || e.cols < 3 {
+            return Val::Missing("a console barycentrics element without i and j");
+        }
+        e.row = None;
+        e.interp = mode;
+        self.s.flags |= flags::BARYCENTRICS;
+        self.load_any_input(id, index + 1)
     }
 
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
@@ -7983,15 +8087,7 @@ impl<'a> Lower<'a> {
                 ..
             } => (
                 attribute,
-                match barycentric {
-                    Barycentric::PerspectiveCenter => 2,
-                    Barycentric::PerspectiveCentroid => 3,
-                    Barycentric::PerspectiveSample => 6,
-                    Barycentric::LinearCenter => 4,
-                    Barycentric::LinearCentroid => 5,
-                    Barycentric::LinearSample => 7,
-                    Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
-                },
+                interp_mode(*barycentric).ok_or("pull-model interpolation")?,
             ),
             // P0, the provoking vertex: a flat (nointerpolation) input.
             Interp::Vertex {
@@ -10761,6 +10857,14 @@ impl<'a> Lower<'a> {
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 let read = live.contains(&(phi.value, n));
+                // A barycentric input VGPR a lane can read here (not one
+                // only joined in a former use, which any value will do for).
+                if read
+                    && !self.vals.contains_key(&arg)
+                    && !(self.never_taken(q, b) || self.dead_on_edge(b, n, phi.reg))
+                {
+                    let _ = self.lazy_barycentric(arg);
+                }
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     // No lane from this edge reads it, or no lane comes
@@ -10838,6 +10942,20 @@ impl<'a> Lower<'a> {
         }
         Ok(())
     }
+}
+
+/// The DXIL interpolation mode of a kind of barycentrics (none for the
+/// pull model).
+fn interp_mode(kind: Barycentric) -> Option<u8> {
+    Some(match kind {
+        Barycentric::PerspectiveCenter => 2,
+        Barycentric::PerspectiveCentroid => 3,
+        Barycentric::PerspectiveSample => 6,
+        Barycentric::LinearCenter => 4,
+        Barycentric::LinearCentroid => 5,
+        Barycentric::LinearSample => 7,
+        Barycentric::PerspectivePullModel => return None,
+    })
 }
 
 #[cfg(test)]
