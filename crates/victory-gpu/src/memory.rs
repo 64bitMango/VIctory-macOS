@@ -40,13 +40,13 @@
 //! memory module of the layer knows and this one does not ask yet.
 //!
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
-//! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
-//! most). Every dispatch of such a shader brings all numbered copies up to
+//! each view heap grows its descriptor run as more copies are needed.
+//! Every dispatch of such a shader brings its addressable copies up to
 //! date and, if it can store, declares all of them written (the bytes are
 //! compared on the CPU afterwards, as for any unordered access view): a
 //! dirty-page mask written by the shader would bound both.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -60,9 +60,6 @@ use crate::shadow::Shadow;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod ray_probe;
 
-/// Copies that can be numbered (the run of heap slots is one longer). A
-/// listed frame of the opening cutscene names about 50 windows.
-pub(crate) const COPIES: u32 = 1023;
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
@@ -105,6 +102,9 @@ struct Memory {
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
+    /// Shadow IDs are unique for the lifetime of a backing, including after
+    /// the guest reuses its address.
+    numbers: HashMap<u64, usize>,
     pages: BTreeMap<u64, usize>,
     ranges: Vec<Vec<(u64, u64)>>,
     recalculate: BTreeSet<usize>,
@@ -130,6 +130,9 @@ pub(crate) struct Ready {
     pub(crate) faults: u64,
     /// The view heap slot of the null view; copy `n`'s view is `n` further.
     pub(crate) base: u32,
+    /// Last numbered copy this draw prepared. Other recording threads can
+    /// subsequently add mappings to the same directory.
+    pub(crate) count: u32,
 }
 
 impl Memory {
@@ -144,6 +147,7 @@ impl Memory {
             directory: Self::table(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: Self::table(u64::from(fault_dwords), "faults")?,
             copies: Vec::new(),
+            numbers: HashMap::new(),
             pages: BTreeMap::new(),
             ranges: Vec::new(),
             recalculate: BTreeSet::new(),
@@ -184,14 +188,12 @@ impl Memory {
     /// Assign stable slots. A previously recorded list may still reference any
     /// old slot, even after the corresponding guest address has been reused.
     fn number(&mut self, shadow: &Arc<Shadow>) -> Option<usize> {
-        if let Some(index) = self.copies.iter().position(|copy| Arc::ptr_eq(copy, shadow)) {
+        if let Some(&index) = self.numbers.get(&shadow.id()) {
             return Some(index);
         }
-        if self.copies.len() == COPIES as usize {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros"));
-            return None;
-        }
+        // The directory stores a one-based u32 slot; zero is the null view.
+        u32::try_from(self.copies.len()).ok()?.checked_add(1)?;
+        self.numbers.insert(shadow.id(), self.copies.len());
         self.copies.push(shadow.clone());
         self.ranges.push(Vec::new());
         Some(self.copies.len() - 1)
@@ -433,11 +435,11 @@ pub(crate) fn ready(
     }
     m.prepare_addresses(heap, addresses, constants);
     m.update_ranges();
-    let base = heap.raw_page_views(&m.copies)?;
+    let (base, count) = heap.raw_page_views(&m.copies)?;
     // A list may submit before the other recording list that numbered a
     // copy. Each must prepare all copies visible at its own bind.
     const READ: usize = usize::MAX - 0x6d;
-    let (reads, written) = list.raw_memory_ranges(&m.directory.0, m.coverage_revision, m.copies.len(), writes);
+    let (reads, written) = list.raw_memory_ranges(&m.directory.0, m.coverage_revision, count as usize, writes);
     for i in reads {
         for &(start, len) in &m.ranges[i] {
             m.copies[i].refresh(list, start, len);
@@ -455,6 +457,7 @@ pub(crate) fn ready(
         directory: m.directory.2,
         faults: m.faults.2,
         base,
+        count,
     })
 }
 

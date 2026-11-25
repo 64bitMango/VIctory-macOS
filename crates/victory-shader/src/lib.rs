@@ -91,7 +91,9 @@ mod source_tests {
     // host.rs consumes finished DXIL to create or run host pipelines. The
     // remaining modules are only compiled by the Windows execution tests.
     const OUTSIDE_TRANSLATION: &[&str] = &[
+        "emit/cube_lod_tests.rs",
         "emit/diff_tests.rs",
+        "emit/helper_lane_tests.rs",
         "emit/host.rs",
         "emit/intersect_tests.rs",
         "emit/valu_tests.rs",
