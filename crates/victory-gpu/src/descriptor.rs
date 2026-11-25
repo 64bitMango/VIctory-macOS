@@ -386,6 +386,8 @@ pub(crate) fn make_read(slots: &[u32]) {
     };
     #[cfg(test)]
     tests::while_making(slots);
+    // Counted with the submitting thread's work on slots (diagnostics).
+    let _syncing = crate::contend::syncing();
     // Several at a time (each a committed texture; hundreds in a new shot,
     // 7 % of the submitting thread when made one by one, run evict5).
     crate::texture::in_parallel(placed.len(), |i| {

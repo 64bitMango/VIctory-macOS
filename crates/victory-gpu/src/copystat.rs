@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Counters since the last line.
+#[derive(Clone, Copy)]
 pub(crate) enum C {
     Submissions,
     Copies,
@@ -140,10 +141,8 @@ pub(crate) enum C {
     /// for the views table; for what a heap's slots view; for the copies'
     /// registries.
     HeapsContended,
-    SlotWaitUs,
-    SlotContended,
-    SyncSlotWaitUs,
-    SyncSlotContended,
+    KeptWaitUs,
+    KeptContended,
     ViewsWaitUs,
     ViewsContended,
     ViewedWaitUs,
@@ -157,6 +156,26 @@ pub(crate) enum C {
     /// ones.
     RecordFound,
     RecordNew,
+    /// A heap's slot locks (`crate::descriptor::host::HostHeap::made`), by
+    /// who asked (title threads writing views, draws reading tables, the
+    /// submitting thread): slots found made without a lock; locks taken;
+    /// time waited and times one was found taken; and the time waited by
+    /// who held it.
+    SlotQuickTitle,
+    SlotQuickDraw,
+    SlotQuickSync,
+    SlotTakesTitle,
+    SlotTakesDraw,
+    SlotTakesSync,
+    SlotWaitTitleUs,
+    SlotWaitDrawUs,
+    SlotWaitSyncUs,
+    SlotContendedTitle,
+    SlotContendedDraw,
+    SlotContendedSync,
+    SlotBehindTitleUs,
+    SlotBehindDrawUs,
+    SlotBehindSyncUs,
     /// Not a counter: how many there are.
     Count,
 }
@@ -386,14 +405,12 @@ pub(crate) fn log(frames: f64) {
         c[C::SyncLeft as usize],
     );
     tracing::info!(
-        "  lock waits per frame (time, times a thread found the lock taken): title threads writing views for the heaps' lock {:.1} ms, {:.0} (held alone by passes over the slots {:.1} ms); for a heap's slot lock {:.1} ms, {:.0} (heap syncs {:.1} ms, {:.0}); for the views table {:.1} ms, {:.0} ({:.0} views recorded were held already, {:.0} new); for what a heap's slots view {:.1} ms, {:.0}; for the copies' registries {:.1} ms, {:.0}",
+        "  lock waits per frame (time, times a thread found the lock taken): title threads writing views for the heaps' lock {:.1} ms, {:.0} (held alone by passes over the slots {:.1} ms); for what a heap's slots hold {:.1} ms, {:.0}; for the views table {:.1} ms, {:.0} ({:.0} views recorded were held already, {:.0} new); for what a heap's slots view {:.1} ms, {:.0}; for the copies' registries {:.1} ms, {:.0}",
         ms(c[C::MirrorWaitUs as usize]),
         c[C::HeapsContended as usize],
         ms(c[C::HeapsAloneUs as usize]),
-        ms(c[C::SlotWaitUs as usize]),
-        c[C::SlotContended as usize],
-        ms(c[C::SyncSlotWaitUs as usize]),
-        c[C::SyncSlotContended as usize],
+        ms(c[C::KeptWaitUs as usize]),
+        c[C::KeptContended as usize],
         ms(c[C::ViewsWaitUs as usize]),
         c[C::ViewsContended as usize],
         c[C::RecordFound as usize],
@@ -402,6 +419,19 @@ pub(crate) fn log(frames: f64) {
         c[C::ViewedContended as usize],
         ms(c[C::CopiesWaitUs as usize]),
         c[C::CopiesContended as usize],
+    );
+    let by = |first: C| [0, 1, 2].map(|k| c[first as usize + k]);
+    let ([quick_t, quick_d, quick_s], [takes_t, takes_d, takes_s]) = (by(C::SlotQuickTitle), by(C::SlotTakesTitle));
+    let ([wait_t, wait_d, wait_s], [times_t, times_d, times_s]) = (by(C::SlotWaitTitleUs), by(C::SlotContendedTitle));
+    let [behind_t, behind_d, behind_s] = by(C::SlotBehindTitleUs);
+    tracing::info!(
+        "  slot locks per frame (title threads writing views / draws reading tables / the submitting thread): slots found made without a lock {quick_t:.0} / {quick_d:.0} / {quick_s:.0}; locks taken {takes_t:.0} / {takes_d:.0} / {takes_s:.0}; waited {:.1} / {:.1} / {:.1} ms, found taken {times_t:.0} / {times_d:.0} / {times_s:.0} times; of the waiting {:.1} ms behind title threads, {:.1} behind draws, {:.1} behind the submitting thread",
+        ms(wait_t),
+        ms(wait_d),
+        ms(wait_s),
+        ms(behind_t),
+        ms(behind_d),
+        ms(behind_s),
     );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
