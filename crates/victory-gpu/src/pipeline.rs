@@ -68,6 +68,9 @@ pub(crate) struct Shader {
     /// so only tests keep it.
     #[cfg(any(windows, test))]
     container: Mutex<Vec<u8>>,
+    /// Its result gets the least indirect light ([`crate::ambient`]).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -100,6 +103,10 @@ impl Shader {
             size: bytes.len(),
             #[cfg(any(windows, test))]
             container: Mutex::new(bytes.to_vec()),
+            #[cfg(windows)]
+            resolves_light: bytes
+                .windows(crate::ambient::PROGRAM.len())
+                .any(|w| w == crate::ambient::PROGRAM),
             #[cfg(windows)]
             translated: OnceLock::new(),
         }
