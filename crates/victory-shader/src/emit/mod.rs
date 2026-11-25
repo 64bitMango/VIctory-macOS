@@ -408,7 +408,11 @@ pub struct Options {
     /// fails such pipelines ("Total mesh size (N) exceeds the maximum mesh
     /// size allowed (32768)"); the order of the elements is not what links
     /// the stages, so the pixel shaders stay as they are. Meshes within
-    /// the limit are made as without it.
+    /// the limit are made as without it. A mesh over the limit even so
+    /// leaves out the clip and cull distances at the end of the console's
+    /// distance vectors that it gives +0.0 at every vertex
+    /// (`container::without_idle_distances`): they clip nothing, and
+    /// Metal counts each twice.
     pub mesh_pack_outputs: bool,
     /// The host runs wave64 programs in 32-lane waves whatever `WaveSize`
     /// says (D3DMetal): a compute group that is one console wave of more
@@ -431,7 +435,10 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
 /// [`translate_with`]; a mesh program with `kept` leaves out the vertex
 /// outputs it does not name (system values stay): a pipeline's pixel shader
 /// reads no others ([`pixel_reads`]). For the meshes Metal counts too
-/// much output of even packed ([`mesh_over_metal_limit`]).
+/// much output of even packed ([`mesh_over_metal_limit`]). A `kept` with
+/// channels ([`pixel_reads_channels`]) also narrows the outputs it names to
+/// those channels, and so the inputs of a pixel program: the two link when
+/// both are made with it ([`stages_link`]).
 pub fn translate_keeping(
     container: &[u8],
     options: Options,
@@ -508,37 +515,88 @@ fn without_idle_skips(
 }
 
 /// The vertex outputs a mesh translation keeps besides its system values:
-/// the semantics (name in upper case, index) a pixel shader reads, sorted.
+/// the semantics (name in upper case, index) a pixel shader reads, sorted,
+/// each with the channels of the element it reads (bit 0 the element's
+/// first), or 0 for the whole element.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct Kept(Vec<(String, u32)>);
+pub struct Kept(Vec<(String, u32, u8)>);
 
 impl Kept {
     pub fn new(semantics: impl IntoIterator<Item = (String, u32)>) -> Kept {
-        let mut v: Vec<(String, u32)> = semantics
+        Kept::with_channels(semantics.into_iter().map(|(n, i)| (n, i, 0)))
+    }
+
+    /// [`Kept::new`] of (name, index, channels read).
+    pub fn with_channels(semantics: impl IntoIterator<Item = (String, u32, u8)>) -> Kept {
+        let mut v: Vec<(String, u32, u8)> = semantics
             .into_iter()
-            .map(|(n, i)| (n.to_ascii_uppercase(), i))
+            .map(|(n, i, channels)| (n.to_ascii_uppercase(), i, channels))
             .collect();
         v.sort_unstable();
-        v.dedup();
+        // One entry per semantic: the whole element (0, sorted first) if
+        // any names it so, else every channel named.
+        v.dedup_by(|b, a| {
+            let same = (&a.0, a.1) == (&b.0, b.1);
+            if same && a.2 != 0 {
+                a.2 |= b.2;
+            }
+            same
+        });
         Kept(v)
     }
 
+    /// The channels kept of `e`, if it is named: 0 for all of them.
+    fn channels(&self, e: &container::SigElement) -> Option<u8> {
+        let name = e.name.to_ascii_uppercase();
+        self.0
+            .binary_search_by(|k| (k.0.as_str(), k.1).cmp(&(name.as_str(), e.index)))
+            .ok()
+            .map(|i| self.0[i].2)
+    }
+
     fn keeps(&self, e: &container::SigElement) -> bool {
-        e.kind != 0
-            || self
-                .0
-                .binary_search(&(e.name.to_ascii_uppercase(), e.index))
-                .is_ok()
+        e.kind != 0 || self.channels(e).is_some()
+    }
+
+    /// The channels from the first to the last kept of `e`, as (first,
+    /// count), when those are fewer than it has. Elements of 16-bit values
+    /// stay whole: the console packs them by their widths (`lower`).
+    fn narrowed(&self, e: &container::SigElement) -> Option<(u8, u8)> {
+        let whole = |c: &u8| *c != 0 && e.kind == 0 && !e.half;
+        let channels = self.channels(e).filter(whole)?;
+        let first = channels.trailing_zeros() as u8;
+        let count = 8 - channels.leading_zeros() as u8 - first;
+        (first + count <= e.cols && count < e.cols).then_some((first, count))
+    }
+
+    /// Narrows the elements named with channels to those ([`Kept::narrowed`]).
+    fn narrow(&self, elements: &mut [container::SigElement]) {
+        for e in elements {
+            if let Some((first, count)) = self.narrowed(e) {
+                e.col += first;
+                e.cols = count;
+            }
+        }
     }
 
     /// One line per semantic, for cache keys.
     pub fn describe(&self) -> String {
-        self.0.iter().map(|(n, i)| format!("{n}{i}\n")).collect()
+        let line = |(n, i, channels): &(String, u32, u8)| match channels {
+            0 => format!("{n}{i}\n"),
+            c => format!("{n}{i} {c:x}\n"),
+        };
+        self.0.iter().map(line).collect()
     }
 }
 
 /// The input semantics a translated pixel shader reads (its `ISG1`).
 pub fn pixel_reads(dxil: &[u8]) -> Result<Kept, ShaderError> {
+    let read = pixel_reads_channels(dxil)?.0;
+    Ok(Kept::new(read.into_iter().map(|(n, i, _)| (n, i))))
+}
+
+/// [`pixel_reads`] with the channels read of each.
+pub fn pixel_reads_channels(dxil: &[u8]) -> Result<Kept, ShaderError> {
     let c = Container::parse(dxil)?;
     let part = c
         .part(FourCC::ISG1)
@@ -548,11 +606,11 @@ pub fn pixel_reads(dxil: &[u8]) -> Result<Kept, ShaderError> {
     let elements = signature(part)?;
     let mut out = Vec::new();
     for (i, e) in elements.into_iter().enumerate() {
-        if read(i).is_some_and(|&rw| rw != 0) {
-            out.push((e.name, e.index));
+        if let Some(&rw) = read(i).filter(|&&rw| rw != 0) {
+            out.push((e.name, e.index, rw >> e.col));
         }
     }
-    Ok(Kept::new(out))
+    Ok(Kept::with_channels(out))
 }
 
 /// A translated mesh shader's vertex and primitive outputs and its maximum
@@ -588,9 +646,39 @@ pub fn mesh_over_metal_limit(dxil: &[u8]) -> bool {
 }
 
 /// Whether a translated mesh shader has vertex outputs (other than system
-/// values) that `kept` does not name.
+/// values) that `kept` does not name, or names with fewer channels than
+/// they have.
 pub fn mesh_outputs_unread(dxil: &[u8], kept: &Kept) -> bool {
-    mesh_outputs(dxil).is_some_and(|(outputs, ..)| outputs.iter().any(|e| !kept.keeps(e)))
+    let unread = |e: &container::SigElement| !kept.keeps(e) || kept.narrowed(e).is_some();
+    mesh_outputs(dxil).is_some_and(|(outputs, ..)| outputs.iter().any(unread))
+}
+
+/// Whether every input a translated pixel shader reads (system values
+/// aside) is an output of the translated mesh shader in the same row and
+/// channels: so for a pair made with one [`Kept`] of channels, which
+/// narrows both ([`translate_keeping`]).
+pub fn stages_link(mesh: &[u8], pixel: &[u8]) -> bool {
+    let sig = |dxil, fourcc| -> Option<(Vec<container::SigElement>, Vec<u8>)> {
+        let c = Container::parse(dxil).ok()?;
+        let part = c.part(fourcc)?.data;
+        let base = crate::dxbc::u32_at(part, 4).ok()? as usize;
+        let elements = signature(part).ok()?;
+        let rw = (0..elements.len()).map(|i| part.get(base + 32 * i + 25).copied());
+        let rw = rw.collect::<Option<_>>()?;
+        Some((elements, rw))
+    };
+    let (Some((outputs, _)), Some((inputs, read))) =
+        (sig(mesh, FourCC::OSG1), sig(pixel, FourCC::ISG1))
+    else {
+        return false;
+    };
+    let same = |a: &container::SigElement, b: &container::SigElement| {
+        a.name.eq_ignore_ascii_case(&b.name)
+            && (a.index, a.row, a.col, a.cols) == (b.index, b.row, b.col, b.cols)
+    };
+    let read = inputs.iter().zip(read);
+    let mut read = read.filter(|(e, rw)| e.kind == 0 && *rw != 0);
+    read.all(|(e, _)| outputs.iter().any(|o| o.kind == 0 && same(o, e)))
 }
 
 /// Emits a program whose earlier stages already ran, without write marks.
@@ -681,14 +769,27 @@ fn emit_keeping(
             }
             keep
         });
+        kept.narrow(&mut outputs);
     }
-    if let (true, crate::native::StageIo::Ms(ms)) = (options.mesh_pack_outputs, &native.io) {
-        let bytes =
-            container::metal_mesh_bytes(&outputs, &prims, ms.max_vertices, ms.max_primitives);
-        if bytes > container::METAL_MESH_BYTES {
-            let order = container::metal_packed_order(&outputs);
-            outputs = order.into_iter().map(|i| outputs[i].clone()).collect();
+    // A pixel program's inputs, narrowed as the mesh outputs they read.
+    if let (Some(kept), true) = (kept, pixel) {
+        kept.narrow(&mut inputs);
+    }
+    // Mesh, packing: whether Metal counts too much of `outputs`, and
+    // their order for the least of it.
+    let over = |outputs: &[container::SigElement]| match &native.io {
+        crate::native::StageIo::Ms(ms) if options.mesh_pack_outputs => {
+            container::metal_mesh_bytes(outputs, &prims, ms.max_vertices, ms.max_primitives)
+                > container::METAL_MESH_BYTES
         }
+        _ => false,
+    };
+    let packed = |outputs: Vec<container::SigElement>| -> Vec<container::SigElement> {
+        let order = container::metal_packed_order(&outputs);
+        order.into_iter().map(|i| outputs[i].clone()).collect()
+    };
+    if over(&outputs) {
+        outputs = packed(outputs);
     }
     // A mesh group's id arrives multiplied by max(threads, vertices,
     // primitives) (the code divides by that); the thread count is in PSV0
@@ -709,7 +810,7 @@ fn emit_keeping(
     };
     // The structure that kills discarded lanes, made when first needed.
     let killing = std::cell::OnceCell::<(structure::Structured, resource::Resources)>::new();
-    let parts = |st, res| lower::Parts {
+    let parts = |st, res, outputs: &[container::SigElement]| lower::Parts {
         native,
         psv: c.part(FourCC::PSV0).map(|p| p.data),
         p,
@@ -717,7 +818,7 @@ fn emit_keeping(
         io,
         res,
         inputs: inputs.clone(),
-        outputs: outputs.clone(),
+        outputs: outputs.to_vec(),
         prims: prims.clone(),
         dropped_rows: dropped_rows.clone(),
         mesh_stride,
@@ -729,43 +830,54 @@ fn emit_keeping(
     // Most programs only interpolate with the barycentric VGPRs, or join
     // them in a former use no lane reads; one that cannot do without them
     // as values is made again with `SV_Barycentrics`.
-    let mut made = None;
-    for barycentrics in [false, true] {
-        let l = match lower::lower_with_layout(
-            &parts(st, res),
-            options.compact_mesh_interface,
-            options.mesh_stores_last,
-            barycentrics,
-        ) {
-            // Discarded lanes kept on as helpers can read what no surviving
-            // lane does (a register only killed lanes skipped writing); such
-            // a program kills them as the console does (`structure::killing`).
-            Err(_) if !st.discards.is_empty() => {
-                if killing.get().is_none() {
-                    let st = structure::killing(p)?;
-                    let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-                    let _ = killing.set((st, res));
+    let lowered = |outputs: &[container::SigElement]| -> Result<lower::Lowered, ShaderError> {
+        let mut made = None;
+        for barycentrics in [false, true] {
+            let l = match lower::lower_with_layout(
+                &parts(st, res, outputs),
+                options.compact_mesh_interface,
+                options.mesh_stores_last,
+                barycentrics,
+            ) {
+                // Discarded lanes kept on as helpers can read what no surviving
+                // lane does (a register only killed lanes skipped writing); such
+                // a program kills them as the console does (`structure::killing`).
+                Err(_) if !st.discards.is_empty() => {
+                    if killing.get().is_none() {
+                        let st = structure::killing(p)?;
+                        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+                        let _ = killing.set((st, res));
+                    }
+                    let (st, res) = killing.get().expect("made above");
+                    lower::lower_with_layout(
+                        &parts(st, res, outputs),
+                        options.compact_mesh_interface,
+                        options.mesh_stores_last,
+                        barycentrics,
+                    )
                 }
-                let (st, res) = killing.get().expect("made above");
-                lower::lower_with_layout(
-                    &parts(st, res),
-                    options.compact_mesh_interface,
-                    options.mesh_stores_last,
-                    barycentrics,
-                )
-            }
-            l => l,
-        };
-        match l {
-            Err(ShaderError::Unsupported { what, .. })
-                if what == lower::BARYCENTRICS_READ && !barycentrics => {}
-            l => {
-                made = Some(l?);
-                break;
+                l => l,
+            };
+            match l {
+                Err(ShaderError::Unsupported { what, .. })
+                    if what == lower::BARYCENTRICS_READ && !barycentrics => {}
+                l => {
+                    made = Some(l?);
+                    break;
+                }
             }
         }
+        Ok(made.expect("the second pass returns"))
+    };
+    let mut l = lowered(&outputs)?;
+    // Still over Metal's limit packed: again without the distances that
+    // clip nothing.
+    if over(&outputs)
+        && let Some(fewer) = container::without_idle_distances(&outputs, &l.idle_distances)
+    {
+        outputs = packed(fewer);
+        l = lowered(&outputs)?;
     }
-    let l = made.expect("the second pass returns");
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,
@@ -1898,6 +2010,18 @@ mod tests {
         isg1: &[u8],
         osg1: &[u8],
     ) -> Result<HostShader, ShaderError> {
+        emit_pixel_keeping(words, inputs, input_addr, isg1, osg1, None)
+    }
+
+    /// [`emit_pixel`], its inputs narrowed to the channels `kept` names.
+    fn emit_pixel_keeping(
+        words: &[u32],
+        inputs: Vec<crate::native::PsInput>,
+        input_addr: u32,
+        isg1: &[u8],
+        osg1: &[u8],
+        kept: Option<&Kept>,
+    ) -> Result<HostShader, ShaderError> {
         let native = super::NativeProgram {
             stage: super::HwStage::Ps,
             wave64: false,
@@ -1918,7 +2042,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native)?;
-        let out = emit(&c, &native, &p, &st, &io, &res)?;
+        let out = emit_keeping(&c, &native, &p, &st, &io, &res, Options::default(), kept)?;
         // dxil.dll, where there is one, checks the module.
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
@@ -2008,6 +2132,19 @@ mod tests {
         options: Options,
         kept: Option<&Kept>,
     ) -> Result<HostShader, ShaderError> {
+        param_mesh_of(&param_elements(rows), rows, None, options, kept)
+    }
+
+    /// [`param_mesh`] with `elements` for its output signature; with
+    /// `distances`, it also exports `pos1` from those four registers (v7
+    /// holds 1.0, v8 is zeroed for it).
+    fn param_mesh_of(
+        elements: &[SigElement],
+        rows: u32,
+        distances: Option<u32>,
+        options: Options,
+        kept: Option<&Kept>,
+    ) -> Result<HostShader, ShaderError> {
         let mut words = vec![
             0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
             0x0001_00C1,
@@ -2029,6 +2166,13 @@ mod tests {
             }
             // exp param(r - 1) v10, v11, v12, v13
             words.extend([0xF800_020F + ((r - 1) << 4), 0x0D0C_0B0A]);
+        }
+        if let Some(registers) = distances {
+            words.extend([
+                0x7E10_0280, // v_mov_b32 v8, 0
+                0xF800_00DF, // exp pos1 from `registers`
+                registers,
+            ]);
         }
         words.extend([
             0x7E12_02FF, // v_mov_b32 v9, TRIANGLE
@@ -2064,7 +2208,7 @@ mod tests {
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
-        let osg1 = container::signature(&param_elements(rows), false);
+        let osg1 = container::signature(elements, false);
         let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes)?;
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
@@ -2074,11 +2218,32 @@ mod tests {
         emit_keeping(&c, &native, &p, &st, &io, &res, options, kept)
     }
 
+    /// Outputs for [`param_mesh_of`] with 14 rows that Metal counts over
+    /// its limit even packed, as it does the title's TransformLit meshes
+    /// (264 bytes a vertex): [`param_elements`] for 13 rows, two scalars
+    /// (`TEXCOORD28`, `TEXCOORD29`) in the fourteenth, and four clip
+    /// distances.
+    fn distance_elements() -> Vec<SigElement> {
+        let mut els = param_elements(13);
+        let mut last = param_elements(14).split_off(els.len());
+        (last[1].index, last[1].cols) = (29, 1);
+        els.append(&mut last);
+        let mut clip = els[0].clone();
+        (clip.name, clip.kind, clip.row) = ("SV_ClipDistance".into(), 6, Some(15));
+        els.push(clip);
+        els
+    }
+
     /// A pixel program that writes four of [`param_mesh`]'s outputs,
     /// interpolated, to target 0: TEXCOORD6 (row 3 x), TEXCOORD15's second
     /// channel (row 7 z), TEXCOORD25's third (row 12 w) and TEXCOORD28
     /// (row 14 x): 3, 7.5, 12.75 and 14. Its signature declares them all.
     fn param_pixel() -> HostShader {
+        param_pixel_keeping(None)
+    }
+
+    /// [`param_pixel`], its inputs narrowed to the channels `kept` names.
+    fn param_pixel_keeping(kept: Option<&Kept>) -> HostShader {
         let reads: [(u32, u32); 4] = [(3, 0), (7, 2), (12, 3), (14, 0)];
         let mut words = Vec::new();
         for (k, &(row, ch)) in reads.iter().enumerate() {
@@ -2111,7 +2276,18 @@ mod tests {
         }
         let isg1 = container::signature(&isg1, true);
         let osg1 = rows(&[("SV_Target", 16, false)], false);
-        emit_pixel(&words, inputs, 1 << 1, &isg1, &osg1).unwrap()
+        emit_pixel_keeping(&words, inputs, 1 << 1, &isg1, &osg1, kept).unwrap()
+    }
+
+    /// Where a translated shader's signature (`OSG1` or `ISG1`) has the
+    /// element of semantic `name`: (row, first channel, channels).
+    fn element(dxil: &[u8], part: FourCC, name: &str) -> Option<(u32, u8, u8)> {
+        let c = Container::parse(dxil).unwrap();
+        signature(c.part(part).unwrap().data)
+            .unwrap()
+            .into_iter()
+            .find(|e| format!("{}{}", e.name, e.index) == name)
+            .map(|e| (e.row.unwrap(), e.col, e.cols))
     }
 
     /// The vertex output semantics of a translated mesh, in `OSG1`.
@@ -2182,9 +2358,107 @@ mod tests {
         assert_eq!(everything.dxil, plain.dxil);
     }
 
+    /// With the channels a pixel shader reads kept, a mesh translation
+    /// narrows the outputs it keeps to them and the pixel shader's own
+    /// translation narrows its inputs alike, so that the two link; neither
+    /// links with the other's plain translation where they differ.
+    #[test]
+    fn kept_channels_narrow_mesh_outputs_and_pixel_inputs_alike() {
+        let ps = param_pixel();
+        let kept = pixel_reads_channels(&ps.dxil).unwrap();
+        assert_eq!(
+            kept.describe(),
+            "TEXCOORD6 1\nTEXCOORD15 2\nTEXCOORD25 4\nTEXCOORD28 1\n"
+        );
+        let whole = pixel_reads(&ps.dxil).unwrap();
+        let wide = param_mesh(PARAM_ROWS, Options::default(), Some(&whole)).unwrap();
+        assert!(!mesh_outputs_unread(&wide.dxil, &whole));
+        assert!(mesh_outputs_unread(&wide.dxil, &kept));
+        let ms = param_mesh(PARAM_ROWS, Options::default(), Some(&kept)).unwrap();
+        let narrow = param_pixel_keeping(Some(&kept));
+        assert!(!mesh_outputs_unread(&ms.dxil, &kept));
+        assert_eq!(output_names(&ms.dxil), output_names(&wide.dxil));
+        for (name, at) in [
+            ("TEXCOORD6", (3, 0, 1)),
+            ("TEXCOORD15", (7, 2, 1)),
+            ("TEXCOORD25", (12, 3, 1)),
+            ("TEXCOORD28", (14, 0, 1)),
+        ] {
+            assert_eq!(element(&ms.dxil, FourCC::OSG1, name), Some(at), "{name}");
+            assert_eq!(element(&narrow.dxil, FourCC::ISG1, name), Some(at), "{name}");
+        }
+        // What the pixel shader does not read stays as declared.
+        assert_eq!(element(&narrow.dxil, FourCC::ISG1, "TEXCOORD7"), Some((3, 1, 3)));
+        assert_eq!(pixel_reads(&narrow.dxil).unwrap(), whole);
+        assert!(stages_link(&ms.dxil, &narrow.dxil));
+        assert!(stages_link(&wide.dxil, &ps.dxil));
+        assert!(!stages_link(&ms.dxil, &ps.dxil));
+        assert!(!stages_link(&wide.dxil, &narrow.dxil));
+        // 16 + 4 × 4 bytes a vertex, of 16 + 4 + 4 (padding) + 12 + 12 + 4.
+        let bytes = |dxil: &[u8]| {
+            let (outputs, prims, vertices, primitives) = mesh_outputs(dxil).unwrap();
+            container::metal_mesh_bytes(&outputs, &prims, vertices, primitives)
+        };
+        assert_eq!((bytes(&wide.dxil), bytes(&ms.dxil)), (128 * 52, 128 * 32));
+        // A pixel shader keeping what it reads whole is its plain translation.
+        assert_eq!(param_pixel_keeping(Some(&whole)).dxil, ps.dxil);
+    }
+
+    /// A mesh Metal counts over its limit even packed leaves out the clip
+    /// distances it gives +0.0 at every vertex, from the end of the
+    /// distance vector; the live ones stay, and so do all of them without
+    /// packing or within the limit.
+    #[test]
+    fn idle_clip_distances_are_left_out_only_over_metals_limit() {
+        let els = distance_elements();
+        let pack = Options {
+            mesh_pack_outputs: true,
+            ..Options::default()
+        };
+        let clip = |ms: &HostShader| element(&ms.dxil, FourCC::OSG1, "SV_ClipDistance0");
+        // v7 (1.0), then v8 (0) three times.
+        let idle = Some(0x0808_0807);
+        let plain = param_mesh_of(&els, 14, idle, Options::default(), None).unwrap();
+        assert_eq!(clip(&plain), Some((15, 0, 4)));
+        let bytes = |dxil: &[u8]| {
+            let (outputs, prims, vertices, primitives) = mesh_outputs(dxil).unwrap();
+            let packed: Vec<SigElement> = container::metal_packed_order(&outputs)
+                .into_iter()
+                .map(|i| outputs[i].clone())
+                .collect();
+            container::metal_mesh_bytes(&packed, &prims, vertices, primitives)
+        };
+        assert_eq!(bytes(&plain.dxil), 128 * 264);
+        assert!(mesh_over_metal_limit(&plain.dxil));
+        let ours = param_mesh_of(&els, 14, idle, pack, None).unwrap();
+        assert_eq!(clip(&ours), Some((15, 0, 1)));
+        assert_eq!(bytes(&ours.dxil), 128 * 252);
+        assert!(!mesh_over_metal_limit(&ours.dxil));
+        // The second distance live: only the two after it go.
+        let two = param_mesh_of(&els, 14, Some(0x0808_0708), pack, None).unwrap();
+        assert_eq!(clip(&two), Some((15, 0, 2)));
+        // All live: all stay, and Metal refuses the pipeline.
+        let live = param_mesh_of(&els, 14, Some(0x0707_0707), pack, None).unwrap();
+        assert_eq!(clip(&live), Some((15, 0, 4)));
+        assert!(mesh_over_metal_limit(&live.dxil));
+        // None live: the element goes.
+        let none = param_mesh_of(&els, 14, Some(0x0808_0808), pack, None).unwrap();
+        assert_eq!(clip(&none), None);
+        // Within the limit packed (13 rows: 256 bytes a vertex) they all
+        // stay.
+        let mut small = param_elements(13);
+        small.push(els.last().unwrap().clone());
+        let fits = param_mesh_of(&small, 13, idle, pack, None).unwrap();
+        assert_eq!(clip(&fits), Some((15, 0, 4)));
+        assert_eq!(bytes(&fits.dxil), 128 * 256);
+        assert!(!mesh_over_metal_limit(&fits.dxil));
+    }
+
     /// [`param_mesh`] with [`param_pixel`] on the host GPU (and WARP),
-    /// packed, kept to what the pixel shader reads, both, and neither: the
-    /// pixel shader reads the values the mesh stored under their semantics.
+    /// packed, kept to what the pixel shader reads, both, and neither; both
+    /// stages narrowed to the channels it reads; and the mesh with idle
+    /// clip distances, packed (without them) and not: the pixel shader
+    /// reads the values the mesh stored under their semantics.
     /// Under Wine, D3DMetal makes the plain one a no-op (Metal: "Total mesh
     /// size (N) exceeds the maximum mesh size allowed (32768)"), so it only
     /// has to draw where Metal is not underneath.
@@ -2201,11 +2475,17 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let ps = param_pixel();
         let kept = pixel_reads(&ps.dxil).unwrap();
+        let channels = pixel_reads_channels(&ps.dxil).unwrap();
+        let narrow = param_pixel_keeping(Some(&channels));
         let pack = Options {
             mesh_pack_outputs: true,
             ..Options::default()
         };
         let wine = super::host::under_wine();
+        let mesh = |options, kept| param_mesh(PARAM_ROWS, options, kept).unwrap();
+        let distances = |options| {
+            param_mesh_of(&distance_elements(), 14, Some(0x0808_0807), options, None).unwrap()
+        };
         let mut ran = 0;
         for (label, warp) in [("hardware", false), ("warp", true)] {
             let Ok(host) = Host::new(warp) else {
@@ -2225,13 +2505,16 @@ mod tests {
                 eprintln!("no mesh shaders on the {label} device; skipped");
                 continue;
             }
-            for (case, options, kept, must_draw) in [
-                ("packed", pack, None, true),
-                ("kept", Options::default(), Some(&kept), true),
-                ("packed and kept", pack, Some(&kept), true),
-                ("plain", Options::default(), None, !wine),
+            for (case, ms, ps, must_draw) in [
+                ("packed", mesh(pack, None), &ps, true),
+                ("kept", mesh(Options::default(), Some(&kept)), &ps, true),
+                ("packed and kept", mesh(pack, Some(&kept)), &ps, true),
+                ("plain", mesh(Options::default(), None), &ps, !wine),
+                ("narrowed", mesh(Options::default(), Some(&channels)), &narrow, true),
+                ("packed and narrowed", mesh(pack, Some(&channels)), &narrow, true),
+                ("idle distances, packed", distances(pack), &ps, true),
+                ("idle distances", distances(Options::default()), &ps, !wine),
             ] {
-                let ms = param_mesh(PARAM_ROWS, options, kept).unwrap();
                 if let Ok(mut v) = super::validator::Validator::load(
                     super::validator::Validator::default_path().as_deref(),
                 ) {

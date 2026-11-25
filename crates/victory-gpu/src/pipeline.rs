@@ -74,7 +74,8 @@ pub(crate) struct Shader {
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Mesh: translations without the vertex outputs a pixel shader does
-    /// not read, by what they keep ([`Shader::translated_keeping`]).
+    /// not read, by what they keep ([`Shader::translated_keeping`]); pixel:
+    /// ones with their inputs narrowed to the channels they read.
     #[cfg(windows)]
     kept: Mutex<HashMap<victory_shader::emit::Kept, Option<Arc<Translated>>>>,
 }
@@ -141,8 +142,15 @@ impl Shader {
                     // bytes are still there for the next try. A mesh shader
                     // keeps them: a pipeline may translate it again without
                     // the outputs its pixel shader does not read
-                    // ([`Shader::translated_keeping`]).
-                    if self.stage != "mesh" {
+                    // ([`Shader::translated_keeping`]); so does a pixel
+                    // shader where pipelines do that, to be made again
+                    // with its inputs as narrow as such a mesh's outputs.
+                    let again = match self.stage {
+                        "mesh" => true,
+                        "pixel" => crate::shader_cache::mesh_prune(),
+                        _ => false,
+                    };
+                    if !again {
                         *container = Vec::new();
                     }
                     done
@@ -181,7 +189,8 @@ impl Shader {
 #[cfg(windows)]
 impl Shader {
     /// A mesh shader's translation keeping only the vertex outputs `kept`
-    /// names (and its system values), made once per `kept`.
+    /// names (and its system values), or a pixel shader's with its inputs
+    /// narrowed to the channels `kept` names, made once per `kept`.
     pub(crate) fn translated_keeping(
         &self,
         kept: &victory_shader::emit::Kept,
@@ -193,6 +202,15 @@ impl Shader {
                 let (host, cached) =
                     crate::shader_cache::host_shader_keeping(&container, Some(kept));
                 match host.and_then(|host| with_resources(&container, host)) {
+                    Ok(t) if self.stage == "pixel" => {
+                        tracing::info!(
+                            hash = %self.hash,
+                            cached,
+                            kept = kept.describe().replace('\n', " "),
+                            "pixel shader translated with its inputs narrowed to the channels it reads"
+                        );
+                        Some(Arc::new(t))
+                    }
                     Ok(t) => {
                         tracing::info!(
                             hash = %self.hash,
@@ -203,7 +221,7 @@ impl Shader {
                         Some(Arc::new(t))
                     }
                     Err(e) => {
-                        tracing::warn!(hash = %self.hash, error = %e, "mesh shader does not translate without its unread outputs");
+                        tracing::warn!(stage = self.stage, hash = %self.hash, error = %e, "mesh shader does not translate without its unread outputs");
                         None
                     }
                 }

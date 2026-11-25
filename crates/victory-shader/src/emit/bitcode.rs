@@ -584,6 +584,59 @@ impl Module {
         }
     }
 
+    /// Whether `v` is zero bits wherever it is made: the integer or float
+    /// constant, or a bitcast, select or phi of nothing else.
+    fn always_zero(&self, v: V) -> bool {
+        let (mut seen, mut work) = (std::collections::HashSet::new(), vec![v]);
+        while let Some(v) = work.pop() {
+            match v {
+                V::Const(i) => match self.consts[i as usize].1 {
+                    Const::Int(0) | Const::Float(0) => {}
+                    _ => return false,
+                },
+                V::Inst(i) if seen.insert(i) => match &self.insts[i as usize].op {
+                    Op::Cast(Cast::Bitcast, x) => work.push(*x),
+                    Op::Select(_, a, b) => work.extend([*a, *b]),
+                    Op::Phi(incoming) if !incoming.is_empty() => {
+                        work.extend(incoming.iter().map(|x| x.0))
+                    }
+                    _ => return false,
+                },
+                V::Inst(_) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// The channels of signature element `id` that calls of the functions
+    /// named from `prefix` (output stores: opcode, element, row, channel,
+    /// value) store, and those of them that take something other than
+    /// zero bits in some store.
+    pub fn stored_channels(&self, prefix: &str, id: u32) -> (u8, u8) {
+        let (mut stored, mut live) = (0u8, 0u8);
+        for i in self.blocks.iter().flat_map(|b| &b.body) {
+            let Op::Call(f, args) = &self.insts[*i as usize].op else {
+                continue;
+            };
+            if !self.funcs[*f as usize].name.starts_with(prefix)
+                || args.get(1).and_then(|&a| self.int_value(a)) != Some(i64::from(id))
+            {
+                continue;
+            }
+            // A store of a channel no constant names keeps them all.
+            let channel = args.get(3).and_then(|&a| self.int_value(a));
+            let Some(ch) = channel.filter(|c| (0..8).contains(c)) else {
+                return (0xFF, 0xFF);
+            };
+            stored |= 1 << ch;
+            if !args.get(4).is_some_and(|&x| self.always_zero(x)) {
+                live |= 1 << ch;
+            }
+        }
+        (stored, live)
+    }
+
     /// Calls of functions named `name` that [`Module::write`] writes.
     #[cfg(test)]
     pub fn written_calls(&self, name: &str) -> usize {
