@@ -978,14 +978,7 @@ impl<'a> Lower<'a> {
             LaneExit::Indirect => true,
             _ => succ(q).len() > 1,
         };
-        let ends = |b: usize| {
-            succ(b).is_empty()
-                && p.blocks[b]
-                    .insts
-                    .iter()
-                    .all(|i| matches!(i.name(), "s_endpgm" | "s_nop" | "v_nop" | "s_waitcnt"))
-        };
-        let early = |q: usize| live && succ(q).iter().any(|&s| ends(s));
+        let early = |q: usize| live && succ(q).iter().any(|&s| ends(p, s));
         let together = undecided(p, |q| decides(q) && !early(q));
         let cycle = in_cycle(p);
         (0..n).map(|b| together[b] && !cycle[b]).collect()
@@ -1457,7 +1450,7 @@ impl<'a> Lower<'a> {
                     &[f, sum, signed],
                 );
                 let r = self.as_int(r);
-                let r = self.whole_wave(r, REDUCTION, |l, lo, hi| {
+                let r = self.whole_wave(r, REDUCTION, Some(z), |l, lo, hi| {
                     let (lo, hi) = (l.as_float(lo), l.as_float(hi));
                     let r = l.s.m.bin(l.cur, Bin::Add, lo, hi);
                     l.as_int(r)
@@ -1617,9 +1610,11 @@ impl<'a> Lower<'a> {
                 &[arg, k0, ku],
             );
             let total = if float { self.as_int(total) } else { total };
+            let z = self.s.m.i32(0);
             return Ok(self.whole_wave(
                 total,
                 "a wave prefix sum where the halves cannot meet",
+                Some(z),
                 |l, lo, _| {
                     let c = l.cur;
                     let upper = l.upper_half(c);
@@ -1636,7 +1631,7 @@ impl<'a> Lower<'a> {
                 },
             ));
         }
-        Ok(self.whole_wave(r, REDUCTION, |l, lo, hi| {
+        Ok(self.whole_wave(r, REDUCTION, Some(id), |l, lo, hi| {
             let c = l.cur;
             let pick = |l: &mut Self, p: u8| {
                 let lower = l.s.m.cmp(c, p, lo, hi);
@@ -1680,7 +1675,7 @@ impl<'a> Lower<'a> {
         let all = exec.is_some_and(|e| !st.bools.meet(&[(st.reach[b], true), (e, false)]));
         // (where threads have ended the lower half may hold none)
         if all && self.halves_full(b) || !self.halves_meet(b) || self.guarded != 0 {
-            return self.whole_wave(first, WHAT, |_, lo, _| lo);
+            return self.whole_wave(first, WHAT, None, |_, lo, _| lo);
         }
         let c = self.cur;
         let Some(on) = exec.and_then(|e| self.boolean(e, c).ok()) else {
@@ -1701,8 +1696,8 @@ impl<'a> Lower<'a> {
         let at = self.read_lane(a, lane);
         let none = self.s.m.cmp(c, pred::EQ, lanes, z);
         let own = self.s.m.select(c, none, first, at);
-        let (lo_lanes, hi_lanes) = self.exchange(c, b, lanes);
-        let (lo, hi) = self.exchange(c, b, own);
+        let (lo_lanes, hi_lanes) = self.exchange(c, b, lanes, z);
+        let (lo, hi) = self.exchange(c, b, own, z);
         let in_lo = self.s.m.cmp(c, pred::NE, lo_lanes, z);
         let in_hi = self.s.m.cmp(c, pred::NE, hi_lanes, z);
         let upper = self.s.m.select(c, in_hi, hi, lo);
@@ -1711,16 +1706,30 @@ impl<'a> Lower<'a> {
 
     /// Halves: a host wave's result `r` of an operation over the wave (the
     /// same in all its lanes) made the console wave's: `both` of the lower
-    /// and the upper half's.
-    fn whole_wave(&mut self, r: V, what: Why, both: impl FnOnce(&mut Self, V, V) -> V) -> V {
+    /// and the upper half's. `absent`: what a half with no lane gives (a
+    /// reduction's identity), if the operation has such a value; another
+    /// needs every lane of both halves there.
+    fn whole_wave(
+        &mut self,
+        r: V,
+        what: Why,
+        absent: Option<V>,
+        both: impl FnOnce(&mut Self, V, V) -> V,
+    ) -> V {
         if self.half_alone() {
             return r;
         }
-        if !self.halves_full(self.cur_ir) || self.guarded != 0 {
+        let b = self.cur_ir;
+        let meet = match absent {
+            Some(_) => self.halves_meet(b),
+            None => self.halves_full(b),
+        };
+        if !meet || self.guarded != 0 {
             self.refuse(what);
             return r;
         }
-        let (lo, hi) = self.exchange(self.cur, self.cur_ir, r);
+        let absent = absent.unwrap_or(r);
+        let (lo, hi) = self.exchange(self.cur, b, r, absent);
         both(self, lo, hi)
     }
 
@@ -2400,7 +2409,8 @@ impl<'a> Lower<'a> {
                     let b = self.def_block.get(&lo).copied().unwrap_or(0);
                     if self.halves_meet(b) && !(at == self.cur && self.guarded != 0) {
                         // each half's ballot is a dword of the console's mask
-                        xy = self.exchange(at, b, xy.0);
+                        let z = self.s.m.i32(0);
+                        xy = self.exchange(at, b, xy.0, z);
                     } else {
                         // One thread alone there: its bit, in its half's
                         // dword. Other lanes there too: the other half's
@@ -3731,11 +3741,12 @@ impl<'a> Lower<'a> {
     /// so that no half stores the next pass's before the other has read.
     ///
     /// Where threads may have ended before `b` a half may have none left
-    /// to store: every thread first clears its half's dword in the entry
-    /// block, which all run, so such a half reads as 0 (no lane in a mask).
-    /// Its threads cleared it before they ended, and the barrier lets the
-    /// rest go on only once they have.
-    fn exchange(&mut self, at: usize, b: usize, v: V) -> (V, V) {
+    /// to store: every thread first sets its half's dword to `absent` (a
+    /// constant: no lane in a mask, a reduction's identity) in the entry
+    /// block, which all run, so such a half reads as that. Its threads set
+    /// it before they ended, and the barrier lets the rest go on only once
+    /// they have.
+    fn exchange(&mut self, at: usize, b: usize, v: V, absent: V) -> (V, V) {
         let i32t = self.s.t.i32;
         let h = self.halves.as_mut().expect("halves");
         let (count, n, full) = (h.count, h.sites, h.full[b]);
@@ -3748,8 +3759,7 @@ impl<'a> Lower<'a> {
             let e = self.s.entry;
             let half = self.s.m.bin(e, Bin::LShr, f, five);
             let own = self.s.m.element(e, g, half);
-            let z = self.s.m.i32(0);
-            self.s.m.store(e, own, z);
+            self.s.m.store(e, own, absent);
         }
         let half = self.s.m.bin(at, Bin::LShr, f, five);
         let own = self.s.m.element(at, g, half);
@@ -7672,6 +7682,7 @@ impl<'a> Lower<'a> {
                     self.whole_wave(
                         r,
                         "v_readlane_b32 where the halves cannot meet",
+                        None,
                         |l, lo, hi| {
                             let c = l.cur;
                             let k32 = l.s.m.i32(32);
@@ -12032,15 +12043,41 @@ fn wave_blocks(x: &Parts, live: bool) -> Vec<bool> {
         _ => false,
     };
     // A per-lane branch to the program's end only takes lanes out for good.
-    let ends = |b: usize| {
-        succ(b).is_empty()
-            && p.blocks[b]
-                .insts
-                .iter()
-                .all(|i| matches!(i.name(), "s_endpgm" | "s_nop" | "v_nop" | "s_waitcnt"))
-    };
-    let early = |q: usize| live && succ(q).iter().any(|&s| ends(s));
+    let early = |q: usize| live && succ(q).iter().any(|&s| ends(p, s));
     undecided(p, |q| per_lane(q) && !early(q))
+}
+
+/// Whether block `b` only ends the program: nothing but the end in it, or
+/// the far jump to such a block (the compiler's branch to an end out of a
+/// branch offset's reach).
+fn ends(p: &Program, mut b: usize) -> bool {
+    for _ in 0..4 {
+        let block = &p.blocks[b];
+        let idle = |i: &Inst| matches!(i.name(), "s_endpgm" | "s_nop" | "v_nop" | "s_waitcnt");
+        match block.exit {
+            Exit::End => return block.insts.iter().all(idle),
+            Exit::Jump(to) => {
+                let far = |i: &Inst| {
+                    matches!(
+                        i.name(),
+                        "s_getpc_b64"
+                            | "s_add_u32"
+                            | "s_sub_u32"
+                            | "s_addc_u32"
+                            | "s_subb_u32"
+                            | "s_setpc_b64"
+                            | "s_branch"
+                    )
+                };
+                if !block.insts.iter().all(|i| idle(i) || far(i)) {
+                    return false;
+                }
+                b = to;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// The blocks some cycle goes through.
@@ -12123,7 +12160,8 @@ fn undecided(p: &Program, decides: impl Fn(usize) -> bool) -> Vec<bool> {
 /// skip's EXEC could go round in (a count taken from lane 0's stale value
 /// could run to the iteration limit), or leaves the skipped range other
 /// than at the skip's target; it writes an SGPR or SCC that is read after
-/// the target; or it does not hand EXEC on within what it got.
+/// the target (other than a copy of what the register held, or a mask of
+/// the same lanes); or it does not hand EXEC on within what it got.
 pub(crate) fn idle_skips(p: &Program, st: &Structured) -> Vec<usize> {
     let n = p.blocks.len();
     // Values some instruction reads, through the phis that pass them on.
@@ -12155,6 +12193,82 @@ pub(crate) fn idle_skips(p: &Program, st: &Structured) -> Vec<usize> {
         index[b] = k;
     }
     let idom = crate::ir::idoms(&p.blocks, &order, &index);
+    let defs: Map<Value, &Inst> = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .flat_map(|i| i.writes.iter().map(move |w| (w.1, i)))
+        .collect();
+    let joins: Map<Value, &Phi> = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.phis)
+        .map(|phi| (phi.value, phi))
+        .collect();
+    // What a scalar is a copy of: through `s_mov`, an SGPR parked in a VGPR
+    // lane and read back, and a join of copies of one value.
+    fn origin(
+        st: &Structured,
+        defs: &Map<Value, &Inst>,
+        joins: &Map<Value, &Phi>,
+        mut v: Value,
+        depth: u32,
+    ) -> Value {
+        for _ in 0..64 {
+            if let Some(&saved) = st.restored.get(&v) {
+                v = saved;
+                continue;
+            }
+            if let Some(phi) = joins.get(&v) {
+                if depth == 0 {
+                    break;
+                }
+                // (a loop's join of the value with itself is the value)
+                let mut from = phi
+                    .args
+                    .iter()
+                    .filter(|&&a| a != v)
+                    .map(|&a| origin(st, defs, joins, a, depth - 1));
+                match from.next() {
+                    Some(first) if first != v && from.all(|a| a == first) => v = first,
+                    _ => break,
+                }
+                continue;
+            }
+            let Some(inst) = defs.get(&v) else { break };
+            let (
+                "s_mov_b32" | "s_mov_b64",
+                Fields::Sop {
+                    dst: Some(Operand::Scalar { code: to, .. }),
+                    src,
+                    ..
+                },
+            ) = (inst.name(), &inst.fields)
+            else {
+                break;
+            };
+            let Some(&Operand::Scalar { code: from, .. }) = src.first() else {
+                break;
+            };
+            let dword = (0..2).find(|&k| inst.write(Reg::S(to + k)) == Some(v));
+            match dword.and_then(|k| inst.read(Reg::S(from + k))) {
+                Some(a) => v = a,
+                None => break,
+            }
+        }
+        v
+    }
+    let origin = |v: Value| origin(st, &defs, &joins, v, 6);
+    // Whether two scalars hold the same: copies of one value, or the same
+    // dword of lane masks of the same lanes.
+    let alike = |a: Value, b: Value| {
+        let (a, b) = (origin(a), origin(b));
+        let lanes = |v: Value| {
+            let low = st.highs.get(&v).copied();
+            st.masks.get(&low.unwrap_or(v)).map(|&m| (m, low.is_some()))
+        };
+        a == b || lanes(a).is_some_and(|m| Some(m) == lanes(b))
+    };
     // Whether the skip that ends block `q` can go.
     let idle = |q: usize, branch: &Inst, taken: usize, not_taken: usize| {
         let block = &p.blocks[q];
@@ -12280,7 +12394,9 @@ pub(crate) fn idle_skips(p: &Program, st: &Structured) -> Vec<usize> {
                 .iter()
                 .any(|i| i.reads.iter().any(|r| scalars.contains(&r.1)))
                 || body.phis.iter().any(|phi| {
-                    live.contains(&phi.value) && phi.args.iter().any(|a| scalars.contains(a))
+                    live.contains(&phi.value)
+                        && phi.args.iter().any(|a| scalars.contains(a))
+                        && !phi.args.iter().all(|&a| alike(a, phi.args[0]))
                 })
         });
         if leaks {
@@ -14437,7 +14553,7 @@ mod tests {
         assert!(super::split_wave_barriers(&wave64(&w)).is_none());
         let l = lowered(&w, 64, true);
         assert_eq!((l.wave_size, l.split_barriers), (None, 1));
-        // The halves exchange only where no lane has left.
+        // A sum over the lanes left: a half with none gives its identity.
         let mut w = vec![V_LSHLREV_V1_2_V0, V_MOV_V16_V0, 0x3604_0081];
         w.extend([0xD4C2_0000, 0x0002_0480]);
         w.extend([AND_SAVEEXEC_S2_S0, skip(23)]);
@@ -14445,7 +14561,43 @@ mod tests {
         w.extend([0x0001_0102, RESTORE_EXEC, V_MOV_V2_S12]);
         w.extend(DS_WRITE_V1_V2);
         w.push(S_ENDPGM);
+        assert_eq!(halves(&w, 64), (Some(32), 1));
+        assert_eq!(halves(&w, 256), (Some(32), 1));
+        // A lane's value has no such stand-in: the lane may have ended.
+        let mut w = vec![V_LSHLREV_V1_2_V0, 0x3604_0081];
+        w.extend([0xD4C2_0000, 0x0002_0480]);
+        w.extend([AND_SAVEEXEC_S2_S0, skip(6), 0x7E04_0300]); // v_mov_b32 v2, v0
+        w.extend([0xD760_0002, 0x0001_4102, 0x7E04_0202]); // v_readlane_b32 s2, v2, 32; v_mov_b32 v2, s2
+        w.extend(DS_WRITE_V1_V2);
+        w.push(S_ENDPGM);
         assert_eq!(halves(&w, 64), (Some(64), 0));
+    }
+
+    #[test]
+    fn a_far_jump_to_the_end_ends_the_lanes_too() {
+        // 20b78ee12ecdb57d at 0x168: the end is out of a branch's reach, so
+        // the lanes left branch over a far jump to it.
+        let mut w = vec![V_LSHLREV_V1_2_V0, V_AND_V1_1_V0];
+        w.extend(CMP_S0_V1_EQ_0);
+        w.extend([
+            AND_SAVEEXEC_S2_S0,
+            0xBF89_0005, // s_cbranch_execnz +5
+            0xBE88_1F00, // s_getpc_b64 s[8:9]
+            0x8008_FF08,
+            44,          // s_add_u32 s8, s8, 44: the end
+            0x8209_8009, // s_addc_u32 s9, s9, 0
+            0xBE80_2008, // s_setpc_b64 s[8:9]
+            0x3604_0082, // v_and_b32 v2, 2, v0
+        ]);
+        w.extend([0xD4C2_0000, 0x0002_0480]); // v_cmp_eq_u32 s[0:1], 0, v2
+        w.extend([BCNT_S0, V_MOV_V2_S0]);
+        w.extend(DS_WRITE_V1_V2);
+        w.push(S_ENDPGM);
+        let p = wave64(&w);
+        assert_eq!(p.blocks[1].exit, ir::Exit::Jump(p.blocks.len() - 1));
+        assert!(super::ends(&p, 1) && !super::ends(&p, 2));
+        assert_eq!(halves(&w, 64), (Some(32), 1));
+        assert_eq!(halves(&w, 256), (Some(32), 1));
     }
 
     #[test]
@@ -14644,5 +14796,28 @@ mod tests {
             super::idle_skips(&p, &structure::structure(&p).unwrap()).len(),
             1
         );
+        // Nor does a register the skipped code uses and then gives back
+        // what it held.
+        let mut w = vec![V_LSHLREV_V1_2_V0, 0xBE8A_0380, V_AND_V1_1_V0]; // s_mov_b32 s10, 0
+        w.extend(CMP_S0_V1_EQ_0);
+        w.extend([
+            AND_SAVEEXEC_S2_S0,
+            skip(3),
+            0xBE8B_030A, // s_mov_b32 s11, s10
+            0xBE8A_0385, // s_mov_b32 s10, 5
+            0xBE8A_030B, // s_mov_b32 s10, s11
+            RESTORE_EXEC_S2,
+            0x7E04_020A, // v_mov_b32 v2, s10
+        ]);
+        w.extend(DS_WRITE_V1_V2);
+        w.push(S_ENDPGM);
+        let skips = |w: &[u32]| {
+            let p = wave64(w);
+            super::idle_skips(&p, &structure::structure(&p).unwrap()).len()
+        };
+        assert_eq!(skips(&w), 1);
+        let at = w.iter().position(|&x| x == 0xBE8A_030B).unwrap();
+        w[at] = 0xBF80_0000; // s_nop
+        assert_eq!(skips(&w), 0);
     }
 }
