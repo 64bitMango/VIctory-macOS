@@ -1139,7 +1139,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
         #[cfg(feature = "diagnostics")]
-        self.probe_constants(list, true);
+        self.probe_constants(list, true, "dispatch");
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
@@ -1227,6 +1227,8 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    #[cfg(feature = "diagnostics")]
+                    self.probe_constants(list, false, "draw");
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1425,10 +1427,12 @@ impl State {
 
     /// In a listed frame: each small buffer (64 bytes at most) the draw's
     /// tables name, as title memory now and as its host copy when the list
-    /// is submitted (before the GPU runs it) and after it has run.
+    /// is submitted (before the GPU runs it) and after it has run. Noted
+    /// when recorded (`crate::capture::listed_soon`), logged if the frame
+    /// that submits the list is listed.
     #[cfg(feature = "diagnostics")]
     fn probe_small(&self, list: &HostList, compute: bool) {
-        if !crate::capture::listed(crate::queue::presented() + 1) {
+        if !crate::capture::listed_soon() {
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
@@ -1452,23 +1456,50 @@ impl State {
                 let Some(shadow) = crate::shadow::find(at, len) else { continue };
                 let who = format!("{} {:?} s{}+{} {at:#x}+{len}", stage.shader.hash, u.kind, u.slot, u.table_offset_dwords);
                 let (s, w) = (shadow.clone(), who.clone());
-                list.defer_host(move || tracing::info!(target: "victory_gpu::trace", "small {w} at submission: {}", s.peek(at, len)));
-                list.defer_after(move || tracing::info!(target: "victory_gpu::trace", "small {who} after the list: {}", shadow.peek(at, len)));
+                let shown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let now = shown.clone();
+                list.defer_host(move || {
+                    let listed = crate::capture::listed(crate::queue::presented() + 1);
+                    now.store(listed, Ordering::Relaxed);
+                    if listed {
+                        tracing::info!(target: "victory_gpu::trace", "small {w} at submission: {}", s.peek(at, len));
+                    }
+                });
+                list.defer_after(move || {
+                    if shown.swap(false, Ordering::Relaxed) {
+                        tracing::info!(target: "victory_gpu::trace", "small {who} after the list: {}", shadow.peek(at, len));
+                    }
+                });
             }
         }
     }
 
     /// Diagnostics, `VICTORY_PROBE_CBVS=<hash>[@<hex offset>],...`: in a
-    /// listed frame, each table CBV a draw or dispatch of a listed shader
+    /// listed frame, each draw, dispatch or indirect execution of a listed
+    /// shader: a `probe <hash> <draw|dispatch|indirect> frame <n>` line and
+    /// its root arguments (`roots`, the first 1024 calls), the textures it
+    /// reads and writes through tables (`view`), and each table CBV it
     /// reads: its address and size, whether the offset lies past the size
     /// (the console reads 0 there; host CBVs are 256-byte multiples, and
     /// D3DMetal may not bound them), 16 floats of the host copy from the
     /// offset (default 0), and the offsets of the first non-finite floats
     /// within the size; at submission and after the list. The first 64.
+    ///
+    /// Lists are recorded ahead of the frame that submits them, so all of
+    /// it is noted when the call is recorded (in any frame, while frames
+    /// are listed at all) and logged when the list is submitted, if
+    /// `listed(presented() + 1)` holds then: the frame the dumps of that
+    /// submission are named after. The tables and root arguments are the
+    /// ones the call was recorded with.
     #[cfg(feature = "diagnostics")]
-    fn probe_constants(&self, list: &HostList, compute: bool) {
+    fn probe_constants(&self, list: &HostList, compute: bool, kind: &'static str) {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
         static PROBES: std::sync::OnceLock<Vec<(String, u64)>> = std::sync::OnceLock::new();
         static LOGGED: AtomicU64 = AtomicU64::new(0);
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        static READS: AtomicU64 = AtomicU64::new(0);
+        static READERS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         let probes = PROBES.get_or_init(|| {
             std::env::var("VICTORY_PROBE_CBVS")
                 .unwrap_or_default()
@@ -1480,18 +1511,23 @@ impl State {
                 })
                 .collect()
         });
-        if !crate::capture::listed(crate::queue::presented() + 1) {
+        if !crate::capture::lists_frames() {
+            return;
+        }
+        // Programs that read the ambient pass's light image through a table
+        // are listed too, once each: where the indirect light goes next.
+        // Every call's tables are looked through for it, so only in lists
+        // recorded shortly before a listed frame.
+        let light = crate::ambient::LIGHT_RESOURCE.load(Ordering::Relaxed);
+        let scan = light != 0 && crate::capture::listed_soon();
+        if probes.is_empty() && !scan {
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
-        // Programs that read the ambient pass's light image through a table
-        // are listed too, once each: where the indirect light goes next.
-        let light = crate::ambient::LIGHT_RESOURCE.load(Ordering::Relaxed);
-        static READERS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         for stage in &p.stages {
             let probe = probes.iter().find(|(h, _)| stage.shader.hash.contains(h.as_str())).map(|&(_, o)| o);
             let reads_light = probe.is_none()
-                && light != 0
+                && scan
                 && stage.translated().used.iter().any(|u| {
                     u.kind == ResourceType::Srv
                         && u.root == RootType::Table
@@ -1499,29 +1535,21 @@ impl State {
                             if matches!(crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4), Some(View::Shader(r, _)) if r == light))
                 })
                 && {
-                    let mut readers = READERS.lock().unwrap_or_else(|e| e.into_inner());
-                    let new = !readers.contains(&stage.shader.hash) && readers.len() < 16;
-                    if new {
-                        readers.push(stage.shader.hash.clone());
-                        tracing::info!(target: "victory_gpu::trace", "reads the ambient light image {light:#x}: {} ({})", stage.shader.hash, p.name);
-                    }
-                    new
+                    let readers = READERS.lock().unwrap_or_else(|e| e.into_inner());
+                    !readers.contains(&stage.shader.hash) && readers.len() < 16
                 };
             if probe.is_none() && !reads_light {
                 continue;
             }
             // What the shader reads and writes through its tables: the
             // resource (as the capture names its dumps), format and size.
-            static READS: AtomicU64 = AtomicU64::new(0);
+            let mut lines: Vec<String> = Vec::new();
             for u in stage.translated().used.iter().filter(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) {
                 let (RootType::Table, Some(Root::Table(table))) =
                     (u.root, self.roots_ref(compute).get(usize::from(u.slot)))
                 else {
                     continue;
                 };
-                if READS.fetch_add(1, Ordering::Relaxed) >= 1024 {
-                    break;
-                }
                 let who = format!(
                     "{} {:?} {}{} s{}+{}",
                     stage.shader.hash,
@@ -1535,25 +1563,26 @@ impl State {
                 let r = match view {
                     Some(View::Shader(r, _)) | Some(View::Unordered(r, ..)) => r,
                     other => {
-                        tracing::info!(target: "victory_gpu::trace", "view {who}: {other:?}");
+                        lines.push(format!("view {who}: {other:?}"));
                         continue;
                     }
                 };
-                match crate::resource::host_resource(r as This) {
+                lines.push(match crate::resource::host_resource(r as This) {
                     Some(t) => {
                         // SAFETY: a live resource.
                         let d = unsafe { t.GetDesc() };
-                        tracing::info!(
-                            target: "victory_gpu::trace",
+                        format!(
                             "view {who}: resource {r:#x} host format {} {}x{}x{} mips {} flags {:#x} dimension {}",
                             d.Format.0, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Flags.0, d.Dimension.0
-                        );
+                        )
                     }
-                    None => tracing::info!(target: "victory_gpu::trace", "view {who}: resource {r:#x} has no host resource"),
-                }
+                    None => format!("view {who}: resource {r:#x} has no host resource"),
+                });
             }
-            let Some(offset) = probe else { continue };
-            for u in stage.translated().used.iter().filter(|u| u.kind == ResourceType::Cbv) {
+            // Its table constant buffers.
+            let mut constants = Vec::new();
+            for u in stage.translated().used.iter().filter(|u| probe.is_some() && u.kind == ResourceType::Cbv) {
+                let offset = probe.unwrap_or(0);
                 let (RootType::Table, Some(Root::Table(table))) =
                     (u.root, self.roots_ref(compute).get(usize::from(u.slot)))
                 else {
@@ -1563,9 +1592,6 @@ impl State {
                 else {
                     continue;
                 };
-                if LOGGED.fetch_add(1, Ordering::Relaxed) >= 64 {
-                    return;
-                }
                 let size = u64::from(size);
                 let who = format!(
                     "{} Cbv b{} s{}+{} {at:#x}+{size:#x} @{offset:#x}{}",
@@ -1575,10 +1601,47 @@ impl State {
                     u.table_offset_dwords,
                     if offset + 16 > size { " (past the size)" } else { "" }
                 );
-                let Some(shadow) = crate::shadow::find(at, 1) else {
-                    tracing::info!(target: "victory_gpu::trace", "cbv {who}: no host copy");
-                    continue;
-                };
+                match crate::shadow::find(at, 1) {
+                    Some(shadow) => constants.push((who, shadow, at, size, offset)),
+                    None => lines.push(format!("cbv {who}: no host copy")),
+                }
+            }
+            let roots = probe.is_some().then(|| self.probe_roots(&stage.shader.hash, stage.translated(), compute));
+            // Whether the submission running now logs this call.
+            let shown = Arc::new(AtomicBool::new(false));
+            let (now, hash, name) = (shown.clone(), stage.shader.hash.clone(), p.name.to_string());
+            list.defer_host(move || {
+                now.store(false, Ordering::Relaxed);
+                let frame = crate::queue::presented() + 1;
+                if !crate::capture::listed(frame) {
+                    return;
+                }
+                match &roots {
+                    Some(roots) => {
+                        if CALLS.fetch_add(1, Ordering::Relaxed) >= 1024 {
+                            return;
+                        }
+                        tracing::info!(target: "victory_gpu::trace", "probe {hash} {kind} frame {frame}");
+                        tracing::info!(target: "victory_gpu::trace", "{roots}");
+                    }
+                    None => {
+                        let mut readers = READERS.lock().unwrap_or_else(|e| e.into_inner());
+                        if readers.contains(&hash) || readers.len() >= 16 {
+                            return;
+                        }
+                        readers.push(hash.clone());
+                        tracing::info!(target: "victory_gpu::trace", "reads the ambient light image {light:#x}: {hash} ({name})");
+                    }
+                }
+                now.store(true, Ordering::Relaxed);
+                for line in &lines {
+                    if READS.fetch_add(1, Ordering::Relaxed) >= 1024 {
+                        break;
+                    }
+                    tracing::info!(target: "victory_gpu::trace", "{line}");
+                }
+            });
+            for (who, shadow, at, size, offset) in constants {
                 let look = move |s: &crate::shadow::Shadow| {
                     let (start, len) = s.range();
                     let end = (at + size.min(1 << 16)).min(start + len);
@@ -1592,11 +1655,84 @@ impl State {
                         .collect();
                     format!("{} non-finite in size {bad:?}", s.peek(at + offset, 64))
                 };
-                let (s, w) = (shadow.clone(), who.clone());
-                list.defer_host(move || tracing::info!(target: "victory_gpu::trace", "cbv {w} at submission: {}", look(&s)));
-                list.defer_after(move || tracing::info!(target: "victory_gpu::trace", "cbv {who} after the list: {}", look(&shadow)));
+                let (s, w, call) = (shadow.clone(), who.clone(), shown.clone());
+                let logged = Arc::new(AtomicBool::new(false));
+                let first = logged.clone();
+                list.defer_host(move || {
+                    let logs = call.load(Ordering::Relaxed) && LOGGED.fetch_add(1, Ordering::Relaxed) < 64;
+                    first.store(logs, Ordering::Relaxed);
+                    if logs {
+                        tracing::info!(target: "victory_gpu::trace", "cbv {w} at submission: {}", look(&s));
+                    }
+                });
+                list.defer_after(move || {
+                    if logged.swap(false, Ordering::Relaxed) {
+                        tracing::info!(target: "victory_gpu::trace", "cbv {who} after the list: {}", look(&shadow));
+                    }
+                });
             }
         }
+    }
+
+    /// For [`State::probe_constants`]: a probed shader's root arguments as
+    /// the title set them (tables with their place in the bound heap, root
+    /// constants, root views), every resource it uses (kind, register, root
+    /// type, root slot and table offset: also those it reaches without a
+    /// table) and its user data, with the view at that heap index if one
+    /// is. A shader that indexes the heap has no `view` lines: its
+    /// textures are the heap slots its user data names.
+    #[cfg(feature = "diagnostics")]
+    fn probe_roots(&self, hash: &str, t: &crate::pipeline::Translated, compute: bool) -> String {
+        use std::fmt::Write;
+        let mut text = format!("roots {hash}:");
+        for (i, root) in self.roots_ref(compute).iter().enumerate() {
+            match root {
+                Root::None => {}
+                Root::Table(table) => {
+                    let _ = write!(text, " s{i}=table {table:#x}");
+                    if let Some(heap) = self.heap_of(*table) {
+                        let _ = write!(text, " (heap {:#x}+{:#x})", heap.start, table - heap.start);
+                    }
+                }
+                Root::Constants(c) => {
+                    let _ = write!(text, " s{i}=constants {:x?}", &c[..c.len().min(16)]);
+                    if c.len() > 16 {
+                        let _ = write!(text, " (of {})", c.len());
+                    }
+                }
+                Root::View(address) => {
+                    let _ = write!(text, " s{i}=view {address:#x}");
+                }
+            }
+        }
+        let tables = t.used.iter().filter(|u| u.root == RootType::Table).count();
+        let _ = write!(text, "; used ({tables} of {} through tables):", t.used.len());
+        for u in &t.used {
+            let register = match u.kind {
+                ResourceType::Srv => "t",
+                ResourceType::Uav => "u",
+                ResourceType::Cbv => "b",
+                _ => "s",
+            };
+            let _ = write!(
+                text,
+                " {:?} {register}{} {:?} s{}+{}",
+                u.kind, u.lower_bound, u.root, u.slot, u.table_offset_dwords
+            );
+        }
+        let views = (self.heaps[0] != 0)
+            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+            .flatten();
+        let _ = write!(text, "; user data:");
+        for u in t.host.user_data.iter().filter(|u| !is_root_view(u)) {
+            let v = self.user_value(compute, u.slot, u.root, u.dword);
+            let _ = write!(text, " u{}={v:#x} ({:?} s{} dword {})", u.index, u.root, u.slot, u.dword);
+            let index = if u.root == RootType::Table { v / 32 } else { v };
+            if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
+                let _ = write!(text, " [heap {index}: {slot}]");
+            }
+        }
+        text
     }
 
     /// In a listed frame, right after a dispatch: each 1D or 3D texture it
@@ -1604,7 +1740,9 @@ impl State {
     /// dispatch left there, before anything later in the frame).
     #[cfg(feature = "diagnostics")]
     fn probe_written(&self, list: &HostList) {
-        if !crate::capture::listed(crate::queue::presented() + 1) {
+        // Read back in lists recorded shortly before a listed frame, logged
+        // if the frame that runs the list is listed.
+        if !crate::capture::listed_soon() {
             return;
         }
         let (Some(p), Some(host)) = (crate::pipeline::host_pipeline(self.pipeline as This), crate::host::host()) else {
@@ -1649,6 +1787,9 @@ impl State {
                 let buffer = Readback(buffer);
                 let who = format!("{} s{}+{} {r:#x} {}x{}x{} f{}", stage.shader.hash, u.slot, u.table_offset_dwords, d.Width, d.Height, d.DepthOrArraySize, d.Format.0);
                 list.defer_after(move || {
+                    if !crate::capture::listed(crate::queue::presented() + 1) {
+                        return;
+                    }
                     let mut data = std::ptr::null_mut();
                     // SAFETY: the list has run; the mapping spans the first slice.
                     unsafe {
@@ -1744,7 +1885,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             self.probe_small(list, false);
             #[cfg(feature = "diagnostics")]
-            self.probe_constants(list, false);
+            self.probe_constants(list, false, "draw");
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1839,6 +1980,8 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            self.probe_constants(list, false, "draw");
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1977,6 +2120,8 @@ impl State {
                 kind == DISPATCH,
             )
         });
+        #[cfg(feature = "diagnostics")]
+        self.probe_constants(list, kind == DISPATCH, "indirect");
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
