@@ -683,8 +683,7 @@ fn record(handle: u64, view: View) {
         let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
         if let Some(&i) = views.index.get(&view) {
             let generation = views.list[i as usize].1;
-            // SAFETY: the handle is a descriptor slot, at least 16 bytes.
-            unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+            write_record(handle, i, generation);
             drop(views);
             #[cfg(all(windows, feature = "diagnostics"))]
             crate::copystat::add(crate::copystat::C::RecordFound, 1);
@@ -723,11 +722,26 @@ fn record(handle: u64, view: View) {
         }
     };
     let generation = views.list[i as usize].1;
-    // SAFETY: the handle is a descriptor slot, at least 16 bytes.
-    unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+    write_record(handle, i, generation);
     drop(views);
     #[cfg(windows)]
     mirror(handle);
+}
+
+/// Writes the record of view entry `i`, generation `generation`, at `handle`:
+/// the tag, then the entry and its generation in one store of eight bytes.
+/// Threads recording views share the views table, so two may write one slot
+/// at once (a title's race, but under the table's lock one record or the
+/// other came out whole): the tag is the same from both, and a store of
+/// eight bytes within a cache line lands whole on the processors this runs
+/// on, so the slot holds one thread's entry with its own generation, not
+/// one's entry with the other's generation, which names no view.
+fn write_record(handle: u64, i: u32, generation: u32) {
+    // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+    unsafe {
+        (handle as *mut u32).write_unaligned(VIEW_TAG);
+        ((handle + 4) as *mut u64).write_unaligned(u64::from(generation) << 32 | u64::from(i));
+    }
 }
 
 /// Whether [`record`] looks a view up with the table shared before it
@@ -1701,7 +1715,7 @@ pub(crate) mod tests {
             for i in FIRST..SLOTS {
                 // SAFETY: a slot of the heap.
                 let record = unsafe { ((start + u64::from(i) * 16) as *const [u32; 3]).read_unaligned() };
-                assert!(views_current(&[record])[0]);
+                assert!(views_current(&[record])[0], "round {round}, slot {i}: one thread's record, whole");
                 let key = u64::from(record[2]) << 32 | u64::from(record[1]);
                 assert_eq!(host.made_key(i), key, "round {round}, slot {i}");
             }
