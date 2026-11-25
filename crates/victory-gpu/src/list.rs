@@ -1194,16 +1194,15 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, of which
+/// the host follows one: the counts are threads, not groups
+/// (`crate::threads`; the ray-tracing builder dispatches this way).
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    count_dispatch();
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    with_state(this, |list, s| s.dispatch(list, x, y, z, flags));
     #[cfg(not(windows))]
-    {
-        let _ = (this, x, y, z);
-        count_dispatch();
-    }
+    let _ = (this, x, y, z, flags);
 }
 
 /// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
@@ -1277,10 +1276,78 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// bottom of the pipe `(flags, control, address, size)`. The host orders
+/// nothing between a dispatch's unordered-access writes and what follows
+/// by itself: what the list's shaders wrote is waited for here, as at the
+/// title's barriers (the ray-tracing structure builder has no other wait
+/// between its stages; after avatarmanz 0b5f191b). Submissions are waited
+/// for anyway, so a sync with none of the list's writes before it does
+/// nothing ([`sync_due`]).
+extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
+    #[cfg(windows)]
+    with_state(this, |list, state| {
+        #[cfg(feature = "diagnostics")]
+        {
+            // The shapes of the title's calls, each once.
+            static SEEN: std::sync::Mutex<Vec<(u32, u32, bool)>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let shape = (flags, control, address == 0);
+            if seen.len() < 64 && !seen.contains(&shape) {
+                seen.push(shape);
+                tracing::info!(
+                    flags = format_args!("{flags:#x}"),
+                    control = format_args!("{control:#x}"),
+                    address = format_args!("{address:#x}"),
+                    size = format_args!("{size:#x}"),
+                    barriers = sync_mode(),
+                    "a pipeline sync"
+                );
+            }
+        }
+        if state.synced(list, sync_mode()) {
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+            // SAFETY: the same layout; no resource named.
+            let barrier =
+                unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+    });
+    let _ = (this, flags, control, address, size);
+}
+
+/// What a pipeline sync does on the host: `VICTORY_SYNC_BARRIER=0` nothing,
+/// as before; `2` an unordered-access barrier at every sync; otherwise (1,
+/// the default) one where the host list has writes since the last
+/// ([`sync_due`]). Read once, here.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn sync_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_SYNC_BARRIER").as_deref().map(str::trim) {
+        Ok("0") => 0,
+        Ok("2") => 2,
+        _ => 1,
+    })
+}
+
+/// Whether a pipeline sync puts an unordered-access barrier on the host
+/// list, in `mode` ([`sync_mode`]). `last` and `now`: the host list and
+/// its count of writes (dispatches, buffer copies, clears, immediate
+/// writes) at the last sync that put one, and now. With no such write on
+/// this host list since, there is nothing a barrier would order: what
+/// earlier lists wrote is done before this one starts, and a barrier
+/// between two draws would only end the host's render pass.
+// shortcut: draws that write through unordered access views are not
+// counted as writes; `VICTORY_SYNC_BARRIER=2` if a title orders those by a
+// sync alone.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn sync_due(mode: u8, last: (usize, u64), now: (usize, u64)) -> bool {
+    match mode {
+        0 => false,
+        2 => true,
+        _ => now.1 != 0 && now != last,
+    }
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -1408,9 +1475,20 @@ pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
 /// Draw state the host has no use for (root signatures: ours come with
-/// the pipeline; depth bounds, depth order and shading rate hints): any
-/// arguments, nothing returned.
+/// the pipeline; depth order and shading rate hints): any arguments,
+/// nothing returned.
 extern "system" fn ignored_state(_: This) {}
+
+/// Depth bounds `(min, max)`.
+/// shortcut: not passed on (host pipelines leave the test out,
+/// `pipeline::host`); the first call says so, and the host's support for
+/// the test is logged when its device is made.
+extern "system" fn depth_bounds(_: This, min: f32, max: f32) {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        tracing::info!(min, max, "the title sets depth bounds, which the host is not given")
+    });
+}
 
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
@@ -1586,7 +1664,7 @@ mod state {
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state(this, |list, s| s.dispatch(list, x, y, z, 0));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -1868,7 +1946,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (52, clear_rtv as *const ()),                 // 0x1a0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, ignored_state as *const ()),             // 0x220 depth bounds
+    (68, depth_bounds as *const ()),              // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait32 as *const ()),                    // 0x238 (newer 0x248)
@@ -1953,6 +2031,23 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tracing::{Event, Metadata, Subscriber, span};
+
+    #[test]
+    fn a_sync_orders_the_lists_writes_once() {
+        let (a, b) = (0x1000usize, 0x2000usize);
+        // No write on the list yet: nothing to order.
+        assert!(!sync_due(1, (0, 0), (a, 0)));
+        // A dispatch since: a barrier; a second sync right after: none.
+        assert!(sync_due(1, (0, 0), (a, 1)));
+        assert!(!sync_due(1, (a, 1), (a, 1)));
+        assert!(sync_due(1, (a, 1), (a, 2)));
+        // Another host list (the next segment) with as many writes.
+        assert!(sync_due(1, (a, 2), (b, 2)));
+        assert!(!sync_due(1, (a, 2), (b, 0)));
+        // Off, and at every sync.
+        assert!(!sync_due(0, (0, 0), (a, 5)));
+        assert!(sync_due(2, (a, 5), (a, 5)) && sync_due(2, (0, 0), (a, 0)));
+    }
 
     struct PipelineBinds(Arc<AtomicUsize>);
 

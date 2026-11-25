@@ -210,6 +210,8 @@ mod bitcode;
 mod bvh_tests;
 mod container;
 #[cfg(all(test, windows))]
+mod counted_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod flow_tests;
@@ -360,6 +362,14 @@ pub const ROOT_UAV_VIEW: u32 = 3;
 /// names.
 pub const ROOT_VIEW_OFFSET: u32 = 4;
 
+/// [`UserData::root`] of a dword that is not the title's: the host sets it
+/// before a dispatch counted in threads to the count on axis
+/// [`UserData::dword`] (0 x, 1 y, 2 z), and leaves it 0 for any other
+/// dispatch (all threads of every group run). The program's threads whose
+/// number on that axis is not below a count that is not 0 leave at once
+/// ([`Options::thread_counts`]). `slot` is `u8::MAX`.
+pub const DISPATCH_THREADS: RootType = RootType::Other(0x5448_5244);
+
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
@@ -419,6 +429,22 @@ pub struct Options {
     /// than 32 lanes gets group barriers where its lanes read LDS other
     /// lanes may have written, which the console's lockstep made safe.
     pub narrow_waves: bool,
+    /// Compute programs that reach title memory by address (the console's
+    /// ray-tracing structure builder and its like) are made for dispatches
+    /// counted in threads (`DispatchX` with the console's "use thread
+    /// dimensions" bit): the host runs whole groups, and the threads of
+    /// the last one past the count leave at once. The host sets the counts
+    /// in the user data [`DISPATCH_THREADS`] names; without them every
+    /// thread runs.
+    pub thread_counts: bool,
+    /// Compute programs that reach title memory by address or write
+    /// through root views (the console's ray-tracing structure builder and
+    /// its like) get a fence over unordered-access memory before and after
+    /// each buffer or global atomic: their threads take turns through
+    /// atomics, and what one wrote before its atomic must be seen by the
+    /// thread that comes after it. The console's waits for its writes there
+    /// are not in the translated code.
+    pub atomic_fences: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -839,6 +865,16 @@ fn emit_keeping(
         bias_as_gradients: options.bias_as_gradients,
         narrow_waves: options.narrow_waves,
     };
+    // The structure builder's programs and their like are made for
+    // dispatches counted in threads (`lower::counted`), and with fences
+    // round their buffer atomics (`lower::fence`).
+    let builder = lower::by_address(p, res);
+    let extra = lower::Extra {
+        thread_counts: options.thread_counts && builder,
+        atomic_fences: options.atomic_fences
+            && native.stage == HwStage::Cs
+            && (builder || lower::writes_root_views(native)),
+    };
     // Most programs only interpolate with the barycentric VGPRs, or join
     // them in a former use no lane reads; one that cannot do without them
     // as values is made again with `SV_Barycentrics`.
@@ -850,6 +886,7 @@ fn emit_keeping(
                 options.compact_mesh_interface,
                 options.mesh_stores_last,
                 barycentrics,
+                extra,
             ) {
                 // Discarded lanes kept on as helpers can read what no surviving
                 // lane does (a register only killed lanes skipped writing); such
@@ -866,6 +903,7 @@ fn emit_keeping(
                         options.compact_mesh_interface,
                         options.mesh_stores_last,
                         barycentrics,
+                        extra,
                     )
                 }
                 l => l,

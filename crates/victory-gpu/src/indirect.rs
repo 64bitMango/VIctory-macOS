@@ -11,6 +11,13 @@
 //! so a list of thousands of garbage records cannot run for seconds
 //! either.
 //!
+//! A record the title has not filled runs empty and is charged nothing
+//! ([`unfilled_empty`]): a draw of 2^23 vertices or indices an instance or
+//! more, a mesh dispatch of more than 65,535 groups (it leaves all ones
+//! there). Clamped instead, two such draws took a list's whole budget and
+//! every record after them ran empty, and such a mesh dispatch ran 65,535
+//! groups of whatever lay beside it.
+//!
 //! With a count buffer ExecuteIndirect runs only the first min(max, count)
 //! records, so the clamp reads the count word and stops there: the maximum
 //! can be far above the count, and the records between never run.
@@ -37,18 +44,47 @@ use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0), SRV(t1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint counted; };
+// flags: 1 the title's record count is read, 2 unfilled records run empty.
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint flags; };
 // The title's records, read only; the clamped ones go to the list's own.
 ByteAddressBuffer args : register(t0);
 RWByteAddressBuffer dest : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
-// records run empty.
+// records run empty. Its second word counts the unfilled records.
 RWByteAddressBuffer budget : register(u1);
-// The title's record count: read only if `counted`.
+// The title's record count: read only with flag 1.
 ByteAddressBuffer countWord : register(t1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+// The vertices or indices an instance from which a draw record is none of
+// the title's.
+static const uint MOST_DRAW = 1u << 23;
+// Whether the record at `at` is a slot the title has not filled: it runs
+// empty and costs nothing.
+bool unfilled(uint at) {
+    if ((flags & 2) == 0 || kind == 2) {
+        return false;
+    }
+    uint first = args.Load(at);
+    if (kind <= 1) {
+        return first >= MOST_DRAW;
+    }
+    return first > 65535u;
+}
+// Whether the record at `at` is a dispatch of at most GROUPS groups that
+// asks for more than 65,535 on an axis: it runs 65,535 there (counted in
+// the budget's third word; such a record is no garbage).
+bool cut(uint at) {
+    if (kind != 2) {
+        return false;
+    }
+    uint3 g = args.Load3(at);
+    if (max(g.x, max(g.y, g.z)) <= 65535u || g.x == 0 || g.y == 0 || g.z == 0) {
+        return false;
+    }
+    return g.x <= GROUPS && g.y <= GROUPS / g.x && g.z <= GROUPS / (g.x * g.y);
+}
 // Clamps the record at `at` into `dest`; its cost.
 uint clamped(uint at) {
     uint cost;
@@ -56,6 +92,10 @@ uint clamped(uint at) {
         // Draws: vertex or index count, then instances.
         uint count = min(args.Load(at), 1u << 24);
         uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
+        if (unfilled(at)) {
+            count = 0;
+            instances = 0;
+        }
         cost = count * instances;
         dest.Store2(at, uint2(count, instances));
         // The rest of the record as it is: first vertex and instance (4 words
@@ -77,6 +117,9 @@ uint clamped(uint at) {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = args.Load3(at);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        if (unfilled(at)) {
+            g = uint3(0, 0, 0);
+        }
         cost = g.x * g.y * g.z * 128;
         dest.Store3(at, g);
     }
@@ -102,7 +145,7 @@ void main(uint lane : SV_GroupIndex) {
     // in every lane, and barriers need that; tiles past `walked` only wait
     // at them.
     uint walked = records;
-    if (counted != 0) {
+    if ((flags & 1) != 0) {
         walked = min(records, countWord.Load(0));
     }
     for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
@@ -111,6 +154,14 @@ void main(uint lane : SV_GroupIndex) {
         uint cost = 0;
         if (record < walked) {
             cost = clamped(at);
+            if (unfilled(at)) {
+                uint was;
+                budget.InterlockedAdd(4, 1u, was);
+            }
+            if (cut(at)) {
+                uint were;
+                budget.InterlockedAdd(8, 1u, were);
+            }
         }
         costs[lane] = cost;
         GroupMemoryBarrierWithGroupSync();
@@ -177,7 +228,7 @@ fn make() -> windows::core::Result<Clamp> {
 /// of the same buffers, and one thread charging the records in order
 /// instead of a group of 64. The results are the same.
 const WORDS_SOURCE: &str = r#"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint counted; };
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint flags; };
 StructuredBuffer<uint> argWords : register(t0);
 RWByteAddressBuffer budget : register(u1);
 RWByteAddressBuffer dest : register(u0);
@@ -185,12 +236,37 @@ StructuredBuffer<uint> countWords : register(t1);
 RWStructuredBuffer<uint> budgetWords : register(u2);
 static const uint BUDGET = 1u << 27;
 static const uint GROUPS = 1u << 20;
+static const uint MOST_DRAW = 1u << 23;
 uint3 load3(uint at) { return uint3(argWords[at / 4], argWords[at / 4 + 1], argWords[at / 4 + 2]); }
+bool unfilled(uint at) {
+    if ((flags & 2) == 0 || kind == 2) {
+        return false;
+    }
+    uint first = argWords[at / 4];
+    if (kind <= 1) {
+        return first >= MOST_DRAW;
+    }
+    return first > 65535u;
+}
+bool cut(uint at) {
+    if (kind != 2) {
+        return false;
+    }
+    uint3 g = load3(at);
+    if (max(g.x, max(g.y, g.z)) <= 65535u || g.x == 0 || g.y == 0 || g.z == 0) {
+        return false;
+    }
+    return g.x <= GROUPS && g.y <= GROUPS / g.x && g.z <= GROUPS / (g.x * g.y);
+}
 uint clamped(uint at) {
     uint cost;
     if (kind <= 1) {
         uint count = min(argWords[at / 4], 1u << 24);
         uint instances = min(argWords[at / 4 + 1], (1u << 26) / max(count, 1u));
+        if (unfilled(at)) {
+            count = 0;
+            instances = 0;
+        }
         cost = count * instances;
         dest.Store2(at, uint2(count, instances));
         if (kind == 1) {
@@ -208,6 +284,9 @@ uint clamped(uint at) {
     } else {
         uint3 g = load3(at);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        if (unfilled(at)) {
+            g = uint3(0, 0, 0);
+        }
         cost = g.x * g.y * g.z * 128;
         dest.Store3(at, g);
     }
@@ -216,13 +295,21 @@ uint clamped(uint at) {
 [numthreads(1, 1, 1)]
 void main() {
     uint left = BUDGET - min(budgetWords[0], BUDGET);
+    uint emptied = budgetWords[1];
+    uint cuts = budgetWords[2];
     uint walked = records;
-    if (counted != 0) {
+    if ((flags & 1) != 0) {
         walked = min(records, countWords[0]);
     }
     for (uint record = 0; record < walked; record++) {
         uint at = record * stride;
         uint cost = clamped(at);
+        if (unfilled(at)) {
+            emptied = emptied + 1u;
+        }
+        if (cut(at)) {
+            cuts = cuts + 1u;
+        }
         if (cost > left) {
             // The first record that does not fit takes what is left, so
             // those after it run empty too.
@@ -233,6 +320,8 @@ void main() {
         }
     }
     budget.Store(0, BUDGET - left);
+    budget.Store(4, emptied);
+    budget.Store(8, cuts);
 }
 "#;
 
@@ -371,7 +460,8 @@ unsafe fn run(
     (kind, stride, records): (u32, u32, u32),
     dest: u64,
 ) {
-    let constants = [kind, stride, records, u32::from(count.is_some())];
+    let flags = u32::from(count.is_some()) | u32::from(unfilled_empty()) << 1;
+    let constants = [kind, stride, records, flags];
     // SAFETY: the caller's; our root signature and pipeline.
     unsafe {
         l.SetComputeRootSignature(&c.root);
@@ -389,6 +479,45 @@ unsafe fn run(
         l.Dispatch(records.min(1), 1, 1);
     }
 }
+
+/// Whether a record the title has not filled runs empty and is charged
+/// nothing to its list's budget (the module notes):
+/// `VICTORY_INDIRECT_UNFILLED=0` clamps it like any other, as before.
+/// Read once, here.
+fn unfilled_empty() -> bool {
+    #[cfg(test)]
+    if let Some(on) = tests::UNFILLED.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_INDIRECT_UNFILLED"))
+}
+
+/// Counts the unfilled records a list's clamps ran empty and the indirect
+/// dispatches they cut at 65,535 groups on an axis (the second and third
+/// word of its budget, once it has run).
+pub(crate) fn note_counts(unfilled: u32, cut: u32) {
+    UNFILLED.fetch_add(u64::from(unfilled), Ordering::Relaxed);
+    CUT.fetch_add(u64::from(cut), Ordering::Relaxed);
+}
+
+/// Indirect dispatches of no more than 2^20 groups that asked for more
+/// than 65,535 on an axis and ran 65,535 there, since the last call (the
+/// frame-rate line): groups of the title's that did not run.
+// shortcut: D3D12 names 65,535 groups an axis as the most, and whether
+// D3DMetal runs more is not known; such a dispatch could run in parts (a
+// command signature with a constant for the first group of each part,
+// which the program adds to its group's number) if a title needs them.
+pub(crate) fn take_cut() -> u64 {
+    CUT.swap(0, Ordering::Relaxed)
+}
+static CUT: AtomicU64 = AtomicU64::new(0);
+
+/// Unfilled records run empty since the last call (the frame-rate line).
+pub(crate) fn take_unfilled() -> u64 {
+    UNFILLED.swap(0, Ordering::Relaxed)
+}
+static UNFILLED: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the clamps of a run of indirect draws go to the host list
 /// before the one that draws (`VICTORY_HOIST_CLAMPS=0`: each before its
@@ -479,6 +608,18 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        /// This thread's [`super::unfilled_empty`], where a test sets it.
+        pub(super) static UNFILLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// The most vertices a draw record of the title's has, and the
+    /// instances such a record is clamped to (2^26 vertex instances).
+    const MOST: u32 = (1 << 23) - 1;
+    /// A draw record of [`MOST`] vertices and any instances: clamped to 8
+    /// instances, two of them fit a list's budget.
+    const LARGE: [u32; 4] = [MOST, u32::MAX, 0, 0];
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
@@ -546,17 +687,63 @@ mod tests {
         }
     }
 
-    /// Rejected records do not wrap the budget: of 128 garbage draws (2^26
-    /// vertex instances each once clamped) two run, where a wrapping add
-    /// let four; of 600 garbage mesh dispatches 16, not 31.
+    /// Rejected records do not wrap the budget: of 128 large draws (2^26
+    /// vertex instances each once clamped, less 8) two run, where a
+    /// wrapping add let four; of 600 mesh dispatches of 65,535 groups 16,
+    /// not 31.
     #[test]
     fn rejected_records_do_not_wrap_the_budget() {
-        let Some(draws) = clamped(0, &[u32::MAX], 128, 1) else {
+        let Some(draws) = clamped(0, &LARGE, 128, 1) else {
             return; // no host GPU here
         };
         assert_eq!(draws.iter().filter(|&&count| count != 0).count(), 2);
-        let meshes = clamped(10, &[u32::MAX], 600, 1).unwrap();
+        let meshes = clamped(10, &[65_535, 1, 1], 600, 1).unwrap();
         assert_eq!(meshes.iter().filter(|&&groups| groups != 0).count(), 16);
+    }
+
+    /// Records the title has not filled run empty and cost nothing: the
+    /// draws between them all run, where clamped (as before, and with
+    /// `VICTORY_INDIRECT_UNFILLED=0`) the unfilled ones took the budget and
+    /// the draws after them ran empty. Likewise mesh dispatches of more
+    /// than 65,535 groups, which were 65,535.
+    #[test]
+    fn unfilled_records_run_empty_and_cost_nothing() {
+        // In turn: 2^23 vertices (the least that is no draw), a draw of
+        // 100, all ones, a draw of 7.
+        let mut words = vec![1 << 23, 5, 0, 0, 100, 1, 0, 0];
+        words.extend([u32::MAX; 4]);
+        words.extend([7, 1, 0, 0]);
+        let before = super::UNFILLED.load(super::Ordering::Relaxed);
+        let Some(draws) = clamped(0, &words, 64, 1) else {
+            return; // no host GPU here
+        };
+        for (i, &count) in draws.iter().enumerate() {
+            assert_eq!(count, [0, 100, 0, 7][i % 4], "record {i}");
+        }
+        // Counted for the frame line (other tests may add their own).
+        assert!(super::UNFILLED.load(super::Ordering::Relaxed) >= before + 32);
+        // The largest draw of the title's still runs.
+        let most = clamped(0, &[MOST, 1, 0, 0], 4, 1).unwrap();
+        assert_eq!(most, [MOST; 4]);
+        let meshes = clamped(10, &[u32::MAX, u32::MAX, u32::MAX, 5, 1, 1, 65_536, 1, 1, 65_535, 1, 1], 8, 1).unwrap();
+        assert_eq!(meshes, [0, 5, 0, 65_535, 0, 5, 0, 65_535]);
+        // Indirect dispatches are not told apart: clamped as before, and
+        // counted as cut where they are no garbage.
+        let cut = super::CUT.load(super::Ordering::Relaxed);
+        let dispatches = clamped(2, &[70_000, 1, 1, u32::MAX, u32::MAX, u32::MAX, 65_535, 2, 1], 3, 1).unwrap();
+        assert_eq!(dispatches, [65_535, 0, 65_535]);
+        assert!(super::CUT.load(super::Ordering::Relaxed) > cut);
+
+        UNFILLED.set(Some(false));
+        let draws = clamped(0, &words, 64, 1);
+        let meshes = clamped(10, &[u32::MAX, u32::MAX, u32::MAX, 5, 1, 1], 4, 1);
+        UNFILLED.set(None);
+        let draws = draws.unwrap();
+        // 5 * 2^23, 100 and 2^26 fit; the next unfilled record does not,
+        // and nothing after it runs.
+        assert_eq!(draws[..5], [1 << 23, 100, 1 << 24, 7, 0]);
+        assert!(draws[5..].iter().all(|&count| count == 0));
+        assert_eq!(meshes.unwrap(), [65_535, 5, 65_535, 5]);
     }
 
     /// The budget goes to the first records, in order: of 200 draws of
@@ -578,7 +765,7 @@ mod tests {
     /// ones after it run empty.
     #[test]
     fn a_record_that_does_not_fit_ends_the_budget() {
-        let mut words = [1 << 24, 3, 0, 0].repeat(3);
+        let mut words = [1 << 22, 12, 0, 0].repeat(3);
         words.extend([3, 1, 0, 0].repeat(6));
         let Some(draws) = clamped(0, &words, 8, 1) else {
             return; // no host GPU here
@@ -644,8 +831,8 @@ mod tests {
     /// Hoisted clamps (`bound_before`) leave the clamped records in the
     /// drawing list's own buffer, one run of records after the other, and
     /// charge the budget of the list before in the order of the draws: of
-    /// two draws of four garbage records (2^26 vertex instances each once
-    /// clamped) the first two records of the first fit, none of the second;
+    /// two draws of four large records (2^26 vertex instances each once
+    /// clamped, less 8) the first two records of the first fit, none of the second;
     /// under a count of 1 only the first is clamped. Every barrier starts
     /// from the buffer's current state, the title's copy is never
     /// transitioned and all end common.
@@ -668,7 +855,7 @@ mod tests {
             // read after they have; live buffers.
             unsafe {
                 for at in 0..per * records as usize {
-                    data.cast::<u32>().add(at).write_volatile(u32::MAX);
+                    data.cast::<u32>().add(at).write_volatile(LARGE[at % per]);
                 }
                 word.cast::<u32>().write_volatile(count.unwrap_or(0));
                 let gpu = title.GetGPUVirtualAddress();
@@ -694,12 +881,12 @@ mod tests {
                 let out = out.cast::<u32>();
                 let counts: Vec<u32> = (0..2 * records as usize).map(|i| out.add(i * per).read_volatile()).collect();
                 match count {
-                    None => assert_eq!(counts, [1 << 24, 1 << 24, 0, 0, 0, 0, 0, 0]),
+                    None => assert_eq!(counts, [MOST, MOST, 0, 0, 0, 0, 0, 0]),
                     // The words past the count stay as the fresh buffer's.
-                    Some(_) => assert_eq!(counts, [1 << 24, 0, 0, 0, 1 << 24, 0, 0, 0]),
+                    Some(_) => assert_eq!(counts, [MOST, 0, 0, 0, MOST, 0, 0, 0]),
                 }
                 for at in 0..per * records as usize {
-                    assert_eq!(data.cast::<u32>().add(at).read_volatile(), u32::MAX, "the title's copy as written");
+                    assert_eq!(data.cast::<u32>().add(at).read_volatile(), LARGE[at % per], "the title's copy as written");
                 }
             }
         }
@@ -709,29 +896,31 @@ mod tests {
     /// finds it spent, and they all run empty.
     #[test]
     fn a_spent_budget_stays_spent() {
-        let Some(twice) = clamped(1, &[u32::MAX], 64, 2) else {
+        let Some(twice) = clamped(1, &[MOST, u32::MAX, 0, 0, 0], 64, 2) else {
             return; // no host GPU here
         };
         assert!(twice.iter().all(|&count| count == 0));
+        let once = clamped(1, &[MOST, u32::MAX, 0, 0, 0], 64, 1).unwrap();
+        assert_eq!(once.iter().filter(|&&count| count != 0).count(), 2, "which a first execution has room for");
     }
 
-    /// The walk stops at the count: of 128 garbage draws under a count of 3
+    /// The walk stops at the count: of 128 large draws under a count of 3
     /// the first two run and the third runs empty, as they do without one,
     /// and the others are never read (the argument buffer's fresh words stay
     /// zero). A count above the records changes nothing; a count of zero
     /// walks none.
     #[test]
     fn the_walk_stops_at_the_count() {
-        let Some(under) = clamped_under(0, &[u32::MAX], 128, 1, Some(3)) else {
+        let Some(under) = clamped_under(0, &LARGE, 128, 1, Some(3)) else {
             return; // no host GPU here
         };
-        assert_eq!(under[..3], [1 << 24, 1 << 24, 0]);
+        assert_eq!(under[..3], [MOST, MOST, 0]);
         assert!(under[3..].iter().all(|&count| count == 0));
-        let all = clamped(0, &[u32::MAX], 128, 1).unwrap();
+        let all = clamped(0, &LARGE, 128, 1).unwrap();
         assert_eq!(under[..3], all[..3]);
-        let above = clamped_under(0, &[u32::MAX], 128, 1, Some(1 << 20)).unwrap();
+        let above = clamped_under(0, &LARGE, 128, 1, Some(1 << 20)).unwrap();
         assert_eq!(above, all);
-        let none = clamped_under(0, &[u32::MAX], 128, 1, Some(0)).unwrap();
+        let none = clamped_under(0, &LARGE, 128, 1, Some(0)).unwrap();
         assert!(none.iter().all(|&count| count == 0));
     }
 
@@ -740,11 +929,11 @@ mod tests {
     /// the same draws with no count spent it all on records that never ran.
     #[test]
     fn records_past_the_count_are_not_charged() {
-        let Some(twice) = clamped_under(0, &[u32::MAX], 128, 2, Some(1)) else {
+        let Some(twice) = clamped_under(0, &LARGE, 128, 2, Some(1)) else {
             return; // no host GPU here
         };
-        assert_eq!(twice[0], 1 << 24);
-        let spent = clamped(0, &[u32::MAX], 128, 2).unwrap();
+        assert_eq!(twice[0], MOST);
+        let spent = clamped(0, &LARGE, 128, 2).unwrap();
         assert!(spent.iter().all(|&count| count == 0));
     }
 }

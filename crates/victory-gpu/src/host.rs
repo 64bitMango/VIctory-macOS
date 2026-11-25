@@ -255,6 +255,22 @@ fn create() -> windows::core::Result<Host> {
         let cpu_view_size =
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         tracing::info!("host D3D12 device ready");
+        // The depth bounds test, which host pipelines leave out so far
+        // (`pipeline::host`, subobject 21; the list's own call is not
+        // passed on): whether this host could run it.
+        let mut options2 = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+        let asked = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS2,
+                (&raw mut options2).cast(),
+                size_of_val(&options2) as u32,
+            )
+            .is_ok();
+        tracing::info!(
+            supported = asked && options2.DepthBoundsTestSupported.as_bool(),
+            answered = asked,
+            "host depth bounds test support (D3D12_OPTIONS2.DepthBoundsTestSupported)"
+        );
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
@@ -2392,10 +2408,18 @@ impl HostList {
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
+            // SAFETY: the list's own mapped words (the budget spent, the
+            // unfilled records run empty, the dispatches cut), written
+            // before it runs.
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
-                (at as *mut u32).write_volatile(0)
+                (at as *mut [u32; 3]).write_volatile([0; 3])
             })));
+            deferred.after.push(Box::new(move || {
+                // SAFETY: the same words, read once the list has run; the
+                // buffer lives as long as the list.
+                let [_, unfilled, cut] = unsafe { (at as *const [u32; 3]).read_volatile() };
+                crate::indirect::note_counts(unfilled, cut);
+            }));
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
@@ -3350,6 +3374,8 @@ impl Meter {
         let indirect = crate::list::take_indirect() as f64 / frames;
         let [records, counted] = crate::indirect::take_records().map(|n| n as f64 / frames);
         let hoisted = crate::indirect::take_hoisted() as f64 / frames;
+        let unfilled = crate::indirect::take_unfilled() as f64 / frames;
+        let cut = crate::indirect::take_cut() as f64 / frames;
         let hoists = crate::list::take_hoists() as f64 / frames;
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
         // Over the same frames as the counts above.
@@ -3363,7 +3389,8 @@ impl Meter {
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
-                 max records {records:.0}/frame ({counted:.0} under a count), {hoisted:.0} clamps/frame \
+                 max records {records:.0}/frame ({counted:.0} under a count, {unfilled:.0} unfilled \
+                 run empty, {cut:.0} dispatches cut at 65,535 groups), {hoisted:.0} clamps/frame \
                  in the list before their draw's ({hoists:.0} lists cut for them)",
                 making = crate::pipeline::making()
             );
