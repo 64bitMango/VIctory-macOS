@@ -71,6 +71,9 @@ pub(crate) struct Shader {
     /// Its result gets the least indirect light ([`crate::ambient`]).
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
+    /// It draws the sky as the title reflects it ([`crate::ambient::SKY`]).
+    #[cfg(windows)]
+    pub(crate) draws_sky: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Mesh: translations without the vertex outputs a pixel shader does
@@ -112,6 +115,10 @@ impl Shader {
             resolves_light: bytes
                 .windows(crate::ambient::PROGRAM.len())
                 .any(|w| w == crate::ambient::PROGRAM),
+            #[cfg(windows)]
+            draws_sky: bytes
+                .windows(crate::ambient::SKY.len())
+                .any(|w| w == crate::ambient::SKY),
             #[cfg(windows)]
             translated: OnceLock::new(),
             #[cfg(windows)]
