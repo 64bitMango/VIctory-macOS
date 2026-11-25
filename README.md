@@ -53,13 +53,7 @@ Several people who own the game have run it on their Macs and reported back in t
 | M3 Max, Series X | On 25 November the picture showed with no workaround. The intro played and the game reached the opening title card, where it froze while Apple's shader compiler kept crashing. A second run with a warm shader cache had no compiler crashes, but the window went black after the loading artwork. In a later run the game world appeared on screen before the game's own watchdog stopped it, with frames taking up to 28 seconds, most of it copying memory. With the store patch from #59 and #60 and fault tracking on, loading ran at 26 fps instead of 8 and copies fell from 158.7 MB to under 1 MB per frame, until a freeze about three minutes in. After the freeze fixes, plain main stayed in the world for over 20 minutes without freezing, at 0.1 to 0.2 fps, with far fewer shader compiler crashes (37 against about 150). With today's speed changes frames there were 14% faster, and a later run stayed in the world for 11 minutes before the game's own timing checks gave up at about 12 seconds per frame. | #50 |
 
 
-
-
-<p align="center"><video src="" width="720" controls></video><br><sub>Seven minutes from launch on jgrizon's M5 Pro (24 GB), current main, 25 November 2026 (#65).</sub></p>
-
-
-
-<p align="center"><video src="" width="720" controls></video><br><sub>Current main loading into the world without freezing on LakshanSivakumar's M5 Pro, at 0.2 fps, 25 November 2026 (#50).</sub></p>
+<p align="center">More screenshots and videos from testers are in <a href="docs/gallery.md">docs/gallery.md</a>.</p>
 
 The black screen from #15 is solved: VIctory now shows the larger of the images the game presents, and `VICTORY_PRESENT_COMPOSITE=1` also draws the Series S overlay on top. Loading used to crawl because VIctory copied all of the game's memory on every submission, since tracking which pages changed hangs Rosetta on the game's AVX stores. #59 and #60 rewrite those 1,234 stores at load time so tracking can run. The loading freeze is fixed: Wine's file metadata calls from our shader cache (#72, #75) and write guards that reached the process heap (#78) caused two deadlocks. The open problems now are the game's speed in the world (2.4 to 2.9 seconds per frame after #111, split between preparing copies, the GPU, copying back and memory protection changes) and crashes in Apple's shader compiler while the game builds its world shaders.
 
