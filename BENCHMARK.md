@@ -1,5 +1,39 @@
 # Radeon runtime testing, 25 November 2026
 
+## Experimental RT in Chapter 1 City
+
+On an RX 7900 XTX, the runtime reached the outdoor City scene from a copied
+autosave with the dynamic structure builder, traversal and lighting resolve
+enabled. After GPU completion, a counter on the selected traversal shader
+recorded 6,074,512 active node visits and 848 finite, in-range triangle
+candidates by frame 1,204. These are cumulative counts for one shader.
+They establish that rays intersect scene geometry. Verification of lighting
+on individual objects and of every bounce is still open.
+
+The CPU previously declared every mapped guest memory window writable even
+when a traversal shader only read through the page directory. The corrected
+translator distinguishes guest-memory writes from output to a separate UAV.
+Two runs used the same City autosave on the same card, with all three RT
+stages and the intersection counter enabled. The sample covers frames 31–80
+after the first heavy scene frame in each run.
+
+| City measurement | Before write tracking fix | With write tracking fix |
+| --- | ---: | ---: |
+| Mean frame time | 3,469 ms | 969 ms |
+| Average FPS (50 frames / elapsed time) | 0.29 | 1.03 |
+| Median frame time | 3,355 ms | 936 ms |
+| 95th-percentile frame time | 4,457 ms | 1,214 ms |
+| Guest memory outside registered buffers compared per frame | 12,793 MB | 2,655 MB |
+| Wait per frame for guest memory reads | 2,036 ms | 95 ms |
+| Draws per frame | 12,583 | 12,520 |
+
+The updated run passed five million cumulative in-range triangle candidates
+by frame 1,265. This is one before-and-after measurement on one system.
+City can still exhaust the page directory's 1,023 backing-copy slots. A
+missing mapping can return zero or lose a write.
+
+## Previous Radeon test results
+
 The Windows diagnostics release at `e061c69032b84ec6e2ec17340469cd689500dafd` built with the pinned toolchain. It includes GPU readback changes from `6a4e2b1` and descriptor allocation changes from `e061c69`.
 
 | Check | Result |
