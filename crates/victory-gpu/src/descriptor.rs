@@ -93,7 +93,8 @@ impl Heap {
         }
         // Submissions held off while a view heap is made and filled
         // (`Host::quiet`), from before `pending` is taken: `mirror` waits
-        // for that with `SHADER_HEAPS` held, which a submission waits for.
+        // for that with `SHADER_HEAPS` held, which a submission may wait
+        // for (behind a thread waiting to hold it alone).
         let _quiet = (self.desc.kind == VIEWS_KIND)
             .then(|| crate::host::host()?.quiet())
             .flatten();
@@ -127,8 +128,97 @@ const SHADER_VISIBLE: u32 = 1;
 
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap.
+///
+/// A read-write lock. As a mutex it was held by every title thread for the
+/// whole of each view it wrote into a heap, and by the submitting thread
+/// for the whole of each heap sync: the title's recording threads waited
+/// 200-390 ms a frame on it (run ab-all1), taking turns at work that is
+/// each heap's own. Held shared ([`heaps`]) by what looks a heap up and
+/// then works under that heap's locks: [`mirror`], [`sync_heaps`],
+/// [`read_textures`], [`release_dynamic`], [`with_host`]. Held alone
+/// ([`heaps_alone`]) to register and drop a heap, and by the passes whose
+/// steps are one against every slot write: [`make_read`], [`evict`],
+/// [`with_slots_still`]. `VICTORY_HEAPS_SHARED=0` holds it alone
+/// everywhere, as the mutex was.
+///
+/// What the mutex gave, and what gives it now:
+/// - A registered heap is live while the lock is held: `Heap::drop` holds
+///   it alone.
+/// - The list does not change under a walk of it: registering holds it
+///   alone.
+/// - One thread at a time makes a slot: the slot lock
+///   (`host::HostHeap::made`), held from reading the slot's record to
+///   entering what it views (`host::HostHeap::mirror`). Draws recorded
+///   while a title thread wrote or a sync ran always relied on that alone;
+///   now title threads and heap syncs do too.
+/// - A sync leaves every slot as the title's record of it was when the
+///   sync looked: it looks at the records of the pages written, and makes
+///   each slot that differs through `mirror`, which reads the record again
+///   under the slot lock. A title thread writing a slot meanwhile makes it
+///   itself after its write (its own `mirror`), or dirties the page for
+///   the next sync (bytes copied without a call); whichever thread takes
+///   the slot lock last read the record last. A write that had not
+///   returned when the submission began was never part of it: with the
+///   mutex its `mirror` could as well wait out the whole sync.
+/// - The passes held alone see no slot written meanwhile by a title thread
+///   or a sync, as before (draws being recorded were never held off).
+///
+/// Lock order (each only with those before it held or none): a
+/// submission's turn (`Host::submitted`, also `Host::quiet`), this lock,
+/// a heap's `pending`, a host heap's slot lock `made`, then the leaves:
+/// [`VIEWS`] (shared), `kept`, `crate::bindless::Viewed`, the copies'
+/// registries (`crate::shadow`). [`with_slots_still`] takes every heap's
+/// slot lock in the list's order, under this lock held alone. Nothing takes
+/// this lock while it holds it (a second shared hold behind a waiting
+/// exclusive one would not return).
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+static SHADER_HEAPS: std::sync::RwLock<Vec<Registration>> = std::sync::RwLock::new(Vec::new());
+
+/// [`SHADER_HEAPS`] held shared, or alone with `VICTORY_HEAPS_SHARED=0`.
+#[cfg(windows)]
+enum Heaps {
+    Shared(std::sync::RwLockReadGuard<'static, Vec<Registration>>),
+    Alone(std::sync::RwLockWriteGuard<'static, Vec<Registration>>),
+}
+
+#[cfg(windows)]
+impl std::ops::Deref for Heaps {
+    type Target = Vec<Registration>;
+    fn deref(&self) -> &Vec<Registration> {
+        match self {
+            Heaps::Shared(heaps) => heaps,
+            Heaps::Alone(heaps) => heaps,
+        }
+    }
+}
+
+/// Whether [`heaps`] shares the lock: unless `VICTORY_HEAPS_SHARED=0`.
+#[cfg(windows)]
+fn heaps_shared() -> bool {
+    #[cfg(test)]
+    if tests::HEAPS_ALONE.with(|alone| alone.get()) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_HEAPS_SHARED"))
+}
+
+/// The registered heaps, live and the same ones until the guard is dropped;
+/// other threads may hold them too.
+#[cfg(windows)]
+fn heaps() -> Heaps {
+    if heaps_shared() {
+        Heaps::Shared(SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()))
+    } else {
+        Heaps::Alone(heaps_alone())
+    }
+}
+
+/// The registered heaps with no other thread holding them.
+#[cfg(windows)]
+fn heaps_alone() -> std::sync::RwLockWriteGuard<'static, Vec<Registration>> {
+    SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner())
+}
 
 #[cfg(any(windows, test))]
 type Registration = (u64, u64, usize);
@@ -169,13 +259,13 @@ fn heap_at(heaps: &[Registration], handle: u64) -> Option<usize> {
 }
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
-/// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
-/// so `Heap::drop` cannot free the heap concurrently.
+/// is in a shader-visible heap. Keeps `SHADER_HEAPS` held (shared) for the
+/// duration so `Heap::drop` cannot free the heap concurrently.
 #[cfg(windows)]
 fn mirror(handle: u64) {
     #[cfg(feature = "diagnostics")]
     let waited = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MirrorWaitUs);
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps();
     #[cfg(feature = "diagnostics")]
     drop(waited);
     let Some(at) = heap_at(&heaps, handle) else {
@@ -209,7 +299,8 @@ fn mirror(handle: u64) {
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
     // Held throughout: a heap is not dropped while its slots are made.
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    // Shared: title threads write views meanwhile (`SHADER_HEAPS`).
+    let heaps = heaps();
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -252,7 +343,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     // runs evict2, noevict1). They are never released, so they outlive it;
     // the lock is held only to look the slots up and to make the views.
     let placed: Vec<View> = {
-        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = heaps_alone();
         heaps
             .iter()
             // SAFETY: registered heaps are live (removed when dropped).
@@ -269,7 +360,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     crate::texture::in_parallel(placed.len(), |i| {
         let _ = host::placed_texture(&placed[i]);
     });
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps_alone();
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -290,7 +381,7 @@ pub(crate) fn make_read(slots: &[u32]) {
 /// shader-visible view heaps view.
 #[cfg(windows)]
 pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps();
     let mut textures = std::collections::HashSet::new();
     for &(_, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -307,7 +398,7 @@ pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
 /// (`crate::resource::evict` gives those textures up).
 #[cfg(windows)]
 pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps_alone();
     for &(_, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -328,7 +419,7 @@ pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
 pub(crate) fn with_slots_still<R>(
     f: impl FnOnce(&dyn Fn(&std::collections::HashSet<usize>) -> std::collections::HashSet<usize>) -> R,
 ) -> R {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps_alone();
     let hosts: Vec<&host::HostHeap> = heaps
         .iter()
         // SAFETY: registered heaps are live (removed when dropped, which
@@ -343,7 +434,7 @@ pub(crate) fn with_slots_still<R>(
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps();
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
@@ -356,7 +447,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 /// heap cannot be released; None if it is gone or has no host heap.
 #[cfg(windows)]
 pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) -> Option<R> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps();
     if !heaps.iter().any(|&(_, _, h)| h == heap) {
         return None;
     }
@@ -370,7 +461,7 @@ pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) ->
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = heaps_alone();
         unregister_heap(&mut heaps, at);
     }
 }
@@ -875,7 +966,7 @@ pub(crate) extern "system" fn create_heap(
     let result = object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out);
     #[cfg(windows)]
     if visible && result == crate::object::S_OK {
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = heaps_alone();
         register_heap(&mut heaps, (start, start + size), at);
     }
     result
@@ -937,6 +1028,9 @@ pub(crate) mod tests {
         /// This thread asks the view entries themselves whether records are
         /// current (as `VICTORY_SLOT_GENERATIONS=0`).
         pub(crate) static FROM_ENTRIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// This thread holds the heaps' lock alone wherever it takes it (as
+        /// `VICTORY_HEAPS_SHARED=0`).
+        pub(crate) static HEAPS_ALONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// Whether the generations kept alone are the entries' own.
@@ -1191,7 +1285,7 @@ pub(crate) mod tests {
         let old = owner(desc, placement);
         let new = owner(desc, placement);
         {
-            let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
             assert_eq!(
                 heaps
                     .iter()
@@ -1244,7 +1338,7 @@ pub(crate) mod tests {
             crate::object::S_FALSE
         );
         {
-            let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
             assert_eq!(heap_at(&heaps, address), Some(existing.0 as usize));
         }
         create_cbv(std::ptr::null(), &[0x3000, 1, 256, 0], address);
