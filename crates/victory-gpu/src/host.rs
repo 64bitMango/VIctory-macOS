@@ -2,7 +2,9 @@
 //! window to present on.
 //!
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
-//! overlap them with per-submission fences once more than clears run.
+//! overlap them with per-submission fences once more than clears run. With
+//! `VICTORY_ASYNC_SUBMIT=1` the title's submissions that owe nothing after
+//! their run are not (`crate::unwaited`).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -59,9 +61,42 @@ impl Drop for Holding {
 
 /// Submissions held off ([`Host::quiet`]).
 pub(crate) struct Quiet<'a> {
-    // Dropped in this order: the mark, then the lock.
+    // Dropped in this order: the mark, then the lock, then the lists an
+    // unwaited submission held.
     _holding: Holding,
     _held: std::sync::MutexGuard<'a, u64>,
+    _finished: Finished,
+}
+
+/// A submission the host GPU may still be running (`crate::unwaited`).
+struct Unwaited {
+    /// Its value of the host fence.
+    value: u64,
+    /// Its lists, which hold what their commands name until they are reset.
+    lists: Vec<std::sync::Arc<HostList>>,
+    /// What a waited submission holds until it has run.
+    kept: Box<dyn std::any::Any + Send>,
+}
+
+// SAFETY: host lists are free-threaded objects, used by one thread at a
+// time (the one holding the submission lock).
+unsafe impl Send for Unwaited {}
+
+/// Whether a submission is unwaited: read without a lock by what would
+/// finish it.
+static IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Host lists an unwaited submission held, given back
+/// (`crate::list::recycle`) when dropped: declared before the submission
+/// lock is taken, so that resetting them (which frees what title lists left
+/// them, under locks of its own) happens after the lock is released.
+#[derive(Default)]
+struct Finished(Vec<std::sync::Arc<HostList>>);
+
+impl Drop for Finished {
+    fn drop(&mut self) {
+        self.0.drain(..).for_each(crate::list::recycle);
+    }
 }
 
 pub(crate) struct Host {
@@ -70,6 +105,9 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// The unwaited submission and the Signals kept behind it: set and
+    /// finished under the submission lock.
+    unwaited: Mutex<crate::unwaited::Slot<Unwaited>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -167,6 +205,55 @@ pub(crate) fn host() -> Option<&'static Host> {
         }
     })
     .as_ref()
+}
+
+/// Finishes the unwaited submission, if there is one
+/// (`crate::unwaited::finish`): whether there was.
+pub(crate) fn finish_unwaited(by: crate::unwaited::By) -> bool {
+    // A thread holding the submission lock has finished it already.
+    if !IN_FLIGHT.load(Ordering::Acquire) || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
+        return false;
+    }
+    let Some(host) = host() else { return false };
+    let mut finished = Finished::default();
+    let _submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    let _holding = Holding::enter();
+    host.finish(by, &mut finished)
+}
+
+/// The same, if the host GPU is done with it and no thread is submitting:
+/// for calls that poll.
+pub(crate) fn finish_unwaited_if_done() -> bool {
+    if !IN_FLIGHT.load(Ordering::Acquire) || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
+        return false;
+    }
+    let Some(host) = host() else { return false };
+    let value = host.unwaited.lock().unwrap_or_else(|e| e.into_inner()).get().map(|u| u.value);
+    // SAFETY: our fence.
+    if value.is_none_or(|v| unsafe { host.fence.GetCompletedValue() } < v) {
+        return false;
+    }
+    let mut finished = Finished::default();
+    let Ok(_submitted) = host.submitted.try_lock() else {
+        return false;
+    };
+    let _holding = Holding::enter();
+    host.finish(crate::unwaited::By::Done, &mut finished)
+}
+
+/// A queue's Signal of `fence` (kept by the caller): whether it was kept
+/// behind the unwaited submission, to be made (and the fence let go) when
+/// that is finished. If not, none is unwaited and the caller makes it.
+pub(crate) fn signal_after_unwaited(fence: usize, value: u64) -> bool {
+    if !IN_FLIGHT.load(Ordering::Acquire) {
+        return false;
+    }
+    let Some(host) = host() else { return false };
+    let kept = host.unwaited.lock().unwrap_or_else(|e| e.into_inner()).signal(fence, value);
+    if kept {
+        crate::unwaited::note_signal();
+    }
+    kept
 }
 
 fn create() -> windows::core::Result<Host> {
@@ -274,6 +361,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            unwaited: Mutex::new(crate::unwaited::Slot::new()),
             event,
             rtvs,
             rtv_size,
@@ -458,7 +546,7 @@ pub(crate) mod tests {
     fn read_marks_of_both_bitmaps_are_taken() {
         let Some(host) = host() else { return };
         // No submission takes the marks meanwhile.
-        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = host.alone();
         let (plain, memory) = (victory_shader::emit::HEAP_VIEWS - 2, victory_shader::emit::HEAP_VIEWS - 1);
         crate::shadow::tests::mark_read(false, plain);
         crate::shadow::tests::mark_read(true, memory);
@@ -498,7 +586,7 @@ pub(crate) mod tests {
         let texture = crate::resource::texture_at(address, &words).expect("its resource");
         let raw = windows::core::Interface::as_raw(&crate::resource::made_copy(texture).unwrap().texture) as usize;
         // No submission takes the marks meanwhile.
-        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = host.alone();
         for _ in 0..2 {
             crate::shadow::tests::mark_read(false, 0);
             let slots = crate::shadow::reads_since();
@@ -545,7 +633,7 @@ pub(crate) mod tests {
         let (idle_frames, idle_ms) = (crate::resource::IDLE_FRAMES, crate::resource::IDLE_MS);
         {
             // No submission takes the marks meanwhile.
-            let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let _one = host.alone();
             // Passes a third of the idle limits apart, over three times them.
             for k in 0..10 {
                 crate::shadow::tests::mark_read(false, 5);
@@ -590,7 +678,7 @@ pub(crate) mod tests {
         let viewed = std::sync::Arc::new(crate::bindless::Viewed::default());
         viewed.set(0, Some(&crate::descriptor::View::Shader(object as usize, Some(desc))), true);
         // No submission uploads meanwhile.
-        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = host.alone();
         // SAFETY: the texture's memory, 256-byte rows of 64 texels.
         unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64 * 4) };
         copy.unstamp();
@@ -626,7 +714,7 @@ pub(crate) mod tests {
             })
             .collect();
         // No submission uploads meanwhile.
-        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = host.alone();
         let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[]);
         for &object in &objects {
             assert_eq!(crate::texture::uploads(object), 1, "each brought up once");
@@ -1053,6 +1141,12 @@ struct Deferred {
     /// The buffer copies its commands use (by address), until it has run:
     /// not released for idleness meanwhile (`crate::shadow::Flight`).
     flying: std::collections::HashMap<usize, crate::shadow::Flight>,
+    /// Whether a shader of the list writes through views it takes from the
+    /// heap itself: ranges no step declares (`crate::unwaited`).
+    heap_writes: bool,
+    /// What a title list owned that this one may read, left to it when the
+    /// title list was reset or released first (`crate::list`).
+    left: Vec<Box<dyn std::any::Any + Send>>,
 }
 
 impl Host {
@@ -1221,24 +1315,152 @@ impl Host {
         if !crate::shader_cache::under_wine() || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
             return None;
         }
+        let mut finished = Finished::default();
         let held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        Some(Quiet { _holding: Holding::enter(), _held: held })
+        let holding = Holding::enter();
+        // An unwaited submission would run during the fill.
+        if IN_FLIGHT.load(Ordering::Acquire) {
+            self.finish(crate::unwaited::By::Heap, &mut finished);
+        }
+        Some(Quiet { _holding: holding, _held: held, _finished: finished })
+    }
+
+    /// Tests: no submission is made, and none runs, while this is held.
+    #[cfg(test)]
+    pub(crate) fn alone(&self) -> Quiet<'_> {
+        let mut finished = Finished::default();
+        let held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let holding = Holding::enter();
+        self.finish(crate::unwaited::By::Ours, &mut finished);
+        Quiet { _holding: holding, _held: held, _finished: finished }
     }
 
     /// Runs `f` while no submission runs (tests).
     #[cfg(test)]
     pub(crate) fn between_submissions<R>(&self, f: impl FnOnce() -> R) -> R {
-        let _submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        let _holding = Holding::enter();
+        let _alone = self.alone();
         f()
     }
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        self.submit(runs, None);
+    }
+
+    /// [`Host::execute`] for a submission of the title's, which may return
+    /// before the host GPU has run it (`crate::unwaited`): why it was
+    /// waited for, if it was. The lists are kept until it is finished.
+    pub(crate) fn execute_title(&self, runs: &[std::sync::Arc<HostList>]) -> Option<crate::unwaited::Waited> {
+        let lists: Vec<&HostList> = runs.iter().map(|l| &**l).collect();
+        self.submit(&lists, Some(runs))
+    }
+
+    /// Brings the buffer ranges `runs` ask for up to date while the
+    /// unwaited submission still runs: the refreshes their steps make,
+    /// early. That submission writes no buffer copy, and what the title
+    /// changed since it was made it does not read (`crate::unwaited`). The
+    /// steps do it all again in their order once it is finished, and find
+    /// little left. Nothing else of the preparation is safe before then.
+    fn prewarm(&self, runs: &[&HostList]) {
+        let started = std::time::Instant::now();
+        let mut batch = Batch::default();
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Refresh(shadow, address, len) = step
+                    && !shadow.written_by_shaders()
+                {
+                    batch.add(shadow, *address, *len);
+                }
+            }
+        }
+        let bytes = batch.flush();
+        crate::unwaited::note_prewarm(started.elapsed(), bytes);
+    }
+
+    /// Finishes the unwaited submission, if any: waits for it, then does
+    /// what a waited one does after its wait ([`Host::submit`]), less what
+    /// it cannot owe (it declared no shader writes, checks, work or
+    /// bottom-of-pipe writes), then makes the Signals kept behind it. The
+    /// caller holds the submission lock; the lists go into `finished`.
+    fn finish(&self, by: crate::unwaited::By, finished: &mut Finished) -> bool {
+        let slot = || self.unwaited.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((value, lists)) = slot().get().map(|u| (u.value, u.lists.clone())) else {
+            return false;
+        };
+        let started = std::time::Instant::now();
+        // The fence decides (its event may never be set, `Host::wait_for`).
+        // SAFETY: our fence.
+        if unsafe { self.fence.GetCompletedValue() } < value {
+            self.wait_for(value);
+        }
+        let waited = started.elapsed();
+        SUBMISSION_US[1].fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::resource::life::note(0, crate::resource::life::RAN, value, 0);
+        let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
+        // SAFETY: a plain query.
+        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            fail(format_args!(
+                "host GPU device removed after an unwaited submission of {} lists{}{}{}",
+                runs.len(),
+                self.removal_data(&runs),
+                last_notes(&runs),
+                removed_during(&runs, None)
+            ));
+        }
+        crate::memory::note_submission(false);
+        // Nothing of it is marked; the bitmaps are cleared as after any.
+        crate::shadow::copy_back_marks(&[], crate::memory::withholding());
+        let read = crate::shadow::take_reads();
+        if !read.is_empty() {
+            crate::descriptor::make_read(&read);
+        }
+        // The lists have run: the copies they used may be released when idle.
+        for list in &runs {
+            list.deferred().flying.clear();
+        }
+        drop(runs);
+        release_retired();
+        {
+            // Under the slot's lock, so that a Signal made now is neither
+            // kept behind a submission that is gone nor made before these.
+            let mut slot = slot();
+            if let Some((unwaited, signals)) = slot.finished() {
+                IN_FLIGHT.store(false, Ordering::Release);
+                for (fence, value) in signals {
+                    crate::fence::set(fence as crate::object::This, value);
+                    crate::fence::let_go(fence as crate::object::This);
+                }
+                release_later(unwaited.kept);
+                finished.0.extend(unwaited.lists);
+            }
+        }
+        finished.0.extend(lists);
+        self.log_messages();
+        crate::unwaited::note_finished(by, started.elapsed(), waited);
+        true
+    }
+
+    /// [`Host::execute`], or with `keep` (the lists of a submission of the
+    /// title's, to hold on to) [`Host::execute_title`].
+    fn submit(&self, runs: &[&HostList], keep: Option<&[std::sync::Arc<HostList>]>) -> Option<crate::unwaited::Waited> {
+        let mut finished = Finished::default();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
+        // The unwaited submission is finished before anything of this one
+        // is prepared; while it still runs, the buffer copies this one's
+        // lists ask for are brought up to date.
+        if IN_FLIGHT.load(Ordering::Acquire) {
+            if keep.is_some() {
+                self.prewarm(runs);
+            }
+            let by = if keep.is_some() { crate::unwaited::By::Title } else { crate::unwaited::By::Ours };
+            self.finish(by, &mut finished);
+        }
+        // What the title's lists owe after their run, before ours join them.
+        let facts = keep.map(|_| runs.iter().fold(crate::unwaited::Facts::default(), |f, l| f.with(l.owes())));
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -1351,6 +1573,16 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        // A submission of the title's that owes nothing after its run is
+        // not waited for (`crate::unwaited`).
+        #[cfg(feature = "diagnostics")]
+        let diagnosed = traced || groups.len() > 1;
+        #[cfg(not(feature = "diagnostics"))]
+        let diagnosed = false;
+        let mut waited = facts.and_then(|f| {
+            crate::unwaited::Facts { uploads: uploads.is_some(), diagnostics: diagnosed, ..f }.waited()
+        });
+        let leave = keep.filter(|_| waited.is_none());
         let mut removed_in = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -1360,14 +1592,29 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
-                let waited = self
+                let signalled = self
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
+                match signalled {
+                    Ok(()) if leave.is_some() => {}
                     Ok(()) => self.wait_for(*submitted),
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "host submission not waited for");
+                        // Nothing would tell when it has run: as before.
+                        waited = waited.or(keep.map(|_| crate::unwaited::Waited::Host));
+                    }
                 }
+            }
+            if let Some(lists) = leave.filter(|_| waited.is_none()) {
+                crate::unwaited::note(None);
+                SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+                // Kept as a waited submission keeps them until it has run.
+                let kept = Box::new((batch, heaps, textures));
+                let mut slot = self.unwaited.lock().unwrap_or_else(|e| e.into_inner());
+                slot.leave(Unwaited { value: *submitted, lists: lists.to_vec(), kept });
+                IN_FLIGHT.store(true, Ordering::Release);
+                return None;
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
@@ -1416,6 +1663,9 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        if keep.is_some() {
+            crate::unwaited::note(waited);
+        }
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -1564,6 +1814,7 @@ impl Host {
             }
             crate::capture::dump_submission(sub, &targets);
         }
+        waited
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -2286,6 +2537,28 @@ impl HostList {
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
         self.deferred().after.push(Box::new(work));
+    }
+
+    /// A shader of the list writes through views it takes from the heap
+    /// itself.
+    pub(crate) fn heap_writes(&self) {
+        self.deferred().heap_writes = true;
+    }
+
+    /// Keeps `what` until the list is reset.
+    pub(crate) fn keep_until_reset(&self, what: Box<dyn std::any::Any + Send>) {
+        self.deferred().left.push(what);
+    }
+
+    /// What the list owes once the GPU has run it (`crate::unwaited`).
+    fn owes(&self) -> crate::unwaited::Facts {
+        let d = self.deferred();
+        crate::unwaited::Facts {
+            shader_writes: d.heap_writes || d.copies.iter().any(|s| matches!(s, Step::GpuWrite(..) | Step::Memory(_))),
+            after: !d.after.is_empty() || !d.missed.is_empty(),
+            bottom_of_pipe: !d.writes.is_empty(),
+            ..Default::default()
+        }
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -3348,6 +3621,8 @@ impl Meter {
         let hoisted = crate::indirect::take_hoisted() as f64 / frames;
         let hoists = crate::list::take_hoists() as f64 / frames;
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
+        // Unwaited submissions (`VICTORY_ASYNC_SUBMIT=1`; nothing without).
+        let unwaited = crate::unwaited::take_line(frames);
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
@@ -3360,7 +3635,7 @@ impl Meter {
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
                  max records {records:.0}/frame ({counted:.0} under a count), {hoisted:.0} clamps/frame \
-                 in the list before their draw's ({hoists:.0} lists cut for them)",
+                 in the list before their draw's ({hoists:.0} lists cut for them){unwaited}",
                 making = crate::pipeline::making()
             );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
@@ -4391,5 +4666,191 @@ mod withholding {
             drop(copy);
             crate::watch::tests::free(p);
         }
+    }
+}
+
+/// Submissions of the title's that may go unwaited (`crate::unwaited`).
+/// Other tests submit meanwhile, and any submission finishes the unwaited
+/// one: what is tested holds whoever finished it.
+#[cfg(test)]
+mod unwaited {
+    use super::{Host, HostList, finish_unwaited, host, signal_after_unwaited};
+    use crate::unwaited::{By, Waited};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A closed list that owes nothing after its run.
+    fn plain(host: &Host) -> Arc<HostList> {
+        let list = Arc::new(host.new_list().unwrap());
+        list.close();
+        list
+    }
+
+    /// The host fence value of the unwaited submission that holds `list`,
+    /// if it is still unwaited.
+    fn unwaited_value(host: &Host, list: &Arc<HostList>) -> Option<u64> {
+        let slot = host.unwaited.lock().unwrap_or_else(|e| e.into_inner());
+        slot.get().filter(|u| u.lists.iter().any(|l| Arc::ptr_eq(l, list))).map(|u| u.value)
+    }
+
+    fn completed(host: &Host) -> u64 {
+        // SAFETY: our fence.
+        unsafe { host.fence.GetCompletedValue() }
+    }
+
+    /// A buffer is not freed or reused with a copy pending: the unwaited
+    /// submission keeps its list, the queue's giving it back does not reset
+    /// it, and the copy lands.
+    #[test]
+    fn an_unwaited_submission_keeps_its_list_and_what_it_holds() {
+        let Some(host) = host() else { return };
+        let list = Arc::new(host.new_list().unwrap());
+        let (up, src) = list.upload(host, 256).unwrap();
+        let (back, dst) = list.readback(host, 256).unwrap();
+        // SAFETY: our mapped buffer; an open list and live buffers.
+        unsafe {
+            std::ptr::write_bytes(src, 0x5a, 256);
+            list.list.CopyBufferRegion(&back, 0, &up, 0, 256);
+        }
+        // Only the list holds the source now.
+        drop(up);
+        list.close();
+        let held = list.clone();
+        assert_eq!(host.execute_title(std::slice::from_ref(&list)), None, "it owes nothing: unwaited");
+        // As the queue does once the call returns.
+        crate::list::recycle(list);
+        {
+            let slot = host.unwaited.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.get().is_some_and(|u| u.lists.iter().any(|l| Arc::ptr_eq(l, &held))) {
+                assert_eq!(held.deferred().uploads.len(), 2, "not reset while it is unwaited");
+            }
+        }
+        drop(held);
+        finish_unwaited(By::Ours);
+        // SAFETY: the mapped read-back buffer, which `back` holds.
+        let copied = unsafe { std::slice::from_raw_parts(dst, 256) };
+        assert!(copied.iter().all(|&b| b == 0x5a), "the copy ran from a live buffer");
+        drop(back);
+    }
+
+    /// A Signal made behind an unwaited submission moves its fence only
+    /// once the host GPU has run that submission and it is finished.
+    #[test]
+    fn a_fence_moves_only_once_the_unwaited_work_before_it_is_finished() {
+        let Some(host) = host() else { return };
+        let mut fence = std::ptr::null();
+        crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence);
+        let list = plain(host);
+        assert_eq!(host.execute_title(std::slice::from_ref(&list)), None);
+        let value = unwaited_value(host, &list);
+        crate::fence::keep(fence);
+        if !signal_after_unwaited(fence as usize, 5) {
+            // Another test's submission finished it first: signalled at once.
+            assert!(unwaited_value(host, &list).is_none());
+            crate::fence::set(fence, 5);
+            crate::fence::let_go(fence);
+        }
+        if crate::fence::value(fence) == 5
+            && let Some(value) = value
+        {
+            assert!(completed(host) >= value, "signalled: the host GPU has run it");
+            assert!(unwaited_value(host, &list).is_none(), "signalled: it is finished");
+        }
+        finish_unwaited(By::FenceWait);
+        assert_eq!(crate::fence::value(fence), 5, "finished: its Signals are made");
+        assert!(value.is_none_or(|v| completed(host) >= v));
+        // Nothing is unwaited behind which to keep this one.
+        assert!(unwaited_value(host, &list).is_none());
+        crate::fence::let_go(fence);
+    }
+
+    /// Bottom-of-pipe writes and work for after the run (read-backs) are
+    /// there when the call returns: such submissions wait.
+    #[test]
+    fn what_the_title_reads_after_a_run_is_there_when_the_call_returns() {
+        let Some(host) = host() else { return };
+        let word = Box::leak(Box::new(0u64));
+        let list = Arc::new(host.new_list().unwrap());
+        list.defer_write(std::ptr::from_mut(word).cast(), crate::queue::Written::Value(7), 8);
+        list.close();
+        assert_eq!(host.execute_title(std::slice::from_ref(&list)), Some(Waited::BottomOfPipe));
+        assert_eq!(*word, 7);
+        let ran: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let list = Arc::new(host.new_list().unwrap());
+        list.defer_after(move || ran.store(true, Ordering::Release));
+        list.close();
+        assert_eq!(host.execute_title(std::slice::from_ref(&list)), Some(Waited::After));
+        assert!(ran.load(Ordering::Acquire));
+    }
+
+    /// Two submissions' shaders write one page: each is waited for, so what
+    /// they wrote reaches title memory in the order they were made; an
+    /// unwaited one between them changes nothing.
+    #[test]
+    fn shader_writes_of_two_submissions_go_back_in_order() {
+        use crate::watch::PAGE;
+        let Some(host) = host() else { return };
+        let p = crate::watch::tests::pool(1);
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        // SAFETY: bytes of our pool.
+        let title = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        // (bytes written at +0 and +8)
+        for (first, second) in [(0x22, 0x23), (0x33, 0x34)] {
+            let list = Arc::new(host.new_list().unwrap());
+            copy.refresh(&list, p as u64, 32);
+            copy.gpu_writes(&list, p as u64, 32, false);
+            let c = copy.clone();
+            // The shader's writes, after the step that keeps the range's bytes.
+            list.defer_host(move || {
+                c.write_host(p as u64, &[first]);
+                c.write_host(p as u64 + 8, &[second]);
+            });
+            list.close();
+            assert_eq!(host.execute_title(std::slice::from_ref(&list)), Some(Waited::ShaderWrites));
+            assert_eq!((title(0), title(8)), (first, second), "back when the call returns");
+            assert_eq!(host.execute_title(std::slice::from_ref(&plain(host))), None);
+        }
+        finish_unwaited(By::Ours);
+        assert_eq!((title(0), title(8)), (0x33, 0x34));
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// The next submission, the title's or ours, finishes the unwaited one
+    /// before it runs; the title's has its buffer copies brought up to
+    /// date meanwhile and again in its steps' order, with the same result.
+    #[test]
+    fn the_next_submission_finishes_the_unwaited_one_first() {
+        use crate::watch::PAGE;
+        let Some(host) = host() else { return };
+        let p = crate::watch::tests::pool(1);
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        for ours in [false, true] {
+            let first = plain(host);
+            assert_eq!(host.execute_title(std::slice::from_ref(&first)), None);
+            let value = unwaited_value(host, &first);
+            // The title writes what the next submission reads.
+            let byte = if ours { 0x77 } else { 0x66 };
+            // SAFETY: a byte of our pool.
+            unsafe { ((p + 16) as *mut u8).write_volatile(byte) };
+            let next = Arc::new(host.new_list().unwrap());
+            copy.refresh(&next, p as u64, PAGE as u64);
+            next.close();
+            if ours {
+                host.execute(&[&next]);
+            } else {
+                host.execute_title(std::slice::from_ref(&next));
+            }
+            assert!(unwaited_value(host, &first).is_none(), "finished");
+            assert!(value.is_none_or(|v| completed(host) >= v), "and run");
+            let _alone = host.alone();
+            assert_eq!(copy.read_host(p as u64 + 16, 1)[0] & 0xff, u32::from(byte));
+        }
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
     }
 }

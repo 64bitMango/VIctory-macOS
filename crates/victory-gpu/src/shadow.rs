@@ -592,6 +592,12 @@ impl Shadow {
         written
     }
 
+    /// Whether shaders of a submission not yet copied back may be writing
+    /// the copy.
+    pub(crate) fn written_by_shaders(&self) -> bool {
+        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
     /// Whether the title wrote none of the copy's memory since the copy took
     /// it (tracked memory only): [`Shadow::update`] would copy nothing.
     pub(crate) fn clean(&self) -> bool {
@@ -2159,6 +2165,8 @@ pub(crate) mod tests {
         };
         let base = copy.marks.expect("tracked memory gets mark bits") as usize;
         assert_eq!(copy.mark_entry(p as u64 + PAGE as u64 + 8), Some((base as u32 + 1, 8)));
+        // No submission takes the marks meanwhile.
+        let _one = host().map(|h| h.alone());
         copy.update(p, len);
         copy.writing(p, len, true);
         assert!(copy.before.lock().unwrap().0.is_empty(), "no snapshot");
@@ -2205,6 +2213,8 @@ pub(crate) mod tests {
             return; // no host GPU here
         };
         let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        // No submission takes the marks meanwhile.
+        let _one = host().map(|h| h.alone());
         copy.update(p, len);
         copy.writing(p, len, true);
         copy.write_host((p + 10) as u64, &[0xaa]);

@@ -783,6 +783,9 @@ impl State {
             {
                 list.defer_heap(&host.viewed);
             }
+            if writes {
+                list.heap_writes();
+            }
             crate::bindless::note_draw(writes);
         }
         for stage in &p.stages {

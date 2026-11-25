@@ -1,5 +1,6 @@
 //! Command queues. Submitted lists run on the host GPU and are waited for,
-//! so fence signals complete at once.
+//! so fence signals complete at once (behind a submission that is not
+//! waited for, when it is finished: `crate::unwaited`).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -177,6 +178,9 @@ pub(crate) fn pump_held(why: Why) {
 pub(crate) fn pump_held_if_free(why: Why) {
     #[cfg(windows)]
     if let Ok(mut held) = HELD.try_lock() {
+        // An unwaited submission the GPU is done with is finished first:
+        // the Signals kept behind it may let held work go.
+        crate::host::finish_unwaited_if_done();
         pump(&mut held, why);
     }
     #[cfg(not(windows))]
@@ -207,12 +211,22 @@ fn pump(held: &mut Holding, why: Why) {
     let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
         let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
         let at = std::time::Instant::now();
-        host.execute(&lists);
+        // The title's own: it may return before the GPU has run it
+        // (`crate::unwaited`).
+        if crate::unwaited::on() {
+            host.execute_title(&segments);
+        } else {
+            host.execute(&lists);
+        }
         ran += at.elapsed();
         drop(lists);
         segments.into_iter().for_each(crate::list::recycle);
     };
     let mut signal = |f: usize, value: u64| {
+        // Behind an unwaited submission: made when that is finished.
+        if crate::host::signal_after_unwaited(f, value) {
+            return timer();
+        }
         crate::fence::set(f as This, value);
         crate::fence::let_go(f as This);
     };
@@ -237,6 +251,15 @@ fn pump(held: &mut Holding, why: Why) {
     if held.blocked(&read).is_empty() {
         return;
     }
+    timer();
+}
+
+/// Starts the timer that tests held work every 2 ms; it also finishes an
+/// unwaited submission the GPU is done with (`crate::unwaited`), whose kept
+/// Signals the title may wait for with no call of ours (it reads a fence's
+/// value in memory).
+#[cfg(windows)]
+fn timer() {
     static TIMER: std::sync::Once = std::sync::Once::new();
     TIMER.call_once(|| {
         let _ = std::thread::Builder::new().name("victory held work".into()).spawn(|| loop {
@@ -381,6 +404,16 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         if held.holds_work(this as usize) {
             crate::fence::keep(fence);
             held.push(this as usize, Item::Signal(fence as usize, value));
+        } else if crate::unwaited::on() {
+            // Behind an unwaited submission, if there is one: the fence
+            // moves when that is finished (`crate::unwaited`).
+            crate::fence::keep(fence);
+            if crate::host::signal_after_unwaited(fence as usize, value) {
+                timer();
+            } else {
+                crate::fence::set(fence, value);
+                crate::fence::let_go(fence);
+            }
         } else {
             crate::fence::set(fence, value);
         }
@@ -687,10 +720,15 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    // An unwaited submission is finished, with the Signals kept behind it.
+    crate::unwaited::finish(crate::unwaited::By::Present);
     // What may run before the frame is shown does.
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
     pump_held(Why::Present);
+    if crate::unwaited::finish(crate::unwaited::By::Present) {
+        pump_held(Why::Present);
+    }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     account_frame(frame);
@@ -1040,6 +1078,8 @@ mod tests {
         );
         let signal = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q));
         assert_eq!(signal(q, fence, 7), S_OK);
+        // Or behind another test's unwaited submission (`crate::unwaited`).
+        crate::unwaited::finish(crate::unwaited::By::Ours);
         assert_eq!(
             slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence),
             7
