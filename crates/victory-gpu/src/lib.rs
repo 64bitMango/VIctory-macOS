@@ -40,6 +40,9 @@ pub mod frame;
 mod hold;
 #[cfg(windows)]
 mod host;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod idle;
 #[cfg(windows)]
 mod indirect;
 pub mod list;

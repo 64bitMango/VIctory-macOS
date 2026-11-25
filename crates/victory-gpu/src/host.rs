@@ -1032,6 +1032,9 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    /// The buffer copies its commands use (by address), until it has run:
+    /// not released for idleness meanwhile (`crate::shadow::Flight`).
+    flying: std::collections::HashMap<usize, crate::shadow::Flight>,
 }
 
 impl Host {
@@ -1202,6 +1205,14 @@ impl Host {
         Some(Quiet { _holding: Holding::enter(), _held: held })
     }
 
+    /// Runs `f` while no submission runs (tests).
+    #[cfg(test)]
+    pub(crate) fn between_submissions<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _holding = Holding::enter();
+        f()
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
@@ -1223,6 +1234,10 @@ impl Host {
         crate::descriptor::sync_heaps();
         #[cfg(feature = "diagnostics")]
         drop(syncing);
+        // Copies of title memory outside buffers nothing asked for in a
+        // while are released, after the heaps' slots are what the title
+        // wrote.
+        crate::shadow::idle_sweep();
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -1503,6 +1518,10 @@ impl Host {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
+        }
+        // The lists have run: the copies they used may be released when idle.
+        for list in runs {
+            list.deferred().flying.clear();
         }
         // The submission has run and the next waits for our lock. Host
         // copies the title gave up meanwhile may have their last holder here.
@@ -2187,6 +2206,7 @@ impl HostList {
     ) {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        deferred.flying.entry(key.0).or_insert_with(|| shadow.fly());
         if deferred.refreshed.insert(key) {
             deferred
                 .copies
@@ -2205,7 +2225,9 @@ impl HostList {
         marked: bool,
     ) {
         let memory = self.memory_writer.load(Ordering::Relaxed);
-        self.deferred()
+        let mut deferred = self.deferred();
+        deferred.flying.entry(std::sync::Arc::as_ptr(shadow) as usize).or_insert_with(|| shadow.fly());
+        deferred
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
     }
@@ -2451,6 +2473,8 @@ impl HostList {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
                     }
+                    // A list submitted again uses it without a lookup.
+                    shadow.ask();
                     batch.add(shadow, *address, *len);
                     continue;
                 }
@@ -3204,6 +3228,7 @@ impl Meter {
                 crate::copystat::log(copy_frames);
                 crate::bindless::log(copy_frames);
                 crate::shadow::log_views(copy_frames);
+                crate::shadow::log_idle();
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
                 if n > 0 {
                     tracing::info!(
