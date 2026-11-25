@@ -739,6 +739,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
     let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = crate::io::raise(&p, &native)?;
     let lowered = super::lower::lower(&super::lower::Parts {
+        psv: None,
         native: &native,
         p: &p,
         st: &st,

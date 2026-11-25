@@ -179,6 +179,7 @@ fn program() -> HostShader {
     assert_eq!(memory, 11, "every access through the pointer is title memory");
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
+        psv: None,
         native: &native,
         p: &p,
         st: &st,
@@ -411,6 +412,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
+        psv: None,
         native: &native,
         p: &p,
         st: &st,
@@ -556,6 +558,7 @@ fn writes_through_views_mark_their_pages() {
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
+        psv: None,
         native: &native,
         p: &p,
         st: &st,

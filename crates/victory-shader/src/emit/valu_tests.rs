@@ -131,6 +131,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native)?;
     let lowered = lower::lower(&lower::Parts {
+        psv: None,
         native: &native,
         p: &p,
         st: &st,
@@ -1342,6 +1343,7 @@ fn lower_cs32_with(
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
+        psv: None,
         native: &native,
         p: &p,
         st: &st,

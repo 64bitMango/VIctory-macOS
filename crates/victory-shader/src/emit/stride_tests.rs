@@ -189,6 +189,7 @@ fn build(
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
+        psv: None,
         native: &native,
         p: &p,
         st: &st,

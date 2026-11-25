@@ -661,6 +661,7 @@ fn emit_keeping(
     let killing = std::cell::OnceCell::<(structure::Structured, resource::Resources)>::new();
     let parts = |st, res| lower::Parts {
         native,
+        psv: c.part(FourCC::PSV0).map(|p| p.data),
         p,
         st,
         io,
@@ -741,6 +742,45 @@ fn emit_keeping(
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
     })
+}
+
+/// Whether the container's `PSV0` part declares the resource at
+/// `register` structured: the native binding map gives a register but no
+/// space, so every declaration of that register class covering it must be
+/// a structured buffer (SRV kind 5, UAV kind 8).
+fn declares_structured_buffer(part: &[u8], register: u32, uav: bool) -> bool {
+    use crate::dxbc::u32_at;
+    let table = || {
+        let info = u32_at(part, 0).ok()? as usize;
+        let header = part.get(4..)?.get(info..)?;
+        let count = u32_at(header, 0).ok()? as usize;
+        let stride = u32_at(header, 4).ok()? as usize;
+        if stride < 16 {
+            return None;
+        }
+        Some(
+            header
+                .get(8..)?
+                .get(..count.checked_mul(stride)?)?
+                .chunks_exact(stride),
+        )
+    };
+    let Some(entries) = table() else { return false };
+    let mut found = false;
+    for entry in entries {
+        let (Ok(kind), Ok(lo), Ok(hi)) = (u32_at(entry, 0), u32_at(entry, 8), u32_at(entry, 12))
+        else {
+            return false;
+        };
+        let class = if uav { 6..=9 } else { 3..=5 };
+        if class.contains(&kind) && (lo..=hi).contains(&register) {
+            if kind != if uav { 8 } else { 5 } {
+                return false;
+            }
+            found = true;
+        }
+    }
+    found
 }
 
 /// The rows of an `ISG1`/`OSG1` part.

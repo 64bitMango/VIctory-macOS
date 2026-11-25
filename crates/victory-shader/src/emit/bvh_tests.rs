@@ -583,6 +583,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
     );
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
+        psv: None,
         native: &native,
         p: &p,
         st: &st,

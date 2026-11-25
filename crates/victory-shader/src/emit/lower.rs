@@ -70,6 +70,9 @@ pub(crate) struct Lowered {
 
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
+    /// The container's `PSV0` part: the resources the console compiler
+    /// declared ([`super::declares_structured_buffer`]).
+    pub psv: Option<&'a [u8]>,
     pub p: &'a Program,
     pub st: &'a Structured,
     pub io: &'a Io,
@@ -4526,7 +4529,32 @@ impl<'a> Lower<'a> {
                 )
             });
             let used = self.used_kind(&src);
-            if count == 8 && heap && used.is_none_or(|u| u.kind == ResourceType::Srv) {
+            // A structured buffer the program only counts the records of
+            // (dword 2): an exact, statically addressed four-dword binding
+            // that the container declares structured, never the nearest
+            // earlier entry or a dynamically indexed range.
+            let address = self.scalar.get(&site);
+            let structured = |uav: bool| {
+                used.filter(|b| {
+                    count == 4
+                        && address.is_some_and(|a| {
+                            a.dynamic.is_none()
+                                && b.table_offset_dwords.checked_mul(4) == Some(a.offset)
+                        })
+                        && b.dwords == 4
+                        && b.kind == if uav { ResourceType::Uav } else { ResourceType::Srv }
+                        && (4..=2048).contains(&b.stride)
+                        && b.stride.is_multiple_of(4)
+                        && self.x.psv.is_some_and(|part| {
+                            super::declares_structured_buffer(part, b.lower_bound, uav)
+                        })
+                })
+            };
+            if let Some(b) = structured(false).or_else(|| structured(true)) {
+                let uav = b.kind == ResourceType::Uav;
+                let u = if uav { 0x1000 } else { 0 };
+                (0, src, (12 | u, b.stride), None, uav)
+            } else if count == 8 && heap && used.is_none_or(|u| u.kind == ResourceType::Srv) {
                 (0, src, (2, 0x409), Some(2), false)
             } else {
                 return self.view_addresses(inst, site, code, count);
@@ -11193,6 +11221,7 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
+            psv: None,
             native: &native,
             p: &p,
             st: &st,
@@ -11227,6 +11256,17 @@ mod tests {
         used: Vec<UsedResource>,
         wave64: bool,
     ) -> Result<Lowered, crate::ShaderError> {
+        lower_psv(words, layout, used, wave64, None)
+    }
+
+    /// [`lower_wave`] with the container's `PSV0` part.
+    fn lower_psv(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+        wave64: bool,
+        psv: Option<&[u8]>,
+    ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
         let native = NativeProgram {
@@ -11247,6 +11287,7 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
         let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
+            psv,
             native: &native,
             p: &p,
             st: &st,
@@ -11440,6 +11481,7 @@ mod tests {
         let io = io::raise(&p, &native).unwrap();
 
         let emitted = lower(&Parts {
+            psv: None,
             native: &native,
             p: &p,
             st: &st,
@@ -11567,6 +11609,69 @@ mod tests {
             slot: 0,
         }];
         lower_with(&words, layout, used).unwrap();
+    }
+
+    /// `PSV0` declaring one resource at register 109 of `kind` (5
+    /// structured SRV, 3 typed SRV).
+    fn psv_with(kind: u32) -> Vec<u8> {
+        use super::super::container::{Binding, Psv, psv};
+        let binding = Binding {
+            kind,
+            space: 1,
+            register: 109,
+            dxil_kind: if kind == 5 { 12 } else { 10 },
+        };
+        psv(&Psv {
+            stage: 5,
+            flag: false,
+            inputs: &[],
+            outputs: &[],
+            prims: &[],
+            mesh: None,
+            gs: None,
+            bindings: &[binding],
+            threads: [1, 1, 1],
+            wave_size: None,
+        })
+    }
+
+    #[test]
+    fn a_structured_buffer_only_counted_reads_its_record_count() {
+        // The record count (dword 2) of the buffer at table entry 0 is the
+        // program's only use of it.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0x7E02_020A, // v_mov_b32 v1, s10
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 109,
+            stride: 16,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let structured = psv_with(5);
+        let l = lower_psv(&words, layout.clone(), used.clone(), false, Some(&structured));
+        assert!(l.is_ok(), "{:?}", l.err());
+        // Only a buffer the container declares structured: a typed one's
+        // record count is no element count of the host's view.
+        let typed = psv_with(3);
+        assert!(lower_psv(&words, layout.clone(), used.clone(), false, Some(&typed)).is_err());
+        assert!(lower_psv(&words, layout, used, false, None).is_err());
+        assert!(super::super::declares_structured_buffer(&structured, 109, false));
+        assert!(!super::super::declares_structured_buffer(&structured, 108, false));
+        assert!(!super::super::declares_structured_buffer(&structured, 109, true));
+        assert!(!super::super::declares_structured_buffer(&typed, 109, false));
     }
 
     #[test]
