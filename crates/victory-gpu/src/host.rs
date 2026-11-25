@@ -1032,6 +1032,18 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: crate::quick::Set<(usize, usize, usize)>,
+    /// Ranges declared written by shaders since the list last wrote title
+    /// memory (host copy, address, bytes, whether marked, whether by a
+    /// program using title memory): declaring them again would add a step
+    /// that changes nothing ([`HostList::defer_gpu_write`]).
+    gpu_written: crate::quick::Set<(usize, usize, usize, bool, bool)>,
+    /// Upload memory filled from title memory since the list last wrote
+    /// title memory (source, bytes): its host address, which a second fill
+    /// would find holding the same bytes ([`HostList::fill_scratch`]).
+    filled: crate::quick::Map<(usize, usize), u64>,
+    /// The host pipelines [`HostList::bind_pipeline`] kept (by address): one
+    /// the list binds again is not kept again.
+    bound: crate::quick::Set<usize>,
     /// Textures whose contents the list brings up to date.
     textures: crate::quick::Set<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1053,6 +1065,41 @@ struct Deferred {
     /// The buffer copies its commands use (by address), until it has run:
     /// not released for idleness meanwhile (`crate::shadow::Flight`).
     flying: crate::quick::Map<usize, crate::shadow::Flight>,
+}
+
+impl Deferred {
+    /// The step recorded last writes title memory: what was brought up to
+    /// date, declared or filled before it is not current after it.
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.gpu_written.clear();
+        self.filled.clear();
+    }
+}
+
+/// Whether a list declares a range its shaders write once until it next
+/// writes title memory ([`HostList::defer_gpu_write`]): on unless
+/// `VICTORY_DECLARE_ONCE=0`.
+fn declare_once() -> bool {
+    #[cfg(test)]
+    if once_tests::EVERY_TIME.with(|off| off.get()) {
+        return false;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_DECLARE_ONCE"))
+}
+
+/// Whether a list fills upload memory from the same title memory once until
+/// it next writes title memory ([`HostList::fill_scratch`]), and keeps a
+/// pipeline it binds again once ([`HostList::bind_pipeline`]): on unless
+/// `VICTORY_LIST_ONCE=0`.
+fn list_once() -> bool {
+    #[cfg(test)]
+    if once_tests::EVERY_TIME.with(|off| off.get()) {
+        return false;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_LIST_ONCE"))
 }
 
 impl Host {
@@ -2200,6 +2247,23 @@ impl HostList {
         }
     }
 
+    /// Notes a pipeline the list binds and keeps it and its root signature
+    /// until the list is reset (the title may release the pipeline before it
+    /// submits the list). The first time only: the list holds the pipeline
+    /// from then on, so its address names no other until the reset, and a
+    /// world list switching between a few pipelines thousands of times
+    /// asked for two interfaces, pushed two references and searched the
+    /// names each time (from Belobug 92d353f8; `VICTORY_LIST_ONCE=0` keeps
+    /// it every time).
+    pub(crate) fn bind_pipeline(&self, name: &str, pso: &impl Interface, root: &impl Interface) {
+        if list_once() && !self.deferred().bound.insert(pso.as_raw() as usize) {
+            return;
+        }
+        self.used_pipeline(name);
+        self.keep(pso);
+        self.keep(root);
+    }
+
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -2211,7 +2275,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        deferred.title_written();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -2220,6 +2284,29 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
+    }
+
+    /// The host GPU address of `len` bytes of the list's upload memory that
+    /// hold the title memory at `src` as it is when the list is submitted.
+    /// One fill serves every ask for the same bytes until the list next
+    /// writes title memory: fills run at submission, in order with the
+    /// list's title copies, so a second one between the same two title
+    /// writes reads the same bytes (a root constant buffer the draws of a
+    /// list bind again and again took 64 KiB of upload memory and a copy
+    /// each time; from Belobug 84ea9c12; `VICTORY_LIST_ONCE=0` fills every
+    /// time).
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        let once = list_once();
+        if once && let Some(&known) = self.deferred().filled.get(&key) {
+            return Some(known);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        if once {
+            self.deferred().filled.insert(key, gpu);
+        }
+        Some(gpu)
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -2244,6 +2331,19 @@ impl HostList {
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run
     /// (`marked`: the pages they mark).
+    ///
+    /// Declared once until the list next writes title memory (from Belobug
+    /// dd799aad; `VICTORY_DECLARE_ONCE=0` declares every time): the
+    /// dispatches and draws of a list declare the same few ranges again and
+    /// again, and each step flushed the submission's pending refreshes and
+    /// took two locks to find its bytes kept already. A step declared again
+    /// changes nothing: the range is pending and its bytes are kept (or its
+    /// pages armed) from the first one until the submission's copy-back,
+    /// and the refreshes it would have flushed are done before the next
+    /// step that writes title memory or keeps bytes, and before the lists
+    /// run, with nothing in between that reads the copies. The same range
+    /// declared the other way (marked or not, by a program using title
+    /// memory or not) is another declaration.
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -2253,10 +2353,13 @@ impl HostList {
     ) {
         let memory = self.memory_writer.load(Ordering::Relaxed);
         let mut deferred = self.deferred();
-        deferred.flying.entry(std::sync::Arc::as_ptr(shadow) as usize).or_insert_with(|| shadow.fly());
-        deferred
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
+        let copy = std::sync::Arc::as_ptr(shadow) as usize;
+        deferred.flying.entry(copy).or_insert_with(|| shadow.fly());
+        if deferred.gpu_written.insert((copy, address, len, marked, memory)) || !declare_once() {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
+        }
     }
 
     /// Shaders of the list take views from the heap itself
@@ -2527,8 +2630,9 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.title_written();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -4400,5 +4504,137 @@ mod withholding {
             drop(copy);
             crate::watch::tests::free(p);
         }
+    }
+}
+
+#[cfg(test)]
+mod once_tests {
+    use super::Step;
+    use crate::watch::PAGE;
+
+    thread_local! {
+        /// This thread's lists declare, fill and keep every time (as
+        /// `VICTORY_DECLARE_ONCE=0 VICTORY_LIST_ONCE=0`).
+        pub(super) static EVERY_TIME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn steps(list: &super::HostList, which: impl Fn(&Step) -> bool) -> usize {
+        list.deferred().copies.iter().filter(|s| which(s)).count()
+    }
+
+    /// A list declares a range its shaders write three times and copies
+    /// into title memory before the last: declared once until the copy and
+    /// once after it (every time with the switch off), and either way the
+    /// same bytes end up in title memory and in the copy: the title's copy,
+    /// and what the shaders wrote.
+    #[test]
+    fn a_range_shaders_write_is_declared_once_until_a_title_write() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let mut results = Vec::new();
+        for every_time in [false, true] {
+            EVERY_TIME.with(|e| e.set(every_time));
+            let p = crate::watch::tests::pool(3);
+            let len = 2 * PAGE;
+            // SAFETY: (all title reads and writes below) bytes of our pool.
+            unsafe {
+                for i in 0..3 * PAGE {
+                    ((p + i) as *mut u8).write_volatile((i % 251) as u8);
+                }
+            }
+            crate::shadow::register(p, p as u64, len as u64);
+            let copy = crate::shadow::find(p as u64, len as u64).unwrap();
+            let list = host.new_list().unwrap();
+            let (range, bytes) = ((p + 100) as u64, PAGE as u64);
+            copy.refresh(&list, range, bytes);
+            copy.gpu_writes(&list, range, bytes, false);
+            copy.refresh(&list, p as u64, 64);
+            copy.gpu_writes(&list, range, bytes, false);
+            // Another range, and the first one by a program using title
+            // memory: declarations of their own.
+            copy.gpu_writes(&list, range + 8, 16, false);
+            {
+                let _writer = list.writer_uses_memory(true);
+                copy.gpu_writes(&list, range, bytes, false);
+                copy.gpu_writes(&list, range, bytes, false);
+            }
+            let declared = |list: &super::HostList| steps(list, |s| matches!(s, Step::GpuWrite(..)));
+            assert_eq!(declared(&list), if every_time { 5 } else { 3 });
+            // The title copies into the range (from its third page).
+            list.defer_copy((p + 200) as *mut u8, (p + 2 * PAGE + 7) as *const u8, 300);
+            copy.refresh(&list, range, bytes);
+            copy.gpu_writes(&list, range, bytes, false);
+            copy.gpu_writes(&list, range, bytes, false);
+            assert_eq!(declared(&list), if every_time { 7 } else { 4 }, "declared again after the title's copy");
+            // The shaders' writes, after every step that keeps bytes.
+            let shader = copy.clone();
+            list.defer_host(move || {
+                shader.write_host(range + 4, &[0xa1, 0xa2, 0xa3]);
+                shader.write_host(range + 250, &[0xb1; 40]);
+                shader.write_host(range + bytes - 2, &[0xc1, 0xc2]);
+            });
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: bytes of our pool.
+            let title: Vec<u8> = (0..len).map(|i| unsafe { ((p + i) as *const u8).read_volatile() }).collect();
+            let held: Vec<u8> = copy.read_host(p as u64, len / 4).iter().flat_map(|d| d.to_le_bytes()).collect();
+            assert!(title[100..100 + PAGE] == held[100..100 + PAGE], "the copy holds the range as title memory does");
+            assert_eq!(title[104..107], [0xa1, 0xa2, 0xa3]);
+            assert_eq!(title[350..390], [0xb1; 40], "over the title's copy");
+            assert_eq!(title[200..350], (0..150).map(|i| ((2 * PAGE + 7 + i) % 251) as u8).collect::<Vec<_>>()[..]);
+            assert_eq!(title[100 + PAGE - 2..100 + PAGE], [0xc1, 0xc2]);
+            results.push(title);
+            drop(copy);
+            crate::shadow::unregister(p, p as u64);
+            crate::watch::tests::free(p);
+        }
+        EVERY_TIME.with(|e| e.set(false));
+        assert!(results[0] == results[1], "declared once or every time: the same title memory");
+    }
+
+    /// Upload memory filled from the same title memory twice is filled once
+    /// until the list writes title memory, and a pipeline bound again is
+    /// kept once; every time with the switch off.
+    #[test]
+    fn fills_and_bound_pipelines_repeat_only_after_a_title_write() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let p = crate::watch::tests::pool(1);
+        for every_time in [false, true] {
+            EVERY_TIME.with(|e| e.set(every_time));
+            let list = host.new_list().unwrap();
+            let fills = |list: &super::HostList| steps(list, |s| matches!(s, Step::Fill(..)));
+            let src = (p + 48) as *const u8;
+            let first = list.fill_scratch(src, 512).unwrap();
+            let again = list.fill_scratch(src, 512).unwrap();
+            let longer = list.fill_scratch(src, 1024).unwrap();
+            assert_eq!(first == again, !every_time);
+            assert!(longer != first && longer != again, "another length is another fill");
+            assert_eq!(fills(&list), if every_time { 3 } else { 2 });
+            list.defer_copy(p as *mut u8, (p + 4096) as *const u8, 16);
+            let after = list.fill_scratch(src, 512).unwrap();
+            assert!(after != first, "filled again after the title's copy");
+            assert_eq!(fills(&list), if every_time { 4 } else { 3 });
+            list.defer(|| {});
+            assert!(list.fill_scratch(src, 512).unwrap() != after, "and after work that may write title memory");
+            // Two host objects stand in for a pipeline and its root signature.
+            let (pso, _) = host.upload_buffer(256).unwrap();
+            let (root, _) = host.upload_buffer(256).unwrap();
+            let kept = list.deferred().kept.len();
+            for _ in 0..3 {
+                list.bind_pipeline("a pipeline", &pso, &root);
+            }
+            assert_eq!(list.deferred().kept.len() - kept, if every_time { 6 } else { 2 });
+            assert!(list.pipelines.lock().unwrap().contains("a pipeline"));
+            list.close();
+            list.reset();
+            list.bind_pipeline("a pipeline", &pso, &root);
+            assert_eq!(list.deferred().kept.len(), 2, "kept again after a reset");
+            assert!(list.pipelines.lock().unwrap().contains("a pipeline"));
+        }
+        EVERY_TIME.with(|e| e.set(false));
+        crate::watch::tests::free(p);
     }
 }
