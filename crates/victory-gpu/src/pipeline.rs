@@ -78,6 +78,9 @@ pub(crate) struct Shader {
     /// ([`crate::ambient::REFLECTED`]).
     #[cfg(windows)]
     pub(crate) ends_reflections: bool,
+    /// It serves rays that do not run ([`activates_rays`]).
+    #[cfg(windows)]
+    activates_rays: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Mesh: translations without the vertex outputs a pixel shader does
@@ -127,6 +130,8 @@ impl Shader {
             ends_reflections: bytes
                 .windows(crate::ambient::REFLECTED.len())
                 .any(|w| w == crate::ambient::REFLECTED),
+            #[cfg(windows)]
+            activates_rays: activates_rays(bytes),
             #[cfg(windows)]
             translated: OnceLock::new(),
             #[cfg(windows)]
@@ -413,13 +418,34 @@ fn bvh_builds() -> bool {
     })
 }
 
-/// Whether `this` is one of the title's BVH builder programs and
-/// `VICTORY_BVH_BUILDS=0` leaves those out.
+/// Whether a container's program only makes sense with the title's rays:
+/// the one that tells the screen probes which rays to trace, by its name.
+/// shortcut: left out with the structure builds (`VICTORY_BVH_BUILDS=0`),
+/// which stand for "no rays" here as an unset `VICTORY_RAYS` does on the
+/// Belobug fork. There, once it ran with no rays behind it, the whole
+/// picture lost light, shadows and reflections (its runs opt31b against
+/// sans39, 2026-11-25).
+#[cfg(any(windows, test))]
+fn activates_rays(container: &[u8]) -> bool {
+    const NAME: &[u8] = b"a title shader";
+    container.windows(NAME.len()).any(|w| w == NAME)
+}
+
+/// Whether `this` is one of the title's BVH builder programs, or the one
+/// that activates the screen probes' rays, and `VICTORY_BVH_BUILDS=0`
+/// leaves those out.
 #[cfg(windows)]
 pub(crate) fn is_left_out(this: This) -> bool {
-    !this.is_null()
-        && !bvh_builds()
-        && pipeline(this).shaders.iter().any(|s| BVH_BUILDER.contains(&s.hash.as_str()))
+    if this.is_null() || bvh_builds() {
+        return false;
+    }
+    let shaders = &pipeline(this).shaders;
+    if shaders.iter().any(|s| s.activates_rays) {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| tracing::info!("the screen probes' ray activation left out (VICTORY_BVH_BUILDS=0)"));
+        return true;
+    }
+    shaders.iter().any(|s| BVH_BUILDER.contains(&s.hash.as_str()))
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -834,6 +860,13 @@ pub fn wanted_early(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_ray_activation_is_known_by_its_name() {
+        assert!(super::activates_rays(b"DXBC....a title shader\0main"));
+        assert!(!super::activates_rays(b"DXBC....a title shader\0main"));
+        assert!(!super::activates_rays(b"a title shader"));
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
