@@ -4,13 +4,15 @@
 //! by tracing rays, which do not run here yet: its program that resolves
 //! them (`a title shader_*`) leaves next to nothing, and
 //! whatever the sun does not reach directly is black. Right after that
-//! program, pixels darker than a soft floor are raised to it. The floor is a
-//! constant: the light in these images does not go with the title's exposure
+//! program, its output is replaced by a constant (it used to be a floor
+//! under what the program wrote, but that is garbage: see the shader). The
+//! constant is the same everywhere: the light in these images does not go with the title's exposure
 //! (well-lit surfaces hold about the same in a shot at -5.5 EV and in one at
 //! -9.75). The title's own lighting then applies it with the surfaces'
 //! colors. Raised, not added: the result is the next frame's history.
 //!
-//! `VICTORY_AMBIENT=<level>` turns it on (0.6, say); off by default.
+//! `VICTORY_AMBIENT=<level>` sets it (0.6 by default, 0 for none); `off`
+//! keeps the title's own output.
 //! shortcut: the same light everywhere, from everywhere; gone once rays run.
 
 use std::sync::OnceLock;
@@ -28,20 +30,21 @@ pub(crate) const PROGRAM: &[u8] = b"a title shader";
 /// integers): root parameter and place in its table.
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
 
-/// Off: the title's own light only (0.6 looked balanced in run a2).
-const DEFAULT: f32 = 0.0;
+/// 0.6 looked balanced in run a2. `VICTORY_AMBIENT=off` leaves what the
+/// title's resolve wrote; 0 is no indirect diffuse light at all.
+const DEFAULT: f32 = 0.6;
 
 /// The floor; `None` if off.
 pub(crate) fn level() -> Option<f32> {
     static LEVEL: OnceLock<f32> = OnceLock::new();
     let level = *LEVEL.get_or_init(|| {
-        std::env::var("VICTORY_AMBIENT")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .filter(|l: &f32| l.is_finite() && *l >= 0.0)
-            .unwrap_or(DEFAULT)
+        let set = std::env::var("VICTORY_AMBIENT").unwrap_or_default();
+        if set.trim() == "off" {
+            return -1.0;
+        }
+        set.trim().parse().ok().filter(|l: &f32| l.is_finite() && *l >= 0.0).unwrap_or(DEFAULT)
     });
-    (level > 0.0).then_some(level)
+    (level >= 0.0).then_some(level)
 }
 
 const SOURCE: &str = r#"
@@ -64,11 +67,10 @@ void main(uint3 at : SV_DispatchThreadID) {
     // The size comes in the constants: `GetDimensions` on the image does
     // not build under Wine (vkd3d-shader and D3DMetal).
     if (at.x >= width || at.y >= height) return;
-    float3 least = tint * level;
-    float3 c = unpack(light[at.xy]);
-    const float3 weights = float3(0.2126, 0.7152, 0.0722);
-    float missing = saturate(1.0 - dot(c, weights) / dot(least, weights));
-    if (missing > 0.0) light[at.xy] = pack(c + least * missing);
+    // What the resolve left is not kept: without rays its inputs are never
+    // written and it holds whatever their memory did (bright magenta on
+    // translucent surfaces, blocks of colours indoors: run v6, 2026-11-25).
+    light[at.xy] = pack(tint * level);
 }
 "#;
 
@@ -211,5 +213,89 @@ mod tests {
             return;
         };
         super::make(&host.device).expect("the ambient pass");
+    }
+
+    /// The pass writes the constant, packed as R9G9B9E5, over the whole
+    /// image (also past a multiple of its 8x8 groups).
+    #[test]
+    fn ambient_pass_writes_the_constant() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (width, height) = (20u32, 12u32);
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: u64::from(width),
+            Height: height,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32_UINT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    None,
+                    &mut texture,
+                )
+                .unwrap();
+        }
+        let texture = texture.unwrap();
+        let pitch = 256u32;
+        let (out, data) = host.shared_buffer(u64::from(pitch * height)).unwrap();
+        let list = host.new_list().unwrap();
+        assert!(super::record(&list, &texture, 0.6));
+        // SAFETY: an open list, live resources; the mapped buffer is read
+        // after the list ran.
+        unsafe {
+            list.list.ResourceBarrier(&[
+                crate::host::transition(&texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                crate::host::transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+            ]);
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&out),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_R32_UINT,
+                            Width: width,
+                            Height: height,
+                            Depth: 1,
+                            RowPitch: pitch,
+                        },
+                    },
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            list.close();
+            host.execute(&[&list]);
+            // 0.6 * (1, 0.98, 0.94): exponent 15 (scale 2^9), mantissas
+            // 307, 301, 289.
+            let want = 307 | 301 << 9 | 289 << 18 | 15 << 27;
+            for y in 0..height {
+                for x in 0..width {
+                    let v = data.cast::<u8>().add((y * pitch + 4 * x) as usize).cast::<u32>().read_volatile();
+                    assert_eq!(v, want, "texel {x},{y}");
+                }
+            }
+        }
     }
 }

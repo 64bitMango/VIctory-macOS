@@ -179,6 +179,19 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     } else {
         build()
     };
+    // A container a diagnostic patch may apply to has entries of its own,
+    // by the patches (`VICTORY_SHADER_PATCH`), on top of the options' build.
+    let patches = victory_shader::native::diagnostic_patches();
+    let patched;
+    let build = if patches.iter().any(|p| p.0 == container.len()) {
+        let mut h = blake3::Hasher::new();
+        h.update(build);
+        h.update(format!("{patches:?}").as_bytes());
+        patched = *h.finalize().as_bytes();
+        &patched
+    } else {
+        build
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, build, container, translate),
         None => (translate(container), false),

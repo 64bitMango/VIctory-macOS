@@ -190,8 +190,32 @@ impl NativeProgram {
                 }
             }
         }
+        for &(_, len, at, clear, set) in diagnostic_patches() {
+            if code.len() == len && at + 4 <= code.len() {
+                let word = u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]);
+                code[at..at + 4].copy_from_slice(&((word & !clear) | set).to_le_bytes());
+            }
+        }
         code
     }
+}
+
+/// Diagnostics: `VICTORY_SHADER_PATCH=<container bytes>:<code bytes>:<code
+/// offset>:<bits to clear>:<bits to set>,...` (all hexadecimal) changes one
+/// word of the machine code of the programs of that size before they are
+/// translated, to see what a part of a shader does to the picture. Each
+/// entry: container length, code length, offset, cleared bits, set bits.
+pub fn diagnostic_patches() -> &'static [(usize, usize, usize, u32, u32)] {
+    static PATCHES: std::sync::OnceLock<Vec<(usize, usize, usize, u32, u32)>> = std::sync::OnceLock::new();
+    PATCHES.get_or_init(|| {
+        let list = std::env::var("VICTORY_SHADER_PATCH").unwrap_or_default();
+        list.split(',')
+            .filter_map(|entry| {
+                let n: Vec<u64> = entry.split(':').filter_map(|x| u64::from_str_radix(x, 16).ok()).collect();
+                (n.len() == 5).then(|| (n[0] as usize, n[1] as usize, n[2] as usize, n[3] as u32, n[4] as u32))
+            })
+            .collect()
+    })
 }
 
 /// What a semantic is, as the stage data names it.
