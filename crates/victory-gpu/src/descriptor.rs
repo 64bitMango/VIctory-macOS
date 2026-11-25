@@ -1574,6 +1574,63 @@ pub(crate) mod tests {
         HEAPS_ALONE.with(|a| a.set(false));
     }
 
+    /// Several threads write the same slots of a heap no sync looks at, at
+    /// once, by calls (placed texture views, left null until read, and
+    /// cleared slots): after each round every slot is made from the record
+    /// it holds, whichever thread's write was the last.
+    #[cfg(windows)]
+    #[test]
+    fn the_last_of_several_threads_writing_a_slot_at_once_makes_it() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        const SLOTS: u32 = 96;
+        const FIRST: u32 = 64;
+        let title = owner(
+            HeapDesc { kind: VIEWS_KIND, count: SLOTS, flags: SHADER_VISIBLE, nodes: 1 },
+            Placement { address: 0, size: 0 },
+        );
+        let start = heap(title.0).start;
+        let Some(host) = heap(title.0).host() else { return };
+        let textures = vec![0u8; 16 << 12];
+        let textures_at = textures.as_ptr() as u64;
+        for round in 0..400u64 {
+            let barrier = std::sync::Barrier::new(4);
+            std::thread::scope(|scope| {
+                for t in 0..4u64 {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+                        let mut view = [0u32; 16];
+                        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+                        let address = textures_at + ((round + t) % 16 << 12);
+                        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+                        barrier.wait();
+                        for i in FIRST..SLOTS {
+                            let at = start + u64::from(i) * 32;
+                            if (round + t + u64::from(i)).is_multiple_of(5) {
+                                // A cleared slot, written by a copy of zeros.
+                                let zeros = [0u64; 4];
+                                copy_simple(std::ptr::null(), 1, at, zeros.as_ptr() as u64, VIEWS_KIND);
+                            } else {
+                                create_placed_srv(std::ptr::null(), &words, &view, at);
+                            }
+                        }
+                    });
+                }
+            });
+            for i in FIRST..SLOTS {
+                // SAFETY: a slot of the heap.
+                let record = unsafe { ((start + u64::from(i) * 32) as *const [u32; 3]).read_unaligned() };
+                let key = match views_current(&[record])[0] {
+                    true => u64::from(record[2]) << 32 | u64::from(record[1]),
+                    false => 0,
+                };
+                assert_eq!(host.made_key(i), key, "round {round}, slot {i}");
+            }
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn slots_written_from_several_threads_during_syncs_end_as_their_records() {
