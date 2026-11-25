@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Counters since the last line.
+#[derive(Clone, Copy)]
 pub(crate) enum C {
     Submissions,
     Copies,
@@ -157,6 +158,49 @@ pub(crate) enum C {
     /// ones.
     RecordFound,
     RecordNew,
+    /// Copying back, on the submitting thread: time asking the lists
+    /// whether their shaders missed memory, taking the shaders' read marks,
+    /// and in the work lists left for after their run.
+    BackMissedUs,
+    BackReadsUs,
+    BackAfterUs,
+    /// Copy-backs done as a batch of pieces (`crate::shadow::
+    /// pieces_at_once`), their passes that ran on helper threads too, and
+    /// copy-backs done piece by piece because copies shared memory.
+    BackBatches,
+    BackSpread,
+    BackOneByOne,
+    /// Copying back the pieces of declared ranges, then of marked pages:
+    /// `crate::shadow::Stage` names each run of fourteen, in its order
+    /// ([`back`]).
+    BackPieces,
+    BackBytes,
+    BackChanged,
+    BackCompareUs,
+    BackOpenUs,
+    BackPutUs,
+    BackReadUs,
+    BackWriteUs,
+    BackCloseUs,
+    BackAgainUs,
+    BackWritten,
+    BackWrites,
+    BackLeft,
+    BackIdle,
+    MarkPieces,
+    MarkBytes,
+    MarkChanged,
+    MarkCompareUs,
+    MarkOpenUs,
+    MarkPutUs,
+    MarkReadUs,
+    MarkWriteUs,
+    MarkCloseUs,
+    MarkAgainUs,
+    MarkWritten,
+    MarkWrites,
+    MarkLeft,
+    MarkIdle,
     /// Not a counter: how many there are.
     Count,
 }
@@ -165,6 +209,14 @@ static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+/// Adds to a copy-back counter: `stage` of `crate::shadow::Stage`, for the
+/// pieces of marked pages (`marked`) or of declared ranges.
+pub(crate) fn back(marked: bool, stage: usize, n: u64) {
+    let first = if marked { C::MarkPieces } else { C::BackPieces } as usize;
+    debug_assert!(stage <= C::BackIdle as usize - C::BackPieces as usize);
+    COUNT[first + stage].fetch_add(n, Relaxed);
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -362,6 +414,83 @@ pub(crate) fn log(frames: f64) {
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
     );
+    tracing::info!(
+        "  copying back per frame: asking lists for misses {:.2} ms, marked pages {:.2} ms, read marks {:.2} ms, \
+         declared ranges {:.2} ms, lists' work after {:.2} ms; {:.1} batches of pieces ({:.1} passes on helper threads too), \
+         {:.1} copy-backs piece by piece for copies sharing memory",
+        ms(c[C::BackMissedUs as usize]),
+        ms(c[C::MarkedUs as usize]),
+        ms(c[C::BackReadsUs as usize]),
+        ms(c[C::CompareUs as usize]),
+        ms(c[C::BackAfterUs as usize]),
+        c[C::BackBatches as usize],
+        c[C::BackSpread as usize],
+        c[C::BackOneByOne as usize],
+    );
+    let kinds = [
+        (
+            "declared ranges",
+            [
+                C::BackPieces,
+                C::BackBytes,
+                C::BackCompareUs,
+                C::BackChanged,
+                C::BackOpenUs,
+                C::BackPutUs,
+                C::BackReadUs,
+                C::BackWriteUs,
+                C::BackWritten,
+                C::BackWrites,
+                C::BackCloseUs,
+                C::BackAgainUs,
+                C::BackLeft,
+                C::BackIdle,
+            ],
+        ),
+        (
+            "marked pages",
+            [
+                C::MarkPieces,
+                C::MarkBytes,
+                C::MarkCompareUs,
+                C::MarkChanged,
+                C::MarkOpenUs,
+                C::MarkPutUs,
+                C::MarkReadUs,
+                C::MarkWriteUs,
+                C::MarkWritten,
+                C::MarkWrites,
+                C::MarkCloseUs,
+                C::MarkAgainUs,
+                C::MarkLeft,
+                C::MarkIdle,
+            ],
+        ),
+    ];
+    for (what, row) in kinds {
+        let v = row.map(|counter| c[counter as usize]);
+        tracing::info!(
+            "  copying back {what} per frame: {:.0} pieces, {:.2} MB compared in {:.2} ms; {:.0} pieces changed: \
+             opening title memory {:.2} ms, read, merged and written in {:.2} ms (threads' time: reading and merging \
+             {:.2} ms, writing {:.2} ms), {:.3} MB written in {:.0} writes; closing and taking pages {:.2} ms; taken \
+             pages read again {:.2} ms; {:.0} pages written and left changed (copied again at the next refresh); \
+             {:.0} pieces opened with nothing to write",
+            v[0],
+            mb(v[1]),
+            ms(v[2]),
+            v[3],
+            ms(v[4]),
+            ms(v[5]),
+            ms(v[6]),
+            ms(v[7]),
+            mb(v[8]),
+            v[9],
+            ms(v[10]),
+            ms(v[11]),
+            v[12],
+            v[13],
+        );
+    }
     let held: Vec<String> = crate::watch::held_times()
         .iter()
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))

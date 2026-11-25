@@ -1513,10 +1513,14 @@ impl Host {
         // those lists write through bounded views from their own inputs:
         // their ranges go back (the imposter transforms beside the BVH
         // builder in one list, run light13).
+        #[cfg(feature = "diagnostics")]
+        let asking = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::BackMissedUs);
         let missed: Vec<bool> = runs
             .iter()
             .map(|list| list.deferred().missed.iter().any(|check| check()))
             .collect();
+        #[cfg(feature = "diagnostics")]
+        drop(asking);
         crate::memory::note_submission(missed.contains(&true));
         let withholding = crate::memory::withholding();
         for (list, &missed) in runs.iter().zip(&missed) {
@@ -1558,26 +1562,29 @@ impl Host {
             .collect();
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
+        #[cfg(feature = "diagnostics")]
+        let reading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::BackReadsUs);
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
             crate::descriptor::make_read(&read);
         }
-        for (shadow, address, len, goes_back) in &back {
-            let (address, len) = (*address, *len);
-            if *goes_back {
-                let written = shadow.copy_back(address, len);
-                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-            } else {
-                shadow.keep_writes(address, len);
-                crate::memory::note_withheld(len as u64);
-                crate::memory::drop_withheld(address, len);
-            }
+        #[cfg(feature = "diagnostics")]
+        drop(reading);
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
+            let written = crate::shadow::copy_back_declared(&back);
+            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        let after = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::BackAfterUs);
         for list in runs {
             for work in &list.deferred().after {
                 work();
             }
         }
+        #[cfg(feature = "diagnostics")]
+        drop(after);
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
