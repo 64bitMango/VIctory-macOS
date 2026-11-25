@@ -1561,7 +1561,7 @@ fn made(r: &Resource) -> Option<std::sync::Arc<HostTexture>> {
 
 /// Milliseconds since the first call: host textures' use stamps.
 #[cfg(windows)]
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }

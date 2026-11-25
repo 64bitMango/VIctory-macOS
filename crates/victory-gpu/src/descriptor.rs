@@ -317,6 +317,28 @@ pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
     }
 }
 
+/// Runs `f` while no title heap slot is being made: every shader-visible
+/// heap's slot record lock is held, which [`host::HostHeap::mirror`] holds
+/// from making a slot's view to entering what it views in
+/// `crate::bindless`. What the heaps' slots view, as `crate::bindless` has
+/// it, stays so until `f` returns (`f` must not make slots itself). `f` is
+/// given a look at the slots themselves: of host resources (raw pointers),
+/// those some title slot views.
+#[cfg(windows)]
+pub(crate) fn with_slots_still<R>(
+    f: impl FnOnce(&dyn Fn(&std::collections::HashSet<usize>) -> std::collections::HashSet<usize>) -> R,
+) -> R {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let hosts: Vec<&host::HostHeap> = heaps
+        .iter()
+        // SAFETY: registered heaps are live (removed when dropped, which
+        // waits for the lock we hold).
+        .filter_map(|&(_, _, at)| unsafe { &*(at as *const Heap) }.host.get()?.as_ref())
+        .collect();
+    let _held: Vec<_> = hosts.iter().map(|h| h.hold_slots()).collect();
+    f(&|resources| hosts.iter().flat_map(|h| h.viewing(resources)).collect())
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]

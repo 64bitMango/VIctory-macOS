@@ -17,6 +17,7 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -51,6 +52,23 @@ pub(crate) struct Shadow {
     /// goes.
     base: u64,
     slice: Option<Slice>,
+    /// When it was last asked for ([`Shadow::ask`]): milliseconds and
+    /// presented frames.
+    asked: [AtomicU64; 2],
+    /// Lists recorded and not yet run that use it ([`Flight`]).
+    flights: AtomicU64,
+}
+
+/// A list's use of a copy from its recording until it has run (or is
+/// reset): the copy is not released for idleness meanwhile
+/// ([`release_idle`]), so every list of a submission uses the one copy of
+/// its memory.
+pub(crate) struct Flight(Arc<Shadow>);
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        self.0.flights.fetch_sub(1, Relaxed);
+    }
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -152,6 +170,21 @@ impl Shadow {
         (self.start, self.len)
     }
 
+    /// Something asks for it now (a lookup, a list using it submitted, a
+    /// shader writing it at an address it computed): it is not idle
+    /// ([`release_idle`]).
+    pub(crate) fn ask(&self) {
+        for (asked, now) in self.asked.iter().zip(&NOW) {
+            asked.store(now.load(Relaxed), Relaxed);
+        }
+    }
+
+    /// A list being recorded uses it: see [`Flight`].
+    pub(crate) fn fly(self: &Arc<Self>) -> Flight {
+        self.flights.fetch_add(1, Relaxed);
+        Flight(self.clone())
+    }
+
     /// After a submission whose shaders wrote title memory at addresses they
     /// computed (`crate::memory`), somewhere in the 64 KiB page at `page`:
     /// the bytes of the page (cut to the copy) that differ from title memory
@@ -226,6 +259,8 @@ impl Shadow {
             marks,
             base: slice.map_or(0, |s| s.offset),
             slice,
+            asked: [0, 1].map(|i| AtomicU64::new(NOW[i].load(Relaxed))),
+            flights: AtomicU64::new(0),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -1054,9 +1089,9 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
-/// gets copies of the aligned windows it touches.
-/// shortcut: copies of windows are never freed; key them to the title's
-/// allocations if memory use grows.
+/// gets copies of the aligned windows it touches. The title unmaps little
+/// of it, so a window nothing asked for in a while is released
+/// ([`release_idle`]) and made again when asked for.
 const WINDOW: u64 = 4 << 20;
 
 /// Copies of title memory outside buffers, by (start, length).
@@ -1067,6 +1102,8 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let len = end.next_multiple_of(WINDOW) - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
+        // Under the lock, where a release checks it.
+        shadow.ask();
         return Some(shadow.clone());
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -1081,7 +1118,225 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let shadow = Shadow::new(buffer, data, gpu, start, len);
     map.insert((start, len), shadow.clone());
     changed();
+    if released().made((start, len)) {
+        IDLE_COUNTS[2].fetch_add(1, Relaxed);
+        IDLE_COUNTS[3].fetch_add(len, Relaxed);
+    }
     Some(shadow)
+}
+
+/// The time copies are stamped with when asked for ([`Shadow::ask`]):
+/// milliseconds and presented frames, as of the last submission's start
+/// ([`idle_sweep`]).
+static NOW: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Seconds (and presented frames) without being asked for after which a
+/// window is released: `VICTORY_IDLE_RELEASE_S` (default
+/// [`crate::idle::IDLE_S`]); none with `VICTORY_IDLE_RELEASE=0`, and in
+/// tests, which release what they made themselves.
+fn idle_seconds() -> Option<u64> {
+    static SECONDS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *SECONDS.get_or_init(|| {
+        if cfg!(test) {
+            return None;
+        }
+        let var = |name: &str| std::env::var(name).ok();
+        let seconds = crate::idle::setting(var("VICTORY_IDLE_RELEASE").as_deref(), var("VICTORY_IDLE_RELEASE_S").as_deref());
+        match seconds {
+            Some(seconds) => tracing::info!(
+                seconds,
+                "copies of title memory outside buffers nothing asked for in this many seconds and frames are released (VICTORY_IDLE_RELEASE_S; VICTORY_IDLE_RELEASE=0 keeps them)"
+            ),
+            None => tracing::info!("copies of title memory outside buffers are never released (VICTORY_IDLE_RELEASE=0)"),
+        }
+        seconds
+    })
+}
+
+/// What is remembered of the windows released. Locked after `LOOSE` where
+/// both are held.
+static RELEASED: Mutex<crate::idle::Released> = Mutex::new(crate::idle::Released::new());
+
+fn released() -> std::sync::MutexGuard<'static, crate::idle::Released> {
+    RELEASED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Since the last [`log_idle`]: windows released and their bytes, windows
+/// made again where one was released and their bytes, those of them made
+/// again because shaders found no copy there. And as of the last pass: idle
+/// windows kept because a heap slot views them, and because a list not yet
+/// run uses them or shaders' writes are not copied back.
+static IDLE_COUNTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// After a submission: its shaders read or wrote title memory `[start,
+/// end)` at addresses they computed and found no copy (`crate::memory`). A
+/// window released there is made again before the next submission
+/// ([`idle_sweep`]).
+pub(crate) fn note_missed(start: u64, end: u64) {
+    released().missed(start, end);
+}
+
+/// At each submission, before its lists are prepared and while none runs
+/// (`Host::execute`): the stamps' time moves on, windows released where
+/// shaders found no copy since are made again, and once a second the idle
+/// windows are released ([`release_idle`]).
+pub(crate) fn idle_sweep() {
+    let Some(seconds) = idle_seconds() else {
+        return;
+    };
+    let now = (crate::resource::now_ms(), crate::queue::presented());
+    NOW[0].store(now.0, Relaxed);
+    NOW[1].store(now.1, Relaxed);
+    make_missed_again();
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    if now.0.saturating_sub(LAST.load(Relaxed)) < 1000 {
+        return;
+    }
+    LAST.store(now.0, Relaxed);
+    let started = std::time::Instant::now();
+    let (windows, bytes) = release_idle(now, seconds, None);
+    let took = started.elapsed();
+    if took > std::time::Duration::from_millis(20) {
+        tracing::info!(windows, bytes, ms = took.as_millis() as u64, "idle copies of title memory released (slow pass)");
+    }
+}
+
+/// Windows released where shaders found no copy since ([`note_missed`])
+/// are made again from title memory, and never released again: such reads
+/// ask for nothing, so a window only they use looks idle. Returns how many.
+fn make_missed_again() -> u64 {
+    let wanted = released().wanted();
+    let mut made = 0;
+    for (start, len) in wanted {
+        // Counted as made again where it is made (`loose`); one a lookup
+        // made meanwhile is not counted here.
+        let there = LOOSE.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(start, len));
+        if !there && loose(start, start + len).is_some() {
+            made += 1;
+        }
+    }
+    IDLE_COUNTS[4].fetch_add(made, Relaxed);
+    made
+}
+
+/// Releases the windows idle at `now` for `seconds`
+/// ([`crate::idle::idle`]), only those inside `within` (start, end; tests):
+/// they leave the copies the runtime finds, and the next lookup of their
+/// memory makes a new window from title memory, as on first use. Returns how
+/// many and their bytes. Between submissions (`Host::execute` holds the
+/// submission lock; the last one has run).
+///
+/// Kept, however idle:
+/// - a window a title heap slot views (`crate::bindless::shown`, and the
+///   slots' own record of the buffers they view): shaders indexing the
+///   heap may read any slot, and draws reading the slot refresh the copy
+///   they find, which must be the one the slot shows;
+/// - a window a list recorded and not yet run uses ([`Flight`]): a new
+///   window made meanwhile would not show what that list's shaders write
+///   to the other lists of its submission;
+/// - a window whose shaders' writes are not copied back yet;
+/// - a window made again after shaders missed it ([`make_missed_again`]).
+///
+/// The slots are looked at and the windows taken out while no title heap
+/// slot is being made (`crate::descriptor::with_slots_still`) and under
+/// the windows' lock, where a lookup stamps what it finds: a window found
+/// since the pass read the time is not idle, so none goes that a slot
+/// being made, or a draw being recorded, has just looked up.
+///
+/// A released window's host buffer lives while anything still holds it:
+/// lists that ran and are not reset yet, and `crate::memory`'s page
+/// tables, which name it until the next submission using them rewrites
+/// them (the copies' generation changed). Its page guards go with it.
+fn release_idle(now: crate::idle::Stamp, seconds: u64, within: Option<(u64, u64)>) -> (u64, u64) {
+    let inside = |s: &Shadow| within.is_none_or(|(a, b)| a <= s.start && s.start + s.len <= b);
+    let asked = |s: &Shadow| (s.asked[0].load(Relaxed), s.asked[1].load(Relaxed));
+    let idle = |s: &Shadow| crate::idle::idle(asked(s), now, seconds);
+    let at = |s: &Arc<Shadow>| Arc::as_ptr(s) as usize;
+    let candidates: Vec<Arc<Shadow>> = LOOSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .filter(|s| inside(s) && idle(s))
+        .cloned()
+        .collect();
+    if candidates.is_empty() {
+        if within.is_none() {
+            IDLE_COUNTS[5].store(0, Relaxed);
+            IDLE_COUNTS[6].store(0, Relaxed);
+        }
+        return (0, 0);
+    }
+    let (gone, shown, busy) = crate::descriptor::with_slots_still(|slots| {
+        use windows::core::Interface;
+        let shown = crate::bindless::shown(&candidates.iter().map(at).collect());
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut released = released();
+        let (mut free, mut busy) = (Vec::new(), 0u64);
+        for c in candidates.iter().filter(|c| !shown.contains(&at(c))) {
+            let key = (c.start, c.len);
+            // Still the window found there, and not asked for since.
+            if !map.get(&key).is_some_and(|s| Arc::ptr_eq(s, c)) || !idle(c) || released.pinned(key) {
+                continue;
+            }
+            if c.flights.load(Relaxed) != 0 || !c.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                busy += 1;
+                continue;
+            }
+            free.push(c);
+        }
+        // The slots themselves, whatever `crate::bindless` has of them.
+        let raw = |c: &Arc<Shadow>| c.buffer.as_raw() as usize;
+        let viewed = if free.is_empty() { Default::default() } else { slots(&free.iter().map(|c| raw(c)).collect()) };
+        let mut gone = Vec::new();
+        for c in free.into_iter().filter(|c| !viewed.contains(&raw(c))) {
+            let key = (c.start, c.len);
+            gone.extend(map.remove(&key));
+            released.release(key);
+        }
+        (gone, (shown.len() + viewed.len()) as u64, busy)
+    });
+    drop(candidates);
+    if within.is_none() {
+        IDLE_COUNTS[5].store(shown, Relaxed);
+        IDLE_COUNTS[6].store(busy, Relaxed);
+    }
+    if gone.is_empty() {
+        return (0, 0);
+    }
+    changed();
+    // Page tables name the windows gone until rewritten: now, so that a
+    // heap no list uses for a while does not keep their buffers.
+    if within.is_none() {
+        crate::memory::rewrite_stale();
+    }
+    let bytes: u64 = gone.iter().map(|c| c.len).sum();
+    IDLE_COUNTS[0].fetch_add(gone.len() as u64, Relaxed);
+    IDLE_COUNTS[1].fetch_add(bytes, Relaxed);
+    tracing::debug!(windows = gone.len(), bytes, "idle copies of title memory released");
+    (gone.len() as u64, bytes)
+}
+
+/// Logs the windows alive and what idle release did since the last call
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_idle() {
+    let (alive, bytes) = {
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        (map.len(), map.values().map(|s| s.len).sum::<u64>())
+    };
+    let [gone, gone_bytes, again, again_bytes, missed] = [0, 1, 2, 3, 4].map(|i| IDLE_COUNTS[i].swap(0, Relaxed));
+    let [shown, busy] = [5, 6].map(|i| IDLE_COUNTS[i].load(Relaxed));
+    let pinned = released().pins();
+    let rule = match idle_seconds() {
+        Some(s) => format!("released when idle {s} s and {s} frames"),
+        None => "never released (VICTORY_IDLE_RELEASE=0)".into(),
+    };
+    tracing::info!(
+        "loose windows of title memory: {alive} alive ({:.0} MB), {rule}; since the last line: released {gone} ({:.0} MB),          made again after a release {again} ({:.0} MB), {missed} of them after title-memory shaders missed them;          idle but kept: {shown} viewed by heap slots, {busy} used by lists not yet run, {pinned} made again after a miss",
+        bytes as f64 / 1e6,
+        gone_bytes as f64 / 1e6,
+        again_bytes as f64 / 1e6,
+    );
 }
 
 /// The copy a buffer view of `len` bytes at `address`, whose elements are
@@ -1642,6 +1897,178 @@ pub(crate) mod tests {
         assert_eq!(unsafe { ((p + 16) as *const u8).read_volatile() }, 0x11, "title memory untouched");
         unregister(p + 1, p as u64);
         unregister(p, p as u64);
+    }
+
+    /// Memory of our own holding `n` whole 4 MiB windows outside any buffer
+    /// object: the allocation, and the first window's start. None without a
+    /// host GPU.
+    fn windows(n: usize) -> Option<(usize, u64)> {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        host()?;
+        let bytes = (n + 1) * WINDOW as usize;
+        // SAFETY: a fresh allocation, freed by the test.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert!(p != 0);
+        Some((p, (p as u64).next_multiple_of(WINDOW)))
+    }
+
+    /// The windows of the allocation at `p` (`n` windows) go, with what is
+    /// remembered of them, and it is freed.
+    fn done(p: usize, n: usize) {
+        let within = (p as u64, (p + (n + 1) * WINDOW as usize) as u64);
+        released().forget(within.0, within.1);
+        release_idle(LATER, 0, Some(within));
+        released().forget(within.0, within.1);
+        crate::watch::tests::free(p);
+    }
+
+    /// Long after the tests' stamps (they are stamped at time 0: no pass
+    /// moves the time on in tests).
+    const LATER: crate::idle::Stamp = (1 << 40, 1 << 40);
+
+    fn registered(c: &Arc<Shadow>) -> bool {
+        all().iter().any(|a| Arc::ptr_eq(a, c))
+    }
+
+    /// Whether the copy behind `held` goes once the page tables naming it
+    /// are rewritten and the last submission's batch is dropped (on a
+    /// thread of its own).
+    fn freed(held: &std::sync::Weak<Shadow>) -> bool {
+        host().expect("checked").between_submissions(crate::memory::rewrite_stale);
+        (0..200).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            held.strong_count() == 0
+        })
+    }
+
+    /// A window nothing asked for in the idle time (seconds and frames) is
+    /// released, and its host buffer goes once nothing holds it; one whose
+    /// shaders' writes are not copied back stays. Asked for again, a new
+    /// window is made, holding the title's bytes as they are now, and it
+    /// counts as made again.
+    #[test]
+    fn idle_windows_go_and_come_back_with_current_bytes() {
+        let Some((p, w)) = windows(1) else { return };
+        let within = Some((w, w + WINDOW));
+        // SAFETY: (title writes below) bytes of our allocation.
+        unsafe { ((w + 16) as *mut u32).write_volatile(1) };
+        let copy = find(w + 16, 4).expect("a window");
+        assert_eq!(copy.range(), (w, WINDOW), "a loose window");
+        copy.update(w as usize, 4096);
+        assert_eq!(copy.read_host(w + 16, 1), [1]);
+        assert_eq!(release_idle((5_000, 1 << 40), 30, within), (0, 0), "asked for 5 s ago");
+        assert_eq!(release_idle((1 << 40, 5), 30, within), (0, 0), "asked for 5 frames ago");
+        copy.writing(w as usize, 64, false);
+        assert_eq!(release_idle(LATER, 30, within), (0, 0), "shaders' writes not copied back");
+        copy.copy_back(w as usize, 64);
+        assert!(registered(&copy));
+        assert_eq!(release_idle(LATER, 30, within), (1, WINDOW), "idle");
+        assert!(!registered(&copy), "no longer found");
+        let held = Arc::downgrade(&copy);
+        drop(copy);
+        assert!(freed(&held), "its memory returned");
+        // The title writes meanwhile; the next use makes a new window.
+        // SAFETY: bytes of our allocation.
+        unsafe { ((w + 16) as *mut u32).write_volatile(2) };
+        let again = find(w + 16, 4).expect("a new window");
+        assert!(registered(&again));
+        assert!(!released().made((w, WINDOW)), "counted as made again");
+        again.update(w as usize, 4096);
+        assert_eq!(again.read_host(w + 16, 1), [2], "the title's bytes as they are now");
+        drop(again);
+        done(p, 1);
+    }
+
+    /// A window a list recorded and not yet run uses is not released: the
+    /// list's submission brings it up to date, and other lookups find the
+    /// same copy meanwhile. Once the list has run it goes, and its buffer
+    /// with the list's reset.
+    #[test]
+    fn windows_of_lists_in_flight_stay_until_the_lists_have_run() {
+        let Some((p, w)) = windows(1) else { return };
+        let host = host().expect("checked");
+        let within = Some((w, w + WINDOW));
+        let copy = find(w, 64).expect("a window");
+        let list = host.new_list().expect("a list");
+        copy.refresh(&list, w, 64);
+        list.close();
+        assert_eq!(release_idle(LATER, 30, within), (0, 0), "a list not yet run uses it");
+        assert!(Arc::ptr_eq(&find(w + 32, 4).expect("the window"), &copy), "still the copy found");
+        // The title writes, then the list is submitted: its copy has it.
+        // SAFETY: bytes of our allocation.
+        unsafe { ((w + 8) as *mut u32).write_volatile(7) };
+        host.execute(&[&list]);
+        assert_eq!(copy.read_host(w + 8, 1), [7], "brought up to date for the list");
+        assert_eq!(release_idle(LATER, 30, within), (1, WINDOW), "the list has run");
+        assert!(!registered(&copy));
+        let held = Arc::downgrade(&copy);
+        drop(copy);
+        host.between_submissions(crate::memory::rewrite_stale);
+        assert!(held.strong_count() > 0, "the list holds it until reset");
+        list.reset();
+        assert!(freed(&held), "freed with the list's reset");
+        // A list reset before it ran lets go too.
+        let copy = find(w, 64).expect("a new window");
+        copy.refresh(&list, w, 64);
+        copy.gpu_writes(&list, w, 64, false);
+        assert_eq!(release_idle(LATER, 30, within), (0, 0));
+        list.close();
+        list.reset();
+        assert_eq!(release_idle(LATER, 30, within), (1, WINDOW));
+        drop((copy, list));
+        done(p, 1);
+    }
+
+    /// A window a view heap slot views is not released (shaders indexing
+    /// the heap may read it); once the slot views something else, it goes.
+    #[test]
+    fn windows_heap_slots_view_stay_until_the_slot_changes() {
+        let Some((p, w)) = windows(1) else { return };
+        let within = Some((w, w + WINDOW));
+        let Some(heap) = crate::descriptor::host::HostHeap::new(false, 4) else {
+            done(p, 1);
+            return;
+        };
+        let view = crate::descriptor::View::Constant(w + 256, 256);
+        heap.viewed.set(0, Some(&view), true);
+        let copy = find(w + 256, 256).expect("the window");
+        let at = Arc::as_ptr(&copy) as usize;
+        assert!(crate::bindless::shown(&[at].into_iter().collect()).contains(&at));
+        assert_eq!(release_idle(LATER, 30, within), (0, 0), "a slot views it");
+        assert!(registered(&copy));
+        heap.viewed.set(0, None, false);
+        assert_eq!(release_idle(LATER, 30, within), (1, WINDOW), "no slot views it");
+        assert!(!registered(&copy));
+        drop(copy);
+        done(p, 1);
+    }
+
+    /// Shaders finding no copy at a released window's memory make it again
+    /// before the next submission, and it is never released again; a miss
+    /// where nothing was released makes nothing.
+    #[test]
+    fn released_windows_shaders_miss_are_made_again_and_kept() {
+        let Some((p, w)) = windows(2) else { return };
+        let within = Some((w, w + 2 * WINDOW));
+        let copy = find(w, 4).expect("a window");
+        assert_eq!(release_idle(LATER, 30, within), (1, WINDOW));
+        assert!(!registered(&copy));
+        // SAFETY: bytes of our allocation.
+        unsafe { ((w + 0x1_0000) as *mut u32).write_volatile(9) };
+        note_missed(w + 0x1_0000, w + 0x2_0000);
+        note_missed(w + WINDOW, w + WINDOW + 0x1_0000);
+        // Other tests' misses are made again by whichever test comes first.
+        make_missed_again();
+        let again = LOOSE.lock().unwrap().get(&(w, WINDOW)).cloned().expect("made again");
+        assert!(!Arc::ptr_eq(&again, &copy), "a new one");
+        assert!(!LOOSE.lock().unwrap().contains_key(&(w + WINDOW, WINDOW)), "never released: not made");
+        again.update(w as usize + 0x1_0000, 4);
+        assert_eq!(again.read_host(w + 0x1_0000, 1), [9], "from title memory");
+        assert!(released().pinned((w, WINDOW)));
+        assert_eq!(release_idle(LATER, 30, within), (0, 0), "kept");
+        assert!(registered(&again));
+        drop((copy, again));
+        done(p, 2);
     }
 
     /// Mark bits are handed out in runs and come back joined.

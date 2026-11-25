@@ -792,6 +792,23 @@ impl HostHeap {
         Some(view)
     }
 
+    /// Holds off the making of this heap's title slots until dropped
+    /// (`crate::descriptor::with_slots_still`).
+    pub(crate) fn hold_slots(&self) -> std::sync::MutexGuard<'_, Vec<u64>> {
+        self.made.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Of host resources `resources` (raw pointers), those a title slot
+    /// views.
+    pub(crate) fn viewing(&self, resources: &std::collections::HashSet<usize>) -> Vec<usize> {
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        kept.iter()
+            .take_while(|&(i, _)| i < self.count as usize)
+            .map(|(_, k)| windows::core::Interface::as_raw(&k.0) as usize)
+            .filter(|r| resources.contains(r))
+            .collect()
+    }
+
     /// The view host slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.

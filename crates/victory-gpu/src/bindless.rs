@@ -322,6 +322,17 @@ pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, 
     }
 }
 
+/// Of `copies` (by address), those a slot of some view heap views.
+pub(crate) fn shown(copies: &std::collections::HashSet<usize>) -> std::collections::HashSet<usize> {
+    let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut shown = std::collections::HashSet::new();
+    for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
+        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+        shown.extend(copies.iter().filter(|&&c| inner.ends.contains_key(&(c, false)) || inner.ends.contains_key(&(c, true))));
+    }
+    shown
+}
+
 /// Draws and dispatches run with heap-indexing shaders, those of them
 /// writing through the heap, textures uploaded for heaps (diagnostics).
 static HEAP_DRAWS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];

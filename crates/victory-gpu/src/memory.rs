@@ -395,6 +395,24 @@ impl Shared {
     }
 }
 
+/// Between submissions, after host copies were released
+/// (`crate::shadow::release_idle`): every live heap's page table that names
+/// copies of another generation is rewritten, so that it holds those gone
+/// (and their views their buffers) no longer.
+pub(crate) fn rewrite_stale() {
+    let now = crate::shadow::generation();
+    let stale: Vec<usize> = shared().iter().filter(|(_, s)| s.generation != now).map(|(k, _)| *k).collect();
+    for key in stale {
+        with_heap(key, |heap| {
+            let mut shared = shared();
+            let host = std::ptr::from_ref(heap) as usize;
+            if let Some((_, s)) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host && s.generation != now) {
+                s.rewrite(heap, now);
+            }
+        });
+    }
+}
+
 /// The page table of view heap `key`, as the last submission using it
 /// left it.
 fn layout(key: usize) -> Arc<Layout> {
@@ -498,6 +516,9 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
         let mut writes = Vec::new();
+        // Memory with no copy: a window released there is made again
+        // (`crate::shadow::note_missed`).
+        let mut gone = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
             // Most words are 0: write back only the ones that are not.
             if *mark == 0 {
@@ -512,6 +533,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
                     regions += 1;
                     missed.push((entry as u64) << 28);
+                    gone.push(((entry as u64) << 28, (entry as u64 + 1) << 28));
                     continue;
                 };
                 let at = (l1 << 28 | page << 16) as u64;
@@ -521,8 +543,20 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                     _ => {
                         pages += 1;
                         missed.push(at);
+                        gone.push((at, at + (1 << 16)));
                     }
                 }
+            }
+        }
+        for (start, end) in gone {
+            crate::shadow::note_missed(start, end);
+        }
+        // Copies shaders write this way are in use, though nothing looks
+        // them up.
+        let mut last = usize::MAX;
+        for &(k, _) in &writes {
+            if std::mem::replace(&mut last, k) != k {
+                copies[k].ask();
             }
         }
         // What shaders computed from memory with no copy (read as zeros) is
