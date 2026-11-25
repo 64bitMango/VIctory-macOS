@@ -1146,9 +1146,13 @@ impl<'a> Lanes<'a> {
             "cselect" => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
                 let scc = inst.read(Reg::Scc)?;
-                let born = self.born(scc);
-                let u = self.b.atom(Atom::Uniform(scc), born);
-                (self.b.ite(u, a, c), None)
+                if self.clear_after_loop(scc) {
+                    (c, None)
+                } else {
+                    let born = self.born(scc);
+                    let u = self.b.atom(Atom::Uniform(scc), born);
+                    (self.b.ite(u, a, c), None)
+                }
             }
             _ => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
@@ -1162,6 +1166,49 @@ impl<'a> Lanes<'a> {
             derived,
             scc,
         })
+    }
+
+    /// Whether SCC value `scc` is clear wherever it is read: a lane-width
+    /// mask operation wrote it as "the EXEC it leaves is not empty"
+    /// (`s_andn2_wrexec_b32`, say) right before the `s_cbranch_execnz`
+    /// that tests that EXEC and closes a loop, as a waterfall loop ends.
+    /// The branch target dominates the block, so a path from it to a read
+    /// of this value (not of a join) passes the writer again: the read
+    /// follows the fallthrough, taken with EXEC empty. A forward branch
+    /// proves nothing: its target may read the value set.
+    fn clear_after_loop(&self, scc: Value) -> bool {
+        let Some(&(b, i)) = self.defs.get(&scc) else {
+            return false;
+        };
+        let block = &self.p.blocks[b];
+        let (Some(writer), Some(last)) = (block.insts.get(i), block.insts.last()) else {
+            return false;
+        };
+        let Exit::Branch { taken, .. } = block.exit else {
+            return false;
+        };
+        // The operations whose SCC is "the result is not zero".
+        const NONZERO: [&str; 11] = [
+            "and", "or", "xor", "andn1", "andn2", "orn1", "orn2", "nand", "nor", "xnor", "not",
+        ];
+        let width = if self.p.wave64 { "_b64" } else { "_b32" };
+        let nonzero = writer
+            .name()
+            .strip_prefix("s_")
+            .and_then(|n| n.strip_suffix(width))
+            .map(|op| {
+                op.strip_suffix("_saveexec")
+                    .or(op.strip_suffix("_wrexec"))
+                    .unwrap_or(op)
+            })
+            .is_some_and(|f| NONZERO.contains(&f));
+        let exec = self.key(|r| writer.write(r), EXEC);
+        nonzero
+            && exec.is_some()
+            && i + 2 == block.insts.len()
+            && last.name() == "s_cbranch_execnz"
+            && self.key(|r| last.read(r), EXEC) == exec
+            && self.index[taken] <= self.index[b]
     }
 
     fn combine(&mut self, f: &str, a: Bool, c: Bool) -> Option<Bool> {
@@ -1671,6 +1718,74 @@ mod tests {
             s.bools.node(when),
             Some((Atom::Lane(_), Bool::TRUE, Bool::FALSE))
         ));
+    }
+
+    /// A waterfall loop's tail, then `s_cselect ..., exec, 0` and a restore
+    /// of EXEC from its result. `tail` is the SCC writer before the loop's
+    /// `s_cbranch_execnz`, which jumps by `back` words.
+    fn select_after_loop(wave64: bool, tail: u32, back: u32) -> (Program, Structured, Value) {
+        let (select, restore) = match wave64 {
+            true => (0x8582_807E, 0xBEFE_0402), // s_cselect_b64 s[2:3], exec, 0
+            false => (0x8502_807E, 0xBEFE_0302), // s_cselect_b32 s2, exec_lo, 0
+        };
+        let p = build(
+            &[
+                if wave64 { 0xBE84_047E } else { 0xBE84_037E }, // s_mov s4, exec
+                0x7DA4_0080,                                    // 4: v_cmpx_eq_u32 exec, 0, v0
+                tail,
+                0xBF89_0000 | back, // s_cbranch_execnz
+                0x7E02_0280,        // 16: v_mov_b32 v1, 0
+                select,
+                restore,     // s_mov exec, s2
+                0x7E04_0280, // v_mov_b32 v2, 0
+                S_ENDPGM,
+            ],
+            wave64,
+        );
+        let s = structure(&p).unwrap();
+        let (b, i) = (0..p.blocks.len())
+            .flat_map(|b| (0..p.blocks[b].insts.len()).map(move |i| (b, i)))
+            .find(|&(b, i)| p.blocks[b].insts[i].name().starts_with("s_cselect"))
+            .unwrap();
+        let picked = p.blocks[b].insts[i].write(Reg::S(2)).unwrap();
+        (p, s, picked)
+    }
+
+    #[test]
+    fn scc_is_clear_after_a_loop_that_runs_while_exec_is_not_empty() {
+        for (wave64, tail) in [
+            (false, 0xBE84_4704), // s_andn2_wrexec_b32 s4, s4
+            (true, 0xBE84_3A04),  // s_andn2_wrexec_b64 s[4:5], s[4:5]
+            (false, 0x8A7E_7E04), // s_andn2_b32 exec_lo, s4, exec_lo
+        ] {
+            let (_, s, picked) = select_after_loop(wave64, tail, 0xFFFD);
+            // The select takes its second operand: no lane.
+            assert_eq!(s.masks[&picked], Bool::FALSE, "{tail:#x}");
+        }
+    }
+
+    #[test]
+    fn scc_stays_unknown_where_no_loop_proves_it_clear() {
+        for (tail, back) in [
+            // Forward, over the first move: the select at the target reads
+            // SCC as the branch left it, set.
+            (0xBE84_4704, 0x0001), // s_andn2_wrexec_b32 s4, s4
+            // SCC of a mask that is not the EXEC the branch tests.
+            (0x8A04_7E04, 0xFFFD), // s_andn2_b32 s4, s4, exec_lo
+            // A carry, whatever EXEC holds.
+            (0x807E_047E, 0xFFFD), // s_add_u32 exec_lo, exec_lo, s4
+        ] {
+            let (p, s, picked) = select_after_loop(false, tail, back);
+            let scc = (p.blocks.iter().flat_map(|b| &b.insts))
+                .find_map(|i| i.read(Reg::Scc).filter(|_| i.name() == "s_cselect_b32"))
+                .unwrap();
+            let m = s.masks[&picked];
+            assert!(
+                s.bools.support(m).contains(&Atom::Uniform(scc)),
+                "{tail:#x}: {:?}",
+                s.bools.support(m)
+            );
+        }
     }
 
     #[test]
