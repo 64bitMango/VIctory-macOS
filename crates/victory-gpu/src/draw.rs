@@ -1488,6 +1488,48 @@ impl State {
             let Some(&(_, offset)) = probes.iter().find(|(h, _)| stage.shader.hash.contains(h.as_str())) else {
                 continue;
             };
+            // What the shader reads and writes through its tables: the
+            // resource (as the capture names its dumps), format and size.
+            static READS: AtomicU64 = AtomicU64::new(0);
+            for u in stage.translated().used.iter().filter(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) {
+                let (RootType::Table, Some(Root::Table(table))) =
+                    (u.root, self.roots_ref(compute).get(usize::from(u.slot)))
+                else {
+                    continue;
+                };
+                if READS.fetch_add(1, Ordering::Relaxed) >= 256 {
+                    break;
+                }
+                let who = format!(
+                    "{} {:?} {}{} s{}+{}",
+                    stage.shader.hash,
+                    u.kind,
+                    if u.kind == ResourceType::Srv { "t" } else { "u" },
+                    u.lower_bound,
+                    u.slot,
+                    u.table_offset_dwords
+                );
+                let view = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4);
+                let r = match view {
+                    Some(View::Shader(r, _)) | Some(View::Unordered(r, ..)) => r,
+                    other => {
+                        tracing::info!(target: "victory_gpu::trace", "view {who}: {other:?}");
+                        continue;
+                    }
+                };
+                match crate::resource::host_resource(r as This) {
+                    Some(t) => {
+                        // SAFETY: a live resource.
+                        let d = unsafe { t.GetDesc() };
+                        tracing::info!(
+                            target: "victory_gpu::trace",
+                            "view {who}: resource {r:#x} host format {} {}x{}x{} mips {} flags {:#x} dimension {}",
+                            d.Format.0, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Flags.0, d.Dimension.0
+                        );
+                    }
+                    None => tracing::info!(target: "victory_gpu::trace", "view {who}: resource {r:#x} has no host resource"),
+                }
+            }
             for u in stage.translated().used.iter().filter(|u| u.kind == ResourceType::Cbv) {
                 let (RootType::Table, Some(Root::Table(table))) =
                     (u.root, self.roots_ref(compute).get(usize::from(u.slot)))
