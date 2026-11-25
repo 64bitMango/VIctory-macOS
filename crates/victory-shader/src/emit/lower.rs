@@ -163,13 +163,11 @@ pub(crate) fn lower_with_layout(
         match made {
             (r, false) => return r,
             (Ok(l), true) if refused.get().is_none() => return Ok(l),
-            _ => {
-                KEPT_WIDE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let why = refused
+            _ => WIDE.set(Some(
+                refused
                     .get()
-                    .unwrap_or("a program the halves form does not translate");
-                *KEPT_WIDE_WHY.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
-            }
+                    .unwrap_or("a program the halves form does not translate"),
+            )),
         }
     }
     unreachable!("the second form has no halves")
@@ -1544,6 +1542,50 @@ impl<'a> Lower<'a> {
                 }
             }
         }))
+    }
+
+    /// Halves: `a` of the first lane in EXEC of the console's wave (lane 0's
+    /// with no lane in EXEC), where `first` is this host wave's first
+    /// lane's. Where every lane in the block is in EXEC that is the lower
+    /// half's `first`; else each half finds its first lane in EXEC, and the
+    /// lower half's counts if it has one.
+    fn first_lane(&mut self, inst: &Inst, a: V, first: V) -> V {
+        const WHAT: Why = "v_readfirstlane_b32 where the halves cannot meet";
+        let b = self.cur_ir;
+        let st = self.x.st;
+        let exec = inst
+            .read(Reg::S(EXEC))
+            .and_then(|v| st.masks.get(&v))
+            .copied();
+        let all = exec.is_some_and(|e| !st.bools.meet(&[(st.reach[b], true), (e, false)]));
+        if all || !self.halves_meet(b) || self.guarded != 0 {
+            return self.whole_wave(first, WHAT, |_, lo, _| lo);
+        }
+        let c = self.cur;
+        let Some(on) = exec.and_then(|e| self.boolean(e, c).ok()) else {
+            self.refuse("v_readfirstlane_b32 under an untracked EXEC");
+            return first;
+        };
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+        let lanes = self.s.m.extract(c, ballot, 0);
+        let (z, k31) = (self.s.m.i32(0), self.s.m.i32(31));
+        let lane = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lanes]);
+        let lane = self.s.m.bin(c, Bin::And, lane, k31);
+        let at = self.read_lane(a, lane);
+        let none = self.s.m.cmp(c, pred::EQ, lanes, z);
+        let own = self.s.m.select(c, none, first, at);
+        let (lo_lanes, hi_lanes) = self.exchange(c, b, lanes);
+        let (lo, hi) = self.exchange(c, b, own);
+        let in_lo = self.s.m.cmp(c, pred::NE, lo_lanes, z);
+        let in_hi = self.s.m.cmp(c, pred::NE, hi_lanes, z);
+        let upper = self.s.m.select(c, in_hi, hi, lo);
+        self.s.m.select(c, in_lo, lo, upper)
     }
 
     /// Halves: a host wave's result `r` of an operation over the wave (the
@@ -7542,20 +7584,15 @@ impl<'a> Lower<'a> {
                     &[a],
                 );
                 let r = self.helper_reads_own(a, r);
-                // Halves: the console's first lane is the lower half's
-                // (every lane is there where the halves meet); a value all
-                // lanes hold alike is any lane's.
+                // Halves: a value all lanes hold alike is any lane's;
+                // another is the first lane's of the whole wave.
                 let same = self.halves.is_some()
                     && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
                         if inst.read(Reg::V(reg)).is_some_and(|x| self.lane_uniform(x, 8)));
-                let r = if same {
+                let r = if same || self.half_alone() {
                     r
                 } else {
-                    self.whole_wave(
-                        r,
-                        "v_readfirstlane_b32 where the halves cannot meet",
-                        |_, lo, _| lo,
-                    )
+                    self.first_lane(inst, a, r)
                 };
                 int(self, r)
             }
@@ -11909,6 +11946,142 @@ fn wave_blocks(x: &Parts, live: bool) -> Vec<bool> {
     divergent.iter().map(|d| !d).collect()
 }
 
+/// The `s_cbranch_execz` skips (byte offsets) the program computes the same
+/// without: the wave takes one only when no lane is left, to save running
+/// code that then does nothing, and per lane it is what keeps the lanes of
+/// a wave apart. Without them every lane runs the code under EXEC, and the
+/// halves of a wave can meet in it ([`Halves`]).
+///
+/// A skip stays where running its code with no lane could show: the code
+/// has an end, a barrier, a message or a loop in it (a count taken from
+/// lane 0's stale value could run to the iteration limit), or leaves the
+/// skipped range other than at the skip's target; it writes an SGPR or SCC that is read after the
+/// target; or it does not hand EXEC on within what it got.
+pub(crate) fn idle_skips(p: &Program, st: &Structured) -> Vec<usize> {
+    let n = p.blocks.len();
+    // Values some instruction reads, through the phis that pass them on.
+    let mut live: Set<Value> = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .flat_map(|i| i.reads.iter().map(|r| r.1))
+        .collect();
+    loop {
+        let before = live.len();
+        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+            if live.contains(&phi.value) {
+                live.extend(phi.args.iter().copied());
+            }
+        }
+        if live.len() == before {
+            break;
+        }
+    }
+    // Whether the skip that ends block `q` can go.
+    let idle = |q: usize, branch: &Inst, taken: usize, not_taken: usize| {
+        let block = &p.blocks[q];
+        if taken == not_taken || p.blocks[taken].offset <= block.offset {
+            return false;
+        }
+        let Some(&got) = branch.read(Reg::S(EXEC)).and_then(|v| st.masks.get(&v)) else {
+            return false;
+        };
+        // No lane the skip's EXEC lacks is in the mask whose low dword is `v`.
+        let within = |v: Value| {
+            st.masks
+                .get(&v)
+                .is_some_and(|&m| !st.bools.meet(&[(m, true), (got, false)]))
+        };
+        // The skipped code: from the fall-through up to the target.
+        let mut inside = vec![false; n];
+        let mut stack = vec![not_taken];
+        while let Some(b) = stack.pop() {
+            if b == taken || std::mem::replace(&mut inside[b], true) {
+                continue;
+            }
+            stack.extend(p.blocks[b].exit.successors());
+        }
+        let contained = (0..n).filter(|&b| inside[b]).all(|b| {
+            let body = &p.blocks[b];
+            b != q
+                && b != 0
+                && !matches!(body.exit, Exit::End | Exit::Indirect)
+                && body.preds.iter().all(|&r| r == q || inside[r])
+                && body
+                    .exit
+                    .successors()
+                    .iter()
+                    .all(|&s| p.blocks[s].offset > body.offset)
+                && !body.insts.iter().any(|i| {
+                    matches!(i.name(), "s_barrier" | "s_sendmsg" | "s_sendmsghalt")
+                        || i.name().starts_with("s_endpgm")
+                })
+        });
+        if !contained || inside[q] {
+            return false;
+        }
+        // Scalars written there and read past the target.
+        let written = (0..n).filter(|&b| inside[b]).flat_map(|b| {
+            let body = &p.blocks[b];
+            let insts = body.insts.iter().flat_map(|i| i.writes.iter().copied());
+            insts.chain(body.phis.iter().map(|phi| (phi.reg, phi.value)))
+        });
+        let scalars: Set<Value> = written
+            .filter(|&(reg, _)| match reg {
+                Reg::S(c) => c != EXEC && c != EXEC + 1,
+                Reg::Scc => true,
+                Reg::V(_) => false,
+            })
+            .map(|w| w.1)
+            .collect();
+        let leaks = (0..n).filter(|&b| !inside[b]).any(|b| {
+            let body = &p.blocks[b];
+            body.insts
+                .iter()
+                .any(|i| i.reads.iter().any(|r| scalars.contains(&r.1)))
+                || body.phis.iter().any(|phi| {
+                    live.contains(&phi.value) && phi.args.iter().any(|a| scalars.contains(a))
+                })
+        });
+        if leaks {
+            return false;
+        }
+        // EXEC as the code hands it on holds no lane the skip's did not.
+        p.blocks[taken]
+            .phis
+            .iter()
+            .filter(|phi| phi.reg == Reg::S(EXEC))
+            .flat_map(|phi| {
+                phi.args
+                    .iter()
+                    .zip(&p.blocks[taken].preds)
+                    .filter(|&(_, &r)| inside[r])
+                    .map(|(&a, _)| a)
+            })
+            .all(within)
+    };
+    // (a block and its copies share the instruction: all must agree)
+    let (mut skips, mut kept) = (Vec::new(), Set::default());
+    for (q, block) in p.blocks.iter().enumerate() {
+        let (Some(branch), Exit::Branch { taken, not_taken }) = (block.insts.last(), block.exit)
+        else {
+            continue;
+        };
+        if branch.name() != "s_cbranch_execz" {
+            continue;
+        }
+        if idle(q, branch, taken, not_taken) {
+            skips.push(branch.machine.offset);
+        } else {
+            kept.insert(branch.machine.offset);
+        }
+    }
+    skips.retain(|at| !kept.contains(at));
+    skips.sort_unstable();
+    skips.dedup();
+    skips
+}
+
 /// The blocks at most one thread of a compute group runs: every lane that
 /// enters has passed a test of its thread id against zero in each dimension
 /// the group has more than one thread in (`v_cmp_eq_u32 0, v0 | v1`, the
@@ -12030,6 +12203,23 @@ static KEPT_WIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 
 /// Why the last of them was.
 static KEPT_WIDE_WHY: std::sync::Mutex<Option<Why>> = std::sync::Mutex::new(None);
+
+thread_local! {
+    /// Why the program last lowered on this thread kept the console's wave
+    /// size though narrow host waves were asked for, if it did.
+    static WIDE: std::cell::Cell<Option<Why>> = const { std::cell::Cell::new(None) };
+}
+
+/// Takes [`WIDE`].
+pub(crate) fn take_wide() -> Option<Why> {
+    WIDE.take()
+}
+
+/// Counts a translation left at the console's wave size.
+pub(crate) fn count_wide(why: Why) {
+    KEPT_WIDE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    *KEPT_WIDE_WHY.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
+}
 
 /// How many translations [`Options::narrow_waves`](super::Options) left
 /// at the console's wave size (a host of 32-lane waves does not run them),
@@ -13806,5 +13996,84 @@ mod tests {
         w.extend(DS_WRITE_V1_V2);
         w.extend([RESTORE_EXEC_S2, S_ENDPGM]);
         assert_eq!(halves(&w, 64), (Some(64), 0));
+    }
+
+    /// `if (id & 3) { slot = counter.add(count of such lanes) + count below }`
+    /// as the console compiler expands it (058b0f6379a8e312 at 0x84): the
+    /// first lane left adds the count, every lane reads that lane's old
+    /// value. `skip`: the two `s_cbranch_execz`, or what stands for them.
+    fn allocation(skip: fn(u32) -> u32) -> Vec<u32> {
+        let mut w = vec![
+            V_LSHLREV_V1_2_V0,
+            0x3604_0083, // v_and_b32 v2, 3, v0
+            0x7DAA_0480, // v_cmpx_ne_u32 exec, 0, v2
+            skip(23),
+            0xD765_0002, // v_mbcnt_lo_u32_b32 v2, -1, 0
+            0x0001_00C1,
+            0xBE84_047E, // s_mov_b64 s[4:5], exec
+            0xBE88_147E, // s_ff1_i32_b64 s8, exec
+            0xBE86_047E, // s_mov_b64 s[6:7], exec
+            0xD766_0003, // v_mbcnt_hi_u32_b32 v3, -1, v2
+            0x0002_04C1,
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7D24_0608, // v_cmpx_eq_i32 exec, s8, v3
+            skip(4),
+            0xBE84_1004, // s_bcnt1_i32_b64 s4, s[4:5]
+            0x7E04_0204, // v_mov_b32 v2, s4
+        ];
+        w.extend([0xD800_0000, 0x0000_0201]); // ds_add_u32 v1, v2
+        w.extend([
+            0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+            0xD765_0003, // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
+            0x0001_007E,
+            0x7E08_0502, // v_readfirstlane_b32 s4, v2
+            0xD766_0002, // v_mbcnt_hi_u32_b32 v2, exec_hi, v3
+            0x0002_067F,
+            0x4A04_0404, // v_add_nc_u32 v2, s4, v2
+        ]);
+        w.extend(DS_WRITE_V1_V2);
+        w.push(S_ENDPGM);
+        w
+    }
+
+    #[test]
+    fn skips_no_lane_sees_are_found() {
+        let w = allocation(skip);
+        let p = wave64(&w);
+        let st = structure::structure(&p).unwrap();
+        // (the skip of the lanes out of the test, and the first lane's)
+        assert_eq!(super::idle_skips(&p, &st), [3 * 4, 13 * 4]);
+        // Per lane, its wave operations are where the halves cannot meet.
+        assert_eq!(halves(&w, 64), (Some(64), 0));
+        // Without the skips every lane runs them under EXEC. Exchanged:
+        // the lanes left as a number (for the first one, their count, and
+        // the count below a lane: a mask each), and the first lane in EXEC
+        // with which half has one.
+        let w = allocation(|_| 0xBF80_0000); // s_nop
+        assert!(
+            super::idle_skips(&wave64(&w), &structure::structure(&wave64(&w)).unwrap()).is_empty()
+        );
+        assert_eq!(halves(&w, 64), (Some(32), 5));
+    }
+
+    #[test]
+    fn a_skip_stays_where_running_its_code_with_no_lane_would_show() {
+        // s10 counts in the skipped code and is read after it.
+        let mut w = vec![V_LSHLREV_V1_2_V0, 0xBE8A_0380, V_AND_V1_1_V0]; // s_mov_b32 s10, 0
+        w.extend(CMP_S0_V1_EQ_0);
+        w.extend([AND_SAVEEXEC_S2_S0, skip(1), 0x810A_810A]); // s_add_i32 s10, s10, 1
+        w.extend([RESTORE_EXEC_S2, 0x7E04_020A]); // v_mov_b32 v2, s10
+        w.extend(DS_WRITE_V1_V2);
+        w.push(S_ENDPGM);
+        let p = wave64(&w);
+        assert!(super::idle_skips(&p, &structure::structure(&p).unwrap()).is_empty());
+        // Unread after it, the count shows nowhere.
+        let at = w.iter().position(|&x| x == 0x7E04_020A).unwrap();
+        w[at] = 0x7E04_0280; // v_mov_b32 v2, 0
+        let p = wave64(&w);
+        assert_eq!(
+            super::idle_skips(&p, &structure::structure(&p).unwrap()).len(),
+            1
+        );
     }
 }
