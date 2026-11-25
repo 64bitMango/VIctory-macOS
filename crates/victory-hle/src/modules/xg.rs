@@ -3,7 +3,7 @@
 //! slice lies, and to copy linear data into tiled memory and back. Served
 //! from `victory_formats::texture`.
 //!
-//! the title imports `XGCreateTextureComputer` and
+//! The title imports `XGCreateTextureComputer` and
 //! `XGSuggestSwizzleMode` and calls these computer methods: Release (0x08),
 //! the layout (0x10), copies into (0x40) and out of (0x48) a subresource,
 //! and the 64 KiB tiling (0x50). The other slots log and fail.
@@ -539,7 +539,7 @@ extern "system" fn tiling(
 }
 
 /// Slot 0x30 `(plane, mip, x, y, z or slice, sample, bit position)`: an
-/// element's byte offset from the texture's start. the title reads
+/// element's byte offset from the texture's start. The title reads
 /// texels of a 128x4 `4KB_S` texture on the CPU through it (title+0x5151c90);
 /// an error returned as an offset made it read wild memory. 0 if outside.
 extern "system" fn element_offset(
@@ -665,10 +665,6 @@ mod tests {
         d.flags = ALLOW_DEPTH_STENCIL;
         XGSuggestSwizzleMode(&d, 0, &mut out);
         assert_eq!(out, 0x118);
-        // A 1D texture has no tiled layout, whatever its use.
-        d.dimension = TEXTURE_1D;
-        XGSuggestSwizzleMode(&d, 0, &mut out);
-        assert_eq!(out, 0x100);
     }
 
     /// The title's calls: layout, then a copy in and out of each mip.

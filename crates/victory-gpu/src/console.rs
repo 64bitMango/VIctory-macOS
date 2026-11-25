@@ -26,14 +26,6 @@ impl Console {
         }
     }
 
-    /// Compute units of the GPU.
-    pub const fn compute_units(self) -> u32 {
-        match self {
-            Console::SeriesX => 52,
-            Console::SeriesS => 20,
-        }
-    }
-
     pub const fn name(self) -> &'static str {
         match self {
             Console::SeriesX => "Xbox Series X",
@@ -46,6 +38,7 @@ static SERIES_S: AtomicBool = AtomicBool::new(false);
 
 /// Set before the title starts.
 pub fn set(console: Console) {
+    victory_formats::texture::set_series_s_tiling(console == Console::SeriesS);
     SERIES_S.store(console == Console::SeriesS, Ordering::Relaxed);
 }
 
