@@ -1635,6 +1635,7 @@ fn evictable(t: &HostTexture) -> bool {
 #[cfg(windows)]
 pub(crate) fn evict_unused() {
     use std::sync::atomic::Ordering::Relaxed;
+    crate::unwaited::not_beside("C6", "unused host textures are given up", String::new);
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     let frame = crate::queue::presented();
     if LAST.swap(frame, Relaxed) == frame {

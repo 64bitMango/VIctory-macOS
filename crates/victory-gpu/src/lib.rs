@@ -91,6 +91,9 @@ mod texture;
 mod threads;
 #[cfg(windows)]
 mod twin;
+// Title submissions that return before the host GPU has run them, and
+// their checker (docs/unwaited.md).
+mod unwaited;
 #[cfg(windows)]
 mod watch;
 

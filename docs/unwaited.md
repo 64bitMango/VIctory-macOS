@@ -403,89 +403,127 @@ page a tracker calls unchanged equals the copy (section 10, C4). If the race
 is still open somewhere (the one-by-one path, `copy_back_page`), a run with
 the checker on and the switch off names it.
 
-## 10. The checker (`VICTORY_UNWAITED_CHECK=1`, off by default)
+## 10. The checker (`VICTORY_UNWAITED_CHECK`, off by default)
 
-Aborts through `host::fail` with one clear line at the first violation. It
-may be used with the switch on or off.
+As built. `=1` ends the run through `host::fail` with one line naming the
+rule at the first violation; `=log` logs the first twenty and counts the
+rest. It works with `VICTORY_UNWAITED` set or unset: C3 and C4 are about the
+copy-back itself, which is the same code on both paths.
 
-- **C1 Host copy touched beside a flight** (I3): any write into a copy's
-  mapping, snapshot, arming or tracker take while a flight is in the air and
-  the thread is not settling it. Names the copy, the range, the flight, and
-  whether the range is in its read or write footprint.
-- **C2 Order** (I1, I2): a launch with a flight in the air; a settle out of
-  sequence; a landing, a bottom-of-pipe write, a kept Signal or after-work
-  before the host fence reached the flight's value; a kept Signal applied
-  below the fence's current value.
-- **C3 Landing against title writes** (I5): at launch the checker keeps its
-  own copy of title memory and of the host copy for every declared range. At
-  the settle, before the production landing, it lists the bytes that will be
-  written (copy differs from its snapshot) and aborts if title memory there
-  changed since launch to something else than the byte about to be written:
-  "copy-back would overwrite a title write". Ranges of unbounded writers are
-  counted as unchecked.
-- **C4 The trackers' word** (also with the switch off): when a page is armed
-  or relied on as unchanged, title memory there equals the copy. A mismatch
-  is the stale-page fault of section 9.
-- **C5 Predicted waits**: a wait counted as met through the overlay holds in
-  memory when its segment is actually submitted.
+- **C1 Host copy touched beside a flight** (I3): `Shadow::copy` (every
+  refresh) and `Shadow::writing` (every declaration, snapshot, arming) by a
+  thread that is not settling the flight. Names the copy and the range.
+- **C2 Order** (I1, I2): a launch with a flight in the air or with launches
+  and settles out of step; a settle out of sequence; a landing before the
+  host fence reached the flight's value.
+- **C3 Copy-back over a title write** (`shadow/check.rs`). At each
+  declaration the checker keeps the copy's bytes and title memory's: the
+  whole of unmarked ranges; of marked ranges the pages shaders marked in the
+  last 256 submissions (the ranges are the views' whole reach, a gigabyte in
+  the world, and the pages written repeat from frame to frame). Before the
+  copy-back, a byte the copy changed and title memory changed too, to
+  something else than what is about to be written, is a violation. Pages
+  marked for the first time in a while, ranges that are withheld and what
+  title-memory programs write at computed addresses are counted as unchecked.
+- **C4 The trackers' word**: "unchanged since taken" must mean "title memory
+  equals the copy", because the copy-back of a marked page writes every byte
+  in which they differ. Checked for a marked page when it is kept before its
+  submission, and for every page a copy-back has just taken and read again.
+  With `VICTORY_UNWAITED_CHECK_REFRESH=1` also for every page a refresh has
+  just taken (this reads everything refreshed a second time). A title write
+  racing the check has set "changed" first (the page is guarded before it is
+  read), so a difference with "unchanged" still standing is a write the copy
+  never saw: the fault of section 9.
+- **C5 Predicted waits**: every value the pump read through the overlay is
+  in memory when the flight has landed.
 - **C6 Lifetime** (I6): the shared upload list reset, retired objects
-  released, a texture given up or an idle copy released with a flight in the
-  air; a flight's host list reset before its settle.
-- **C7 Queue order** (I4): a `Step::Copy`, `Step::Run`, fill or page mapping
-  executed with a flight in the air.
+  released, textures given up or idle copies released beside a flight.
+- **C7 Queue order** (I4): a copy into title memory (`copy_mapped` with a
+  title destination: the title's buffer copies) beside a flight.
 
-## 11. Tests and deliberate breaks (milestone two)
+Not built: a rule on a kept Signal lower than the fence's value (a title may
+signal a lower value itself; the order is by construction and tested).
 
-Under Wine, through the real host device and queue:
+Cost (the frame line reports it as "unwaited checker: ms/frame, MB
+compared"): see the hand-back for measured figures. By design it reads title
+memory once and the copy once per unmarked declared byte at the declaration
+and again at the copy-back (55 MB of snapshots a frame today), one page read
+per lately-marked page at arming and one at the copy-back (about 2,000 pages),
+and one page read per page a copy-back takes.
 
-- Two submissions back to back, the second launched while the first is in the
-  air, with: a shader write to a declared range, a marked page, a
-  bottom-of-pipe word, a kept Signal with an event, and a thread writing other
-  bytes of the same pages throughout. The same script run through
-  `Host::execute` on a second set of buffers. Title memory, host copies,
-  fence values and the order of events compared byte for byte. Repeated some
-  hundreds of times with the racing thread's timing varied.
-- The pump: a segment waiting on a flight's word runs behind it and finds the
-  word in memory; a timestamp wait settles first; Signals stay in order.
-- A flight with no further call is settled by the poll, with the host event
-  never waited on.
-- A title list reset and released while its host list flies.
-- With the switch off: the flag is never set and no hook fires.
+## 11. Tests and deliberate breaks
 
-Each protection is then undone in turn, and a test or the checker must fail:
-settle skipped before the next preparation; a refresh allowed beside a flight;
-a title copy step run before the settle; bottom-of-pipe written at launch; a
-kept Signal set at once; Signals applied out of order; the upload list reset
-beside a flight; lists recycled at launch; the overlay left in place after the
-settle; `taken` without the read-again.
+Under Wine, through the real host device and queue. The "shaders" are real
+GPU copies into the copies' buffers and into the marks' bitmap, behind up to
+six 16 MB copies that keep the submission running.
+
+- `host::unwaited::tests::both_paths_leave_the_same_bytes`: two submissions
+  (a declared range, a marked page, a bottom-of-pipe word, two kept Signals;
+  then a queue-ordered title copy, shader writes over the first one's range
+  and bytes, two words) with a thread writing other bytes of the same pages
+  throughout, through `Host::execute` on one buffer and as flights on
+  another. Title memory, words, fence, order of landings compared; the copies
+  must be current afterwards. Twelve rounds a run
+  (`VICTORY_UNWAITED_TEST_ROUNDS`), every other one with the submission lock
+  held and the checker on, the others through `Host::execute_unwaited` where
+  other tests' submissions settle the flights.
+- `queue::tests::work_waiting_for_what_a_flight_will_tell_runs_behind_it`:
+  `pump_unwaited` on held work of its own: the overlay for a word and for a
+  fence, a timestamp wait settled by the pump.
+- `a_flight_left_alone_is_settled_by_the_poll`.
+- `shadow::check::copies`: C3 and C4 on a copy, each with its clean case.
+- `unwaited::tests`: the overlay's arithmetic.
+
+Breaks (`protections_undone_are_found`, `what_is_done_beside_a_flight_is_found`):
+words written at the launch; a Signal made at once; Signals made last first;
+the flight not holding its lists; the settle not waiting; a second launch
+with no settle; a refresh, a declaration, a title copy, a release of retired
+objects and an idle sweep beside a flight. Each is found by the script's own
+expectations or by the rule named in the test.
 
 ## 12. Switches and counters
 
 - `VICTORY_UNWAITED=1`: tier one. Off by default.
-- `VICTORY_UNWAITED_CHECK=1`: the checker. Off by default.
-- No other switch in tier one. R1 to R3 get one each when they are built.
+- `VICTORY_UNWAITED_CHECK=1` (or `log`), `VICTORY_UNWAITED_CHECK_REFRESH=1`.
+- R1 to R3 get one switch each when they are built.
 
-Frame-rate line (per frame): title pieces launched unwaited and waited, why
-each waited one waited; settles by cause; flights by write footprint (none,
-declared, unbounded) and read footprint (exact, hulls, everything); ms from
-launch to settle start; ms the settle stood waiting for the GPU; ms the GPU
-was done before the settle began (lateness of the landing); ms of the settle
-after the wait; the three "would have overlapped" sums of section 7; Signals
-kept; waits met through the overlay; marked pages that kept the title's
-bytes, to compare with a waited run.
+A line of its own after the frame-rate line, only with a switch set (per
+frame): title pieces launched and waited for diagnostics; settles by cause;
+flights by write footprint (none, declared, unbounded) and read footprint
+(exact, hulls, every copy); ms from launch to settle; ms settles stood
+waiting for the GPU; settles that found it done; ms of the settles after the
+wait; "would have overlapped" for heap sync, uploads, refreshes and title
+copies, and the three together (section 7); Signals kept; waits met by a word
+to come; and the checker's cost, megabytes compared, ranges unchecked and
+violations.
 
-## 13. Where the code goes
+## 13. Where the code is
 
-- New `crates/victory-gpu/src/unwaited.rs`: the flight, launch, settle, the
-  overlay, the poll thread, counters, the checker, tests.
-  `Host::execute_unwaited` and `Host::settle_flight` live there as a second
-  `impl Host`; the preparation and the after-wait sequence are copies of
-  `Host::execute`'s, marked to be kept in step, and the equivalence test of
-  section 11 is what keeps them so.
-- Hooks in shared code, each a test of one flag that is false with the switch
-  off: top of `Host::execute` and `Host::quiet`; `queue::pump` (which function
-  runs a piece, the overlay, kept Signals), `queue::signal`, `queue::present`,
-  `queue::copy_page_mappings`; `fence::set_event_on_completion`,
-  `fence::signal`, `fence::completed`; checker calls in `Shadow::copy`,
-  `Shadow::writing`, the trackers' takes and `bindless::uploads`.
-- `Host::execute` itself is not edited beyond that first test.
+- `crates/victory-gpu/src/unwaited.rs`: the switches, what a flight will
+  tell (words, Signals), the overlay, the poll thread, counters, the
+  checker's report.
+- `crates/victory-gpu/src/host/unwaited.rs`: `Host::execute_unwaited`,
+  `launch_held`, `settle_held`: copies of `Host::execute`'s preparation and
+  of what it does after its wait, each place naming the other.
+- `crates/victory-gpu/src/shadow/check.rs`: C3 and C4.
+- Hooks, each a test of a flag that is false with the switches off:
+  `Host::execute` and `Host::quiet` (settle), `queue::pump` (which pump),
+  `queue::signal`, `queue::present`, `queue::copy_page_mappings`,
+  `fence::completed`, `fence::set_event_on_completion`, `fence::signal`; and
+  the checker's in `Shadow::writing`, `Shadow::copy`, `update_free`,
+  `copy_back_marks`, `copy_back_declared`, `pieces_at_once`, `idle_sweep`,
+  `bindless::uploads`, `resource::evict_unused`, `host::release_retired`,
+  `host::copy_mapped_noting`. A draw whose shader writes through the heap's
+  views notes it on its host list (`draw.rs`), for the write footprint.
+- `Host::execute` itself has one added statement: the settle.
+
+## 14. R1 after the heap sync moved to helper threads (8020fafa)
+
+`sync_heaps` now makes runs of slots on helper threads (`back::spread`), the
+helpers marked as holding the submission lock too. "Heap sync beside a
+flight" therefore means several threads writing host slots while the GPU
+executes, not one, and the submitting thread waiting on them. For R1 this
+changes the test to build (the stress test writes its 40,000 slots from as
+many threads as the sync uses) and adds one requirement: nothing a helper
+does may settle or launch (they hold no lock; `Host::settle_flight` already
+refuses on a thread marked as holding the submission lock).

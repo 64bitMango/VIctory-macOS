@@ -36,6 +36,11 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+/// Title submissions that return before the host GPU has run them
+/// (`VICTORY_UNWAITED=1`): the launch and the settle, copied from
+/// [`Host::execute`].
+mod unwaited;
+
 thread_local! {
     /// The thread holds the submission lock ([`Host::execute`] or
     /// [`Host::quiet`]).
@@ -1124,6 +1129,9 @@ struct Deferred {
     /// The buffer copies its commands use (by address), until it has run:
     /// not released for idleness meanwhile (`crate::shadow::Flight`).
     flying: crate::quick::Map<usize, crate::shadow::Flight>,
+    /// A shader of the list writes through views it takes from the heap
+    /// itself (`crate::unwaited`: a flight's write footprint).
+    heap_writes: bool,
 }
 
 impl Deferred {
@@ -1328,7 +1336,12 @@ impl Host {
             return None;
         }
         let held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        Some(Quiet { _holding: Holding::enter(), _held: held })
+        let holding = Holding::enter();
+        // The host must be idle (`VICTORY_UNWAITED`: never a flight without it).
+        if crate::unwaited::in_flight() {
+            self.settle_held(crate::unwaited::By::Heap, true);
+        }
+        Some(Quiet { _holding: holding, _held: held })
     }
 
     /// Runs `f` while no submission runs (tests).
@@ -1340,11 +1353,20 @@ impl Host {
     }
 
     /// Runs closed lists and waits for them.
+    ///
+    /// KEEP IN STEP WITH `crate::host::unwaited`: `Host::launch_held` copies
+    /// this function's preparation and `Host::settle_held` what it does
+    /// after its wait. A change here is to be carried there.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
+        // A title submission still on the GPU (`VICTORY_UNWAITED`; never
+        // without it) is settled before anything of this one is prepared.
+        if crate::unwaited::in_flight() {
+            self.settle_held(crate::unwaited::By::Ours, true);
+        }
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -3041,6 +3063,9 @@ pub(crate) fn copy_mapped_noting(
     if len == 0 {
         return;
     }
+    if title_dst {
+        crate::unwaited::not_beside("C7", "a queue-ordered copy into title memory is made", || format!("{len} bytes to {:#x}", dst as usize));
+    }
     // The kernel writes the destination: it must not be guarded meanwhile.
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
@@ -3528,6 +3553,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
+        crate::unwaited::frame_done();
         crate::memory::log_frame();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
@@ -3579,6 +3605,9 @@ impl Meter {
                  in the list before their draw's ({hoists:.0} lists cut for them)",
                 making = crate::pipeline::making()
             );
+            if let Some(line) = crate::unwaited::take_line() {
+                tracing::info!("{line}");
+            }
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(
@@ -4059,6 +4088,7 @@ pub(crate) fn retire(resource: ID3D12Resource) {
 
 /// After a submission has run, with none running: the retired resources go.
 pub(crate) fn release_retired() {
+    crate::unwaited::not_beside("C6", "retired host objects are released", String::new);
     let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
     if !retired.is_empty() {
         release_later(Box::new(retired));

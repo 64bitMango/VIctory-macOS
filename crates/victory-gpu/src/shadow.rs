@@ -25,6 +25,10 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::{PAGE, Take};
 
+/// The copy side of the checker of `crate::unwaited`.
+mod check;
+pub(crate) use check::exempt as check_exempt;
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -360,11 +364,17 @@ impl Shadow {
         // From here to the copy-back, "changed" must mean "the title wrote it
         // since the copy took it": pages a refresh left open while they
         // rested are taken for good first.
+        crate::unwaited::not_beside("C1", "a range of a host copy is declared written", || {
+            format!("{address:#x}+{len:#x} of copy {:#x}+{:#x}", self.start, self.len)
+        });
         self.settle(address, len);
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert((address, address + len));
+        if crate::unwaited::checking() {
+            self.check_declared(address, len, marked);
+        }
         if marked && let Some(t) = &self.tracked {
             t.arm(address, address + len);
             return;
@@ -758,6 +768,9 @@ impl Shadow {
                     bytes[s - *at..e - *at].copy_from_slice(host);
                 }
             }
+            if crate::unwaited::checking() {
+                self.check_patched(a + start, b + start);
+            }
         }
         copied
     }
@@ -786,7 +799,18 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
             // Cut to the range: next to it shaders may be writing the copy.
-            let mut copied: usize = runs.into_iter().map(|(a, b)| self.copy(a, b)).sum();
+            let check = how == Take::All && crate::unwaited::checking_refreshes();
+            let mut copied: usize = runs
+                .into_iter()
+                .map(|(a, b)| {
+                    let copied = self.copy(a, b);
+                    if check {
+                        let _cost = crate::unwaited::checked();
+                        self.check_equal(a, b, "after a refresh took the page");
+                    }
+                    copied
+                })
+                .sum();
             for (a, b) in unmapped {
                 // SAFETY: inside the mapping (`take_split` cuts to the buffer).
                 unsafe { self.data.add(a - self.start as usize).write_bytes(0, b - a) };
@@ -844,6 +868,9 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        crate::unwaited::not_beside("C1", "a host copy is refreshed from title memory", || {
+            format!("{from:#x}..{to:#x} of copy {start:#x}+{:#x}", self.len)
+        });
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let host = |at: usize| unsafe { self.data.add(at - start) };
         #[cfg(feature = "diagnostics")]
@@ -1236,6 +1263,9 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             crate::copystat::marked(copy.start, copy.len, list.len() as u64);
         }
     }
+    if crate::unwaited::checking() {
+        check::marked(&by_copy);
+    }
     let at_once = if batched() { marked_at_once(&by_copy) } else { None };
     #[cfg(feature = "diagnostics")]
     if let Some(written) = at_once {
@@ -1417,6 +1447,9 @@ impl Drop for Laps {
 /// of their copy that goes back, so doing them after changes no byte: at
 /// most a page counts as changed in a copy that would have taken it.
 pub(crate) fn copy_back_declared(back: &[(Arc<Shadow>, usize, usize, bool)]) -> usize {
+    if crate::unwaited::checking() {
+        check::declared(back);
+    }
     let at_once = if batched() { declared_at_once(back) } else { None };
     let mut written = at_once.unwrap_or(0);
     for (shadow, address, len, goes_back) in back {
@@ -1687,6 +1720,9 @@ fn pieces_at_once(pieces: &[crate::back::Piece], copies: &[&Shadow], marked: boo
         crate::back::again(pieces, &title, threads(again, 16));
     }
     laps.lap(Stage::AgainUs);
+    if crate::unwaited::checking() && read_again() {
+        check::taken(copies, &taken);
+    }
     #[cfg(feature = "diagnostics")]
     {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1942,6 +1978,7 @@ pub(crate) fn note_missed(start: u64, end: u64) {
 /// shaders found no copy since are made again, and once a second the idle
 /// windows are released ([`release_idle`]).
 pub(crate) fn idle_sweep() {
+    crate::unwaited::not_beside("C6", "idle copies of title memory are released", String::new);
     let Some(seconds) = idle_seconds() else {
         return;
     };

@@ -362,6 +362,7 @@ pub(crate) fn uploads(
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
 ) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None));
+    crate::unwaited::not_beside("C6", "the shared upload list is reset", String::new);
     let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
     crate::texture::recycle();
     match &guard.0 {
