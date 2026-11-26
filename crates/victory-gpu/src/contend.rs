@@ -54,7 +54,9 @@ fn waited(lock: Lock, since: std::time::Instant) {
     let (us, times) = match lock {
         Lock::Heaps => (C::MirrorWaitUs, C::HeapsContended),
         Lock::Kept => (C::KeptWaitUs, C::KeptContended),
+        Lock::Views if in_sync() => (C::ViewsSyncWaitUs, C::ViewsSyncContended),
         Lock::Views => (C::ViewsWaitUs, C::ViewsContended),
+        Lock::Viewed if in_sync() => (C::ViewedSyncWaitUs, C::ViewedSyncContended),
         Lock::Viewed => (C::ViewedWaitUs, C::ViewedContended),
         Lock::Copies => (C::CopiesWaitUs, C::CopiesContended),
     };

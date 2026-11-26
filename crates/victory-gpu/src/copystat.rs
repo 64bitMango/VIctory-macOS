@@ -200,6 +200,32 @@ pub(crate) enum C {
     RestedPages,
     RestingSubmissions,
     ExactSubmissions,
+    /// Heap syncs: time taking the changed pages of the heaps (guarding
+    /// them again), asking whether a page is mapped, making what the views
+    /// of a run's slots need, and making the run's slots under its lock.
+    SyncTakeUs,
+    SyncProbeUs,
+    SyncPrepareUs,
+    SyncMakeUs,
+    /// The submitting thread's own waits (heap syncs, slots shaders read)
+    /// for what a heap's slots view and for the views table.
+    ViewedSyncWaitUs,
+    ViewedSyncContended,
+    ViewsSyncWaitUs,
+    ViewsSyncContended,
+    /// Of the records naming no view that are neither ours nor zeros
+    /// ([`C::SyncStaleOther`]): a render target or depth view's record; a
+    /// current view's entry and generation under another tag; a title
+    /// address in the first eight bytes; the rest.
+    SyncOtherTarget,
+    SyncOtherTagged,
+    SyncOtherAddress,
+    SyncOtherRest,
+    /// Table entries draws read that name no view: a view of a released
+    /// resource, zeros, other bytes.
+    DrawNoneReleased,
+    DrawNoneZeros,
+    DrawNoneOther,
     /// Not a counter: how many there are.
     Count,
 }
@@ -247,6 +273,17 @@ pub(crate) fn snapshot(start: u64, len: u64, bytes: u64) {
         .get_or_insert_with(HashMap::new)
         .entry((start, len))
         .or_default() += bytes;
+}
+
+/// Examples for the next line ([`sample`]).
+static SAMPLES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// An example for the next statistics line, if it has fewer than twelve.
+pub(crate) fn sample(text: impl FnOnce() -> String) {
+    let mut samples = SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
+    if samples.len() < 12 {
+        samples.push(text());
+    }
 }
 
 /// Our process's working set, bytes.
@@ -493,6 +530,30 @@ pub(crate) fn log(frames: f64) {
     );
     if let Some(more) = MORE.get() {
         more(frames);
+    }
+    tracing::info!(
+        "  heap sync time per frame: taking the heaps' changed pages {:.1} ms, asking whether pages are mapped {:.1} ms, making what views need {:.1} ms, making slots under their runs' locks {:.1} ms; the submitting thread waited {:.1} ms ({:.0} times) for what a heap's slots view and {:.1} ms ({:.0}) for the views table",
+        ms(c[C::SyncTakeUs as usize]),
+        ms(c[C::SyncProbeUs as usize]),
+        ms(c[C::SyncPrepareUs as usize]),
+        ms(c[C::SyncMakeUs as usize]),
+        ms(c[C::ViewedSyncWaitUs as usize]),
+        c[C::ViewedSyncContended as usize],
+        ms(c[C::ViewsSyncWaitUs as usize]),
+        c[C::ViewsSyncContended as usize],
+    );
+    tracing::info!(
+        "  records that are neither ours nor zeros per frame: at slots heap syncs made null {:.0} render target or depth records, {:.0} a current view's entry under another tag, {:.0} with a title address first, {:.0} others; table entries draws read that name no view: {:.0} views of released resources, {:.0} zeros, {:.0} other bytes",
+        c[C::SyncOtherTarget as usize],
+        c[C::SyncOtherTagged as usize],
+        c[C::SyncOtherAddress as usize],
+        c[C::SyncOtherRest as usize],
+        c[C::DrawNoneReleased as usize],
+        c[C::DrawNoneZeros as usize],
+        c[C::DrawNoneOther as usize],
+    );
+    for sample in std::mem::take(&mut *SAMPLES.lock().unwrap_or_else(|e| e.into_inner())) {
+        tracing::info!("    for example: {sample}");
     }
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();

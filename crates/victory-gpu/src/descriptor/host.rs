@@ -76,6 +76,11 @@ pub(crate) struct HostHeap {
     held: Box<[AtomicU64]>,
     /// The slots' locks ([`HostHeap::lock_slot`]).
     locks: Box<[Stripe]>,
+    /// Whether slots have locks by run and are looked at without one
+    /// ([`slot_locks`]), and whether a sync makes a run's slots under one
+    /// hold ([`sync_runs`]), as they were when the heap was made: every
+    /// thread takes the same lock for a slot.
+    by_run: [bool; 2],
     /// Diagnostics, per title slot: the frame (plus 1) a draw last read it
     /// through a table, and a heap sync last made it null for a record that
     /// names no view.
@@ -190,6 +195,36 @@ fn null_once() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_NULL_ONCE"))
+}
+
+/// What a record that is neither ours nor zeros looks like (diagnostics):
+/// a render target or depth view's record; a current view's entry and
+/// generation under another tag; a title address in its first eight bytes;
+/// anything else.
+#[cfg(feature = "diagnostics")]
+fn other_bytes(record: [u32; 3]) -> crate::copystat::C {
+    use crate::copystat::C;
+    let [tag, a, b] = record;
+    let first = u64::from(tag) | u64::from(a) << 32;
+    if tag == super::RTV_TAG || tag == super::DSV_TAG {
+        C::SyncOtherTarget
+    } else if views_current(&[[VIEW_TAG, a, b]])[0] {
+        C::SyncOtherTagged
+    } else if a != 0 && (0x1_0000..0x8000_0000_0000).contains(&first) {
+        C::SyncOtherAddress
+    } else {
+        C::SyncOtherRest
+    }
+}
+
+/// The `step` bytes of the title slot at `handle`, as dwords in hex.
+#[cfg(feature = "diagnostics")]
+fn slot_bytes(handle: u64, step: u64) -> String {
+    let words: Vec<String> = (0..step / 4)
+        // SAFETY: a descriptor slot in title memory, `step` bytes.
+        .map(|k| format!("{:08x}", unsafe { ((handle + 4 * k) as *const u32).read_unaligned() }))
+        .collect();
+    words.join(" ")
 }
 
 /// Who makes or reads a slot (diagnostics: whose waits for the slot locks,
@@ -378,6 +413,7 @@ impl HostHeap {
             made: zeroed(count as usize),
             held: zeroed((count as usize).div_ceil(64)),
             locks: (0..STRIPES).map(|_| Stripe::default()).collect(),
+            by_run: [slot_locks(), sync_runs()],
             #[cfg(feature = "diagnostics")]
             noted: [zeroed32(count as usize), zeroed32(count as usize)],
             kept: Mutex::new(Paged::new((count + extra) as usize)),
@@ -875,7 +911,7 @@ impl HostHeap {
                 if let Some(Some(reason)) = due {
                     why[reason as usize] += 1;
                     #[cfg(feature = "diagnostics")]
-                    self.note_due(i, reason, [_tag, view, generation]);
+                    self.note_due(i, reason, [_tag, view, generation], at(i), step);
                 }
                 due.is_some()
             })
@@ -904,7 +940,7 @@ impl HostHeap {
                 }
             }
         };
-        if !sync_runs() {
+        if !self.by_run[1] {
             for i in stale {
                 made(&self.mirror(i, at(i), false));
             }
@@ -915,6 +951,8 @@ impl HostHeap {
             let n = rest.iter().take_while(|&&i| i / RUN == head / RUN).count();
             let (run, after) = rest.split_at(n);
             rest = after;
+            #[cfg(feature = "diagnostics")]
+            let preparing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncPrepareUs);
             // What the views need, before the lock (`mirror` makes it
             // without the lock too): for the records as read above.
             for &i in run {
@@ -925,6 +963,10 @@ impl HostHeap {
                     prepare(&view);
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            drop(preparing);
+            #[cfg(feature = "diagnostics")]
+            let _making = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncMakeUs);
             // One by one where the title wrote another record meanwhile
             // (what that one needs is not made), and past the host heap.
             let mut again = Vec::new();
@@ -952,7 +994,7 @@ impl HostHeap {
     /// draw read the slot through a table in the last eight frames (such
     /// slots the draws would make themselves).
     #[cfg(feature = "diagnostics")]
-    fn note_due(&self, index: u32, reason: Due, record: [u32; 3]) {
+    fn note_due(&self, index: u32, reason: Due, record: [u32; 3], handle: u64, step: u64) {
         use crate::copystat::{C, add};
         let frame = crate::frame::current() as u32 + 1;
         let since = |noted: &std::sync::atomic::AtomicU32| match noted.load(Relaxed) {
@@ -972,6 +1014,19 @@ impl HostHeap {
                     },
                     1,
                 );
+                if !matches!(record, [VIEW_TAG, ..] | [0, 0, 0]) {
+                    add(other_bytes(record), 1);
+                    crate::copystat::sample(|| {
+                        let was = self.made[index as usize].load(Acquire);
+                        let was = view_at(was as u32, (was >> 32) as u32);
+                        format!(
+                            "{} slot {index} made from {} now holds {}",
+                            if self.sampler { "sampler" } else { "view" },
+                            was.map_or("a view since released".into(), |v| format!("{v:?}").chars().take(60).collect::<String>()),
+                            slot_bytes(handle, step)
+                        )
+                    });
+                }
                 if since(nulled) <= 2 {
                     add(C::SyncStaleAgain, 1);
                 }
@@ -1011,7 +1066,7 @@ impl HostHeap {
     /// The lock of slot `index` ([`HostHeap::made`]), for a draw or not
     /// (diagnostics: the wait is counted by who waited and who held it).
     fn lock_slot(&self, index: u32, _for_draw: bool) -> std::sync::MutexGuard<'_, ()> {
-        let stripe = &self.locks[if slot_locks() { (index / RUN) as usize % STRIPES } else { 0 }];
+        let stripe = &self.locks[if self.by_run[0] { (index / RUN) as usize % STRIPES } else { 0 }];
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -1070,6 +1125,37 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        let view = self.mirror_slot(index, handle, for_draw);
+        // A draw's table entry that names no view: what its slot holds
+        // (diagnostics; bytes that are no record of ours there would be a
+        // descriptor the title made that we do not know).
+        #[cfg(feature = "diagnostics")]
+        if for_draw && view.is_none() && index < self.count && !crate::contend::in_sync() {
+            use crate::copystat::{C, add};
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let record = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            match record {
+                [VIEW_TAG, ..] => add(C::DrawNoneReleased, 1),
+                [0, 0, 0] => add(C::DrawNoneZeros, 1),
+                _ => {
+                    add(C::DrawNoneOther, 1);
+                    crate::copystat::sample(|| {
+                        let kind = if self.sampler { "sampler" } else { "view" };
+                        format!("a draw's table entry at {kind} slot {index} holds {}", slot_bytes(handle, u64::from(self.title_step())))
+                    });
+                }
+            }
+        }
+        view
+    }
+
+    /// Bytes per title slot of this heap.
+    #[cfg(feature = "diagnostics")]
+    fn title_step(&self) -> u32 {
+        if self.sampler { 16 } else { 32 }
+    }
+
+    fn mirror_slot(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -1088,7 +1174,7 @@ impl HostHeap {
         if for_draw && !crate::contend::in_sync() {
             self.noted[0][index as usize].store(crate::frame::current() as u32 + 1, Relaxed);
         }
-        if slot_locks()
+        if self.by_run[0]
             && let Some(found) = self.made_already(index, handle, for_draw)
         {
             #[cfg(feature = "diagnostics")]
@@ -2326,9 +2412,9 @@ pub(crate) mod tests {
     }
 
     thread_local! {
-        /// This thread takes one lock for all of a heap's slots, for every
-        /// look and each slot a sync makes (as `VICTORY_SLOT_LOCKS=0` and
-        /// `VICTORY_SYNC_RUNS=0`).
+        /// Heaps made on this thread have one lock for all their slots, taken
+        /// for every look and each slot a sync makes (as
+        /// `VICTORY_SLOT_LOCKS=0` and `VICTORY_SYNC_RUNS=0`).
         pub(crate) static ONE_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// This thread leaves the null view of a slot that shows nothing (as
         /// `VICTORY_NULL_ONCE=1`).
