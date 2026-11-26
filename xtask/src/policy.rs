@@ -25,6 +25,7 @@ const ALLOWED_NAMES: &[&str] = &[
     ".victory-root",
     "pre-commit",
     "LICENSE",
+    "CODEOWNERS",
     "LICENSE-MIT",
     "LICENSE-APACHE",
 ];
