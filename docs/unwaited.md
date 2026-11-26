@@ -85,7 +85,7 @@ Each is enforced by construction and verified by the checker (section 10).
 - **I5 Landing is the waited path's.** The settle runs the same statements as
   `Host::execute` after its wait, on the same state, with the submission lock
   held. Between launch and settle that state changes only as it changes during
-  a waited submission's GPU wait: by the title's own threads.
+  a waited submission's GPU wait: by the application's own threads.
 - **I6 Nothing a flight names goes away.** Its host lists are held (so a title
   list reset meanwhile gets a fresh host list, `list::restart`), and with them
   every copy, texture, pipeline, heap and upload buffer they keep. The shared
@@ -139,7 +139,7 @@ What settles, and how it is counted:
 | next title piece | `execute_unwaited`, first thing |
 | ours | top of `Host::execute`, top of `Host::quiet` |
 | present | `queue::present`, before the frame is shown |
-| fence event | `SetEventOnCompletion` for a value not reached, and the title's CPU `Signal` |
+| fence event | `SetEventOnCompletion` for a value not reached, and the application's CPU `Signal` |
 | page mapping | `CopyPageMappingsBatchX` |
 | pump | a queue head that waits on a word the flight will write with a timestamp, or that is blocked for any reason while a flight is in the air |
 | poll | a 1 ms thread, parked while there is no flight, asks the fence's completed value and settles when it is reached and both locks are free; also `GetCompletedValue` of a title fence |
@@ -175,20 +175,20 @@ This is what kept 13 of 19 submissions waiting in the second attempt.
 
 ### 4.4 What runs beside a flight in tier one
 
-The title's own threads, as during a waited GPU run today. Of ours: nothing
+The application's own threads, as during a waited GPU run today. Of ours: nothing
 that touches shared state. `execute_unwaited` settles before it prepares.
 
-Tier one therefore changes when the title's submitting thread gets its call
+Tier one therefore changes when the application's submitting thread gets its call
 back and when results land. It does not yet move our CPU work under the GPU's.
 
 ## 5. Every way a flight's results can be observed
 
 | What | How it stays correct with N in the air |
 |---|---|
-| Title CPU reads of ranges N's shaders wrote | They hold the bytes from before N until the settle. That is a state the console also has (the GPU has not got there yet). Everything that tells the title N ran comes after the landing (I2). Not trapped, and need not be: a title that reads earlier races its own GPU on the console. Longer than today by at most the time until the next settling call or 1 ms after the GPU is done. |
-| Title CPU writes into pages N's shaders write | As during a waited run: unmarked ranges are merged byte by byte against the snapshot taken at N's steps; armed marked pages keep the bytes from before the title's first write (`Tracked::saved`); marked pages nobody armed (heap-view writes) keep the title's bytes and lose the shaders' (counted "kept the title's", 4 a frame today). The window is longer, so this count is watched (section 12). |
+| Title CPU reads of ranges N's shaders wrote | They hold the bytes from before N until the settle. That is a state the console also has (the GPU has not got there yet). Everything that tells the application N ran comes after the landing (I2). Not trapped, and need not be: a title that reads earlier races its own GPU on the console. Longer than today by at most the time until the next settling call or 1 ms after the GPU is done. |
+| Title CPU writes into pages N's shaders write | As during a waited run: unmarked ranges are merged byte by byte against the snapshot taken at N's steps; armed marked pages keep the bytes from before the application's first write (`Tracked::saved`); marked pages nobody armed (heap-view writes) keep the application's bytes and lose the shaders' (counted "kept the application's", 4 a frame today). The window is longer, so this count is watched (section 12). |
 | Bottom-of-pipe words | Written at the settle, after the landing, as in the waited order. Pump waits on them: 4.3. |
-| Fence values and events | Kept Signals are applied at the settle. `SetEventOnCompletion` for a value not reached settles first, so an event the title then blocks on is either set already or waits for work not yet submitted, as today. |
+| Fence values and events | Kept Signals are applied at the settle. `SetEventOnCompletion` for a value not reached settles first, so an event the application then blocks on is either set already or waits for work not yet submitted, as today. |
 | Queries, read-backs | After-work and `missed` checks run at the settle. Texture read-backs asked from title threads are submissions of ours: `Host::execute` settles first. |
 | N+1's shaders reading what N wrote, through host copies | GPU order on one host queue. N+1 is prepared after N landed, so its refreshes, snapshots and `update_busy` see the state the waited order gives them. |
 | Host copies refreshed while N reads or writes them | Does not happen (I3). The checker aborts on the first host-copy write beside a flight. |
@@ -197,7 +197,7 @@ back and when results land. It does not yet move our CPU work under the GPU's.
 | Descriptor and heap state | Heap sync runs after the settle. Title threads write views into host heaps while N runs, as they do during a waited run today (about 1,300 locked and 4,000 unlocked slot writes a frame). A view heap is made only with no flight (I7). |
 | Resources released or recycled | I6. `restart` leaves a held host list to its holder (verified: it tests the `Arc` count); what a title list owned goes with that host list (`list::leave`). `release_retired`, `evict_unused`, `idle_sweep` and the reset of the shared upload list (`bindless::uploads`, which says "closed by the last submission, which has run") run only after a settle. |
 | Presents | `queue::present` pumps, settles, then presents. `Host::present` submits a list of ours, which settles too. |
-| Idle and timer path | The 1 ms poll settles a flight whose GPU work is done when the title makes no call. It asks the fence, not the event (I8). |
+| Idle and timer path | The 1 ms poll settles a flight whose GPU work is done when the application makes no call. It asks the fence, not the event (I8). |
 | D3DMetal's missed fence events | `wait_for` already wakes each second and asks the fence. The poll never waits on the event (the event is only waited on under the submission lock, as today). |
 | Device removal | Checked at the settle, with the flight's lists for the report. |
 | Our own diagnostics | Capture dumps, GPU timing and traced frames use the waited path. |
@@ -210,7 +210,7 @@ world, about 22 host submissions and 19 to 26 title pieces a frame):
 | | a frame |
 |---|---|
 | Title pieces launched unwaited | all of them, 19 to 26, outside timed or traced frames |
-| Settled by the next title piece | most: the title's submitting thread makes its next call at once |
+| Settled by the next title piece | most: the application's submitting thread makes its next call at once |
 | Settled by ours (read-backs 8 to 11 a frame, present, passes) | about 10 |
 | Settled by the pump for a timestamp wait or a blocked head | 0 to 8 (8 segments a frame wait on a word today, all released by a submission) |
 | Settled by the poll | few in the world, most in menus |
@@ -224,11 +224,11 @@ refreshed beside the flight.
 ## 7. How much overlaps, and what rule change buys more
 
 Measured today (`timing2`, per world frame): preparing 190 to 210 ms, of it
-heap slots the title copied 93, texture uploads 32, refresh batches 44,
+heap slots the application copied 93, texture uploads 32, refresh batches 44,
 snapshots and declarations 24, title copies and fills 12, page tables 8; GPU
 162 ms waited (243 with per-list timing); copy-back 45 to 55.
 
-The frame is the serial work of one thread, so the title's thread has no work
+The frame is the serial work of one thread, so the application's thread has no work
 of its own to do between two submissions. Overlap has to come from our
 preparation of N+1 running under N. Stage by stage, read against the code:
 
@@ -251,7 +251,7 @@ What buys overlap, in the order I would try them. Each is a rule change with
 a risk, not a tuning.
 
 - **R1 Heap sync beside the flight** (93 ms a frame available; inferred 40 to
-  70 overlapped). Rule: slots the title rewrote since N was prepared are not
+  70 overlapped). Rule: slots the application rewrote since N was prepared are not
   slots N reads (the console rule, for descriptors). Host behaviour: the same
   kind of write title threads already make during a waited run, at up to
   39,000 a frame instead of about 5,000. Risk: if either fails, a shader of N
@@ -269,7 +269,7 @@ a risk, not a tuning.
   This is what the second attempt's `prewarm` did. Rule: the console rule for
   bytes. Checkable byte by byte for exact read ranges (compare before
   overwriting, abort if a byte N declared reading would change); not for
-  hulls, where the title legitimately writes neighbouring bytes all the time.
+  hulls, where the application legitimately writes neighbouring bytes all the time.
 - **R4 Tier two: two in the air**, N+1 launched before N has landed, with
   per-flight write ranges and landing behind the next flight, as the fork
   does. That is where the copy-back's 45 ms and the remaining wait would go.
@@ -344,9 +344,9 @@ Cannot transfer:
   faults cost tens of microseconds under Wine. Landing stays the batched
   copy-back of `back.rs`, with the submission lock held.
 - **Trapping CPU reads of in-flight ranges (c).** Would need no-access guards
-  on ranges the title reads constantly; not needed while every signal is late.
+  on ranges the application reads constantly; not needed while every signal is late.
 - **A preparing thread, joined parts.** Their gain from 103 to 75 ms came from
-  preparing on a thread of their own while the title's thread recorded. Our
+  preparing on a thread of their own while the application's thread recorded. Our
   frame is one thread's serial work with nothing beside it to free.
 - Hash passes on the card and the kernel write watch: no equivalent here.
 
@@ -363,10 +363,10 @@ Against (e):
    still read. ba4e596's `prewarm` ran only refreshes early; the next
    submission's `Step::Copy`, `Step::Run` and fills ran after the finish
    (verified in `submit_held`). What `prewarm` did carry into copies a flight
-   could read were the title's own CPU writes, on the strength of the console
+   could read were the application's own CPU writes, on the strength of the console
    rule. That is a real exposure and tier one removes it, but:
 2. **There was almost no flight to disturb.** The on-run's own counters: one
-   unwaited submission a frame of 19, "the GPU ran 0.0 ms beside the title's
+   unwaited submission a frame of 19, "the GPU ran 0.0 ms beside the application's
    thread" (0.1 in one interval), while 75 to 240 MB a frame were "refreshed
    meanwhile". The unwaited submission was a trivial one that was done before
    the early refreshes began.
@@ -382,7 +382,7 @@ Against (e):
 So the evidence does not support (e), and does not support "the off path
 changed" either. What it does fit (inferred, not reproduced): a race the
 waited path had at that base and no longer has. The crash was a pointer read
-as `0xfc007c007c007c00`, half-float data where the title kept a pointer: a
+as `0xfc007c007c007c00`, half-float data where the application kept a pointer: a
 whole stale page of a host copy written over newer title bytes. The copy-back
 of marked pages could do exactly that. `copy_back_marked` read a page of title
 memory, and only at the end of the whole pass (44 ms a frame, about 2,000
@@ -417,14 +417,14 @@ copy-back itself, which is the same code on both paths.
   and settles out of step; a settle out of sequence; a landing before the
   host fence reached the flight's value.
 - **C3 Copy-back over a title write** (`shadow/check.rs`): a byte the
-  shaders changed in the copy that the title changed too, to something else
+  shaders changed in the copy that the application changed too, to something else
   than what is about to be written. The checker keeps no bytes of its own.
   For unmarked declared ranges "before" is the copy-back's own snapshot, and
-  only pages the title wrote since the copy took them are read, and only
+  only pages the application wrote since the copy took them are read, and only
   where the snapshot is also what title memory held (the page was unchanged
   at the declaration, or a refresh under the range took it since). For
-  marked pages "before" is what the tracker saved at the title's first write
-  to the armed page; a page the title did not write has nothing to undo.
+  marked pages "before" is what the tracker saved at the application's first write
+  to the armed page; a page the application did not write has nothing to undo.
   Ranges withheld, pages already written at their declaration and what
   title-memory programs write at computed addresses count as unchecked.
 - **C4 The trackers' word**: "unchanged since taken" must mean "title memory
@@ -442,7 +442,7 @@ copy-back itself, which is the same code on both paths.
 - **C6 Lifetime** (I6): the shared upload list reset, retired objects
   released, textures given up or idle copies released beside a flight.
 - **C7 Queue order** (I4): a copy into title memory (`copy_mapped` with a
-  title destination: the title's buffer copies) beside a flight.
+  title destination: the application's buffer copies) beside a flight.
 
 Not built: a rule on a kept Signal lower than the fence's value (a title may
 signal a lower value itself; the order is by construction and tested).
@@ -451,7 +451,7 @@ Cost, measured (`shadow::check::copies::benchmark_checker_release`, release,
 Wine on the M5 Pro, frames of 20 submissions landing 1,920 marked pages and
 declaring 55 MB of unmarked ranges): 25.6 ms a frame without the checker,
 35.6 ms with, 147 MB compared a frame. It is one page read and compare per
-page a copy-back takes, plus the pages the title wrote under declared ranges.
+page a copy-back takes, plus the pages the application wrote under declared ranges.
 A first version that read every lately marked page at every declaration cost
 280 ms a frame. With `VICTORY_UNWAITED_CHECK_REFRESH=1` everything refreshed
 is read a second time (143 MB a frame in the world: about as much again,

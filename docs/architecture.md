@@ -9,7 +9,7 @@
                                                     ▼
                                          cache_dir: converted data
                                                     │
- game executable ─► victory-loader ────► title code (native x86-64)
+ application executable ─► victory-loader ────► title code (native x86-64)
                     prepare, map, bind      │ imports
                                             ▼
                                          victory-hle ── host Windows (shared APIs)
@@ -21,11 +21,11 @@
                                          victory-shader ◄─► cache_dir
 ```
 
-Shaders are translated when the title creates a pipeline, from the bytes it
+Shaders are translated when the application creates a pipeline, from the bytes it
 passes, wherever it loaded them from (executable, archive, memory).
 Converting them ahead of time from files (`victory translate --cache`) is
 only a warm-up: it fills the same cache, under the same key. With
-`--pipelines` it also makes the host pipelines of the title's shader pack
+`--pipelines` it also makes the host pipelines of the application's shader pack
 into the pipeline library, from the creation streams the engine would pass
 (`victory-game` builds them, `victory-gpu` reads them as it reads the
 title's), so a run finds them under the names it gives them itself.
@@ -36,13 +36,13 @@ title's), so a run finds them under the names it gives them itself.
 |-------|------|
 | `victory-core` | config, asset-policy guard, logging |
 | `victory-pe` | read-only PE32+ and import-library analysis |
-| `victory-loader` | prepare, map, bind and start the title image |
+| `victory-loader` | prepare, map, bind and start the application image |
 | `victory-hle` | console API implementations, host pass-through policy |
 | `victory-gpu` | D3D12.X objects, command lists and GPU memory → host D3D12 |
 | `victory-shader` | Xbox shader containers → host shaders |
 | `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), BCPack, audio codecs |
 | `victory-pipeline` | converter trait, content-addressed cache |
-| `victory-game` | the title-specific formats, build identities, hooks |
+| `victory-game` | the application-specific formats, build identities, hooks |
 | `apps/victory` | command-line front end |
 | `xtask` | asset-policy check, git hooks |
 | `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |
@@ -52,11 +52,11 @@ any Xbox Series title.
 
 ## Import resolution
 
-For every `dll!function` the title imports, in order:
+For every `dll!function` the application imports, in order:
 
 1. our implementation in `victory-hle::modules` (always wins);
 2. the host's own function, if `HostPolicy` allows that DLL;
-3. an export of a DLL the title ships beside its executable, mapped like
+3. an export of a DLL the application ships beside its executable, mapped like
    the executable (only DLLs neither of the above serves);
 4. a generated stub that names the import when called (`--unimplemented
    trap` breaks into the debugger and aborts; `zero` logs once and returns 0).

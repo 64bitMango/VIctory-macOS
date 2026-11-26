@@ -1,10 +1,10 @@
 # Contributing to VIctory for macOS
 
-Thank you for wanting to help. The goal is simple to state: the title on an Apple Silicon Mac, from a copy that the player owns. There is work here for people who know Rust, graphics, Wine, macOS or none of these yet.
+Thank you for wanting to help. The goal is simple to state: the application on an Apple Silicon Mac, from a copy that the player owns. There is work here for people who know Rust, graphics, Wine, macOS or none of these yet.
 
 ## The one rule
 
-Nothing from the game is ever committed. That covers executables, DLLs, shaders, textures, audio, keys, dumps, decrypted files and screenshots of game content. Everything is built from files that the user supplies on their own machine. A check called `cargo xtask policy` enforces this on every commit, and pull requests that break it are closed. Please also do not post or link game files in issues.
+Nothing from the application is ever committed. That covers executables, DLLs, shaders, textures, audio, keys, dumps, decrypted files and screenshots of game content. Everything is built from files that the user supplies on their own machine. A check called `cargo xtask policy` enforces this on every commit, and pull requests that break it are closed. Please also do not post or link application files in issues.
 
 D3DMetal and anything else from Apple's Game Porting Toolkit stays out of the repository too, because Apple's licence does not allow sharing it.
 
@@ -26,7 +26,7 @@ Read [docs/macos.md](docs/macos.md) for how the port works and what was already 
 
 These are the open areas, roughly from most to least useful.
 
-- **World rendering.** The game reaches its world but draws little of it, on Windows too. Shader translation gaps and missing GPU features are listed in VIctory's own status table. Work on the shared crates helps every platform.
+- **World rendering.** The application reaches its world but draws little of it, on Windows too. Shader translation gaps and missing GPU features are listed in VIctory's own status table. Work on the shared crates helps every platform.
 - **D3DMetal differences.** Metal and the console GPU disagree in small ways, as `sin(NaN)` showed. A test that passes on Windows and fails under D3DMetal usually points at one of these. Find it, fix it in the translator or the GPU layer, and add a test.
 - **Speed.** Rosetta, Wine and D3DMetal each cost time. Profiling the frame loop on a Mac and finding where it goes is very valuable.
 - **A native Mac host.** The long-term route replaces Wine with a native macOS host and a Metal backend. It is described at the end of `docs/macos.md`, and design discussion in an issue is welcome before any code.

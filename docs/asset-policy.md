@@ -1,6 +1,6 @@
 # Asset policy (rule #1)
 
-**Nothing from the game is ever stored in this repository.** Everything is
+**Nothing from the application is ever stored in this repository.** Everything is
 built on the user's machine from files the user supplies. The same applies
 to other titles used for testing, and to any other proprietary material.
 

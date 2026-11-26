@@ -4,7 +4,7 @@
 # VICTORY_CONFIG selects a different config file.
 
 [paths]
-# Your own dump of the title.     env: VICTORY_GAME_DIR
+# Your own dump of the application.     env: VICTORY_GAME_DIR
 game_dir = 'D:\victory-data\game'
 
 # Derived data. Default: %LOCALAPPDATA%\victory\cache.   env: VICTORY_CACHE_DIR
@@ -16,7 +16,7 @@ game_dir = 'D:\victory-data\game'
 
 # AMD FidelityFX for PC: the folder with amd_fidelityfx_upscaler_dx12.dll
 # (FidelityFX SDK, Kits/FidelityFX/signedbin). It upscales in place of a
-# title's console build. Unset: the title's own.   env: VICTORY_FIDELITYFX_DIR
+# title's console build. Unset: the application's own.   env: VICTORY_FIDELITYFX_DIR
 # fidelityfx_dir = 'D:\victory-data\fidelityfx'
 
 # Other Xbox Series titles used to test platform-level code.
