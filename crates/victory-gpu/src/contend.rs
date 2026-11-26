@@ -14,8 +14,12 @@ pub(crate) enum Lock {
     Heaps,
     /// What a host heap's slots hold (`crate::descriptor::host::HostHeap::kept`).
     Kept,
-    /// The views table (`crate::descriptor::VIEWS`).
+    /// The views' entries, by their readers (`crate::descriptor::VIEWS`;
+    /// the index too where the two are not split).
     Views,
+    /// The views' index, and the entries to write one, by threads
+    /// recording or releasing a view (`crate::descriptor::VIEW_INDEX`).
+    ViewIndex,
     /// What a heap's slots view (`crate::bindless::Viewed`).
     Viewed,
     /// The registries of copies of title memory (`crate::shadow`).
@@ -54,6 +58,7 @@ fn waited(lock: Lock, since: std::time::Instant) {
     let (us, times) = match lock {
         Lock::Heaps => (C::MirrorWaitUs, C::HeapsContended),
         Lock::Kept => (C::KeptWaitUs, C::KeptContended),
+        Lock::ViewIndex => (C::ViewIndexWaitUs, C::ViewIndexContended),
         Lock::Views if in_sync() => (C::ViewsSyncWaitUs, C::ViewsSyncContended),
         Lock::Views => (C::ViewsWaitUs, C::ViewsContended),
         Lock::Viewed if in_sync() => (C::ViewedSyncWaitUs, C::ViewedSyncContended),
