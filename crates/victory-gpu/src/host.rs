@@ -43,7 +43,20 @@ thread_local! {
 }
 
 /// The thread holds the submission lock while this lives.
-struct Holding(bool);
+pub(crate) struct Holding(bool);
+
+/// Whether this thread holds the submission lock, or works for one that
+/// does ([`holding_too`]).
+pub(crate) fn holds_submissions() -> bool {
+    HOLDS_SUBMISSIONS.with(std::cell::Cell::get)
+}
+
+/// For a helper thread of a thread that holds the submission lock and
+/// waits for it: marked as holding it too until this is dropped, so that
+/// nothing it does waits for the lock its waiter holds ([`Host::quiet`]).
+pub(crate) fn holding_too() -> Holding {
+    Holding::enter()
+}
 
 impl Holding {
     fn enter() -> Self {

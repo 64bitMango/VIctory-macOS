@@ -81,14 +81,26 @@ const PARTS: usize = 64;
 /// Slots in a row in one part (`crate::descriptor::host::RUN`).
 const RUN: u32 = 64;
 
-/// A part of [`Viewed`], on cache lines of its own.
+/// A part of [`Viewed`], on cache lines of its own; with how often it was
+/// found taken since the last statistics line (diagnostics).
 #[derive(Default)]
 #[repr(align(64))]
-struct Part<T>(Mutex<T>);
+struct Part<T>(Mutex<T>, #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] std::sync::atomic::AtomicU32);
 
 impl<T> Part<T> {
     fn lock(&self) -> std::sync::MutexGuard<'_, T> {
+        #[cfg(feature = "diagnostics")]
+        match self.0.try_lock() {
+            Ok(part) => return part,
+            Err(_) => self.1.fetch_add(1, Relaxed),
+        };
         crate::contend::lock(&self.0, crate::contend::Lock::Viewed)
+    }
+
+    /// How often it was found taken since this was last asked.
+    #[cfg(feature = "diagnostics")]
+    fn waits(&self) -> u32 {
+        self.1.swap(0, Relaxed)
     }
 }
 
@@ -170,13 +182,25 @@ impl Inner {
                         .or_insert_with(|| (shadow.clone(), BTreeMap::new(), BTreeMap::new()));
                     tally(&mut ends.1, key.1, now > 0);
                     tally(&mut ends.2, key.2, now > 0);
-                    let hull = match (ends.1.keys().next(), ends.2.keys().next_back()) {
-                        (Some(&from), Some(&to)) => Some((shadow.clone(), from, to - from, key.3, shadow.dirty_bit())),
+                    let bounds = match (ends.1.keys().next(), ends.2.keys().next_back()) {
+                        (Some(&from), Some(&to)) => Some((from, to - from)),
                         _ => None,
                     };
-                    match hull {
-                        Some(hull) => {
-                            self.hulls.insert((key.0, key.3), hull);
+                    match bounds {
+                        // Written only where it changes: most ranges that
+                        // come and go lie inside their copy's hull (the
+                        // views of a draw's constants in a buffer every
+                        // draw's are in), and every thread making such
+                        // slots meets at that copy's part.
+                        Some((from, len)) => {
+                            let bit = shadow.dirty_bit();
+                            match self.hulls.get_mut(&(key.0, key.3)) {
+                                Some(hull) if (hull.1, hull.2, hull.4) == (from, len, bit) => {}
+                                Some(hull) => (hull.1, hull.2, hull.4) = (from, len, bit),
+                                None => {
+                                    self.hulls.insert((key.0, key.3), (shadow.clone(), from, len, key.3, bit));
+                                }
+                            }
                         }
                         None => {
                             self.ends.remove(&(key.0, key.3));
@@ -576,6 +600,27 @@ pub(crate) fn log(frames: f64) {
             c.dedup();
             copies += c.len();
             distinct += inner.textures.len();
+        }
+        // Which parts the threads meet at: the slots' parts, the counts'
+        // parts, the busiest of those and its copy with most ranges.
+        let slot_waits: u32 = viewed.slots.iter().map(Part::waits).sum();
+        let count_waits: Vec<u32> = viewed.counts.iter().map(Part::waits).collect();
+        if let Some((busiest, &most)) = count_waits.iter().enumerate().max_by_key(|&(_, &n)| n) {
+            let inner = viewed.counts[busiest].lock();
+            let mut by_copy: BTreeMap<usize, (u32, u32)> = BTreeMap::new();
+            for (range, (slots, _)) in inner.ranges.iter() {
+                let copy = by_copy.entry(range.0).or_default();
+                (copy.0, copy.1) = (copy.0 + 1, copy.1 + slots);
+            }
+            let top = by_copy.iter().max_by_key(|(_, n)| n.1).map(|(copy, n)| (*copy, *n));
+            let top = top.and_then(|(copy, n)| inner.ranges.range((copy, 0, 0, false)..).next().map(|(_, (_, s))| (s.range(), n)));
+            tracing::info!(
+                "  what slots view, times a part was found taken since the last line: slots' parts {slot_waits}, counts' parts {} (the busiest {most}, with {} copies and {} textures; its copy with most slots {})",
+                count_waits.iter().sum::<u32>(),
+                by_copy.len(),
+                inner.textures.len(),
+                top.map_or("none".into(), |((start, len), (ranges, slots))| format!("{start:#x}+{len:#x}: {ranges} ranges, {slots} slots")),
+            );
         }
         let left: Vec<String> = KINDS.iter().zip(left).map(|(k, n)| format!("{k} {n}")).collect();
         let all = crate::shadow::all();

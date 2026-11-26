@@ -350,6 +350,9 @@ pub(crate) fn sync_heaps() {
         let changed = written.take_resting(start as usize, usize::MAX);
         #[cfg(feature = "diagnostics")]
         drop(taking);
+        // The slots to make of every page, then made together: on several
+        // threads where there are enough (`host::HostHeap::make_runs`).
+        let mut runs = Vec::new();
         for (from, to) in changed {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
@@ -369,9 +372,10 @@ pub(crate) fn sync_heaps() {
                     crate::copystat::C::SyncSlots,
                     last.min(u64::from(heap.desc.count)).saturating_sub(first),
                 );
-                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
+                host.due_runs(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step, &mut runs);
             }
         }
+        host.make_runs(&runs, start, step);
     }
 }
 
@@ -654,6 +658,11 @@ struct Views {
     /// record of the pages written ([`views_current`]), and an entry of
     /// `list` is 136 bytes, a cache line fetched per slot asked about.
     generations: Vec<u32>,
+}
+
+/// Where each view's entry is, the entries naming each resource, and the
+/// entries free: what recording and releasing a view look up and change.
+struct Index {
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
@@ -663,13 +672,68 @@ struct Views {
 // Read by every list recorder for every descriptor it binds: readers share
 // it. As a mutex it made the title's recording threads take turns (Belobug
 // ff920f2: 6,600 context switches a second each in a PIX timing capture).
-static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
-    list: Vec::new(),
-    generations: Vec::new(),
+//
+// The entries alone: with the index beside them under one lock, each of the
+// 9,500 views a frame the title records for the first time held every
+// reader off for its search and insert in a tree of 136-byte keys, and the
+// readers (200,000 looks a frame, the submitting thread's among them)
+// waited 75 ms a frame, 10,000 times (run with what slots view in parts).
+// The index has its own lock ([`VIEW_INDEX`]); the entries are held alone
+// only to write one entry.
+//
+// What the one lock gave, and what gives it now:
+// - An entry's view and generation are read together: both are written
+//   with this lock held alone.
+// - A record is written with its entry's own generation: `record` holds
+//   the index (shared for a view it finds, alone for a new one) from
+//   finding the entry to writing the record, and `forget`, which moves
+//   generations on, holds the index alone.
+// - An entry is freed and given to another view under the index held
+//   alone; its generation moved on when it was freed, so a record of the
+//   view it held before names no view from then on.
+//
+// Locked in the order: the index, then the entries.
+// `VICTORY_VIEWS_SPLIT=0`: readers hold the index too (shared), so a view
+// recorded or released holds them off for all of it, as under the one lock.
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views { list: Vec::new(), generations: Vec::new() });
+
+static VIEW_INDEX: std::sync::RwLock<Index> = std::sync::RwLock::new(Index {
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
 });
+
+/// Whether readers of the entries leave the index alone ([`VIEWS`]): unless
+/// `VICTORY_VIEWS_SPLIT=0`.
+fn views_split() -> bool {
+    #[cfg(test)]
+    if tests::VIEWS_ONE.with(|one| one.get()) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_VIEWS_SPLIT"))
+}
+
+/// The entries, to read; with the index held too (dropped after them) if
+/// the two are not split.
+struct Entries {
+    views: std::sync::RwLockReadGuard<'static, Views>,
+    _index: Option<std::sync::RwLockReadGuard<'static, Index>>,
+}
+
+impl std::ops::Deref for Entries {
+    type Target = Views;
+    fn deref(&self) -> &Views {
+        &self.views
+    }
+}
+
+/// The entries, to read. Not for a thread that holds the index.
+fn entries() -> Entries {
+    let _index = (!views_split()).then(|| crate::contend::read(&VIEW_INDEX, crate::contend::Lock::Views));
+    Entries { views: crate::contend::read(&VIEWS, crate::contend::Lock::Views), _index }
+}
+
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 impl View {
@@ -688,16 +752,16 @@ fn record(handle: u64, view: View) {
         return;
     }
     // A view recorded before (the title records the same views again and
-    // again, into other slots) is only looked up: readers share the table,
-    // and the recording threads took turns at it. Its record is written
-    // with the table held, as below: its generation is the entry's own
-    // then (`forget` holds the table alone).
+    // again, into other slots) is only looked up: recorders share the
+    // index, and took turns at it. Its record is written with the index
+    // held, as below: its generation is the entry's own then (`forget`
+    // holds the index alone).
     if record_shared() {
-        let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
-        if let Some(&i) = views.index.get(&view) {
-            let generation = views.list[i as usize].1;
+        let index = crate::contend::read(&VIEW_INDEX, crate::contend::Lock::Views);
+        if let Some(&i) = index.index.get(&view) {
+            let generation = VIEWS.read().unwrap_or_else(|e| e.into_inner()).generations[i as usize];
             write_record(handle, i, generation);
-            drop(views);
+            drop(index);
             #[cfg(all(windows, feature = "diagnostics"))]
             crate::copystat::add(crate::copystat::C::RecordFound, 1);
             #[cfg(windows)]
@@ -705,38 +769,43 @@ fn record(handle: u64, view: View) {
             return;
         }
     }
-    let mut views = crate::contend::write(&VIEWS, crate::contend::Lock::Views);
+    let mut index = crate::contend::write(&VIEW_INDEX, crate::contend::Lock::Views);
     // Looked up again: another thread may have entered it meanwhile.
-    let i = match views.index.get(&view) {
+    let i = match index.index.get(&view) {
         Some(&i) => {
             #[cfg(all(windows, feature = "diagnostics"))]
             crate::copystat::add(crate::copystat::C::RecordFound, 1);
             i
         }
         None => {
-            let i = match views.free.pop() {
-                Some(i) => {
-                    views.list[i as usize].0 = view.clone();
-                    i
-                }
-                None => {
-                    views.list.push((view.clone(), 1));
-                    views.generations.push(1);
-                    views.list.len() as u32 - 1
+            let free = index.free.pop();
+            let i = {
+                // The entries held alone for the one entry written.
+                let mut views = crate::contend::write(&VIEWS, crate::contend::Lock::Views);
+                match free {
+                    Some(i) => {
+                        views.list[i as usize].0 = view.clone();
+                        i
+                    }
+                    None => {
+                        views.list.push((view.clone(), 1));
+                        views.generations.push(1);
+                        views.list.len() as u32 - 1
+                    }
                 }
             };
             for r in view.resources().into_iter().filter(|&r| r != 0) {
-                views.by_resource.entry(r).or_default().push(i);
+                index.by_resource.entry(r).or_default().push(i);
             }
-            views.index.insert(view, i);
+            index.index.insert(view, i);
             #[cfg(all(windows, feature = "diagnostics"))]
             crate::copystat::add(crate::copystat::C::RecordNew, 1);
             i
         }
     };
-    let generation = views.list[i as usize].1;
+    let generation = VIEWS.read().unwrap_or_else(|e| e.into_inner()).generations[i as usize];
     write_record(handle, i, generation);
-    drop(views);
+    drop(index);
     #[cfg(windows)]
     mirror(handle);
 }
@@ -770,30 +839,41 @@ fn record_shared() -> bool {
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
-    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
-    let Some(entries) = views.by_resource.remove(&resource) else {
+    let mut index = VIEW_INDEX.write().unwrap_or_else(|e| e.into_inner());
+    let Some(entries) = index.by_resource.remove(&resource) else {
         return;
     };
-    for i in entries {
-        let (view, generation) = views.list[i as usize].clone();
-        // Entries freed through a view's other resource may hold another
-        // view by now.
-        if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
-            continue;
+    // Found with the entries shared, their generations moved on with them
+    // held alone, at once: no recorder looks meanwhile (the index is held).
+    let mut freed = Vec::new();
+    {
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        for i in entries {
+            let (view, _) = &views.list[i as usize];
+            // Entries freed through a view's other resource may hold another
+            // view by now.
+            if index.index.get(view) != Some(&i) || !view.resources().contains(&resource) {
+                continue;
+            }
+            index.index.remove(view);
+            freed.push(i);
         }
-        views.index.remove(&view);
-        views.list[i as usize].1 = generation.wrapping_add(1).max(1);
-        views.generations[i as usize] = views.list[i as usize].1;
+    }
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+    for i in freed {
+        let generation = views.list[i as usize].1.wrapping_add(1).max(1);
+        views.list[i as usize].1 = generation;
+        views.generations[i as usize] = generation;
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
-        views.free.push(i);
+        index.free.push(i);
     }
 }
 
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
+    let views = entries();
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
 }
@@ -805,7 +885,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 /// `VICTORY_SLOT_GENERATIONS=0`.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
-    let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
+    let views = entries();
     if generations_alone() {
         let generations = &views.generations;
         return records
@@ -840,7 +920,7 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
+    let views = entries();
     let (view, current) = views.list.get(i as usize)?;
     (tag == VIEW_TAG && *current == generation).then(|| view.clone())
 }
@@ -1128,6 +1208,9 @@ pub(crate) mod tests {
         /// This thread takes the views table alone for every record (as
         /// `VICTORY_RECORD_SHARED=0`).
         pub(crate) static RECORD_ALONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// This thread's reads of the views' entries hold their index too (as
+        /// `VICTORY_VIEWS_SPLIT=0`).
+        pub(crate) static VIEWS_ONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// This thread holds the heaps' lock alone wherever it takes it (as
         /// `VICTORY_HEAPS_SHARED=0`).
         pub(crate) static HEAPS_ALONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1219,6 +1302,7 @@ pub(crate) mod tests {
             for t in 0..THREADS {
                 scope.spawn(move || {
                     RECORD_ALONE.with(|alone| alone.set(t % 3 == 2));
+                    VIEWS_ONE.with(|one| one.set(t % 2 == 1));
                     let slots = [0u64; 4 * 8];
                     let at = |i: usize| slots.as_ptr() as u64 + 32 * i as u64;
                     let mut seed = 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(t as u64 + 1);
@@ -1448,6 +1532,10 @@ pub(crate) mod tests {
         ONE_LOCK.with(|one| one.set(one_lock));
         // What the slots view in one part too (as `VICTORY_VIEWED_PARTS=0`).
         crate::bindless::tests::ONE_PART.with(|one| one.set(one_lock));
+        // The syncs' runs on helper threads, or all on the syncing thread
+        // (as `VICTORY_SYNC_THREADS`).
+        let helpers = Some(if one_lock { 1 } else { 4 });
+        host::tests::SYNC_THREADS.with(|threads| threads.set(helpers));
         let page = crate::watch::PAGE;
         let pages = (SLOTS as usize * 32).div_ceil(page);
         // Each heap in pages of its own: samplers, views, and the pair one
@@ -1483,6 +1571,7 @@ pub(crate) mod tests {
                 HEAPS_ALONE.with(|a| a.set(alone));
                 ONE_LOCK.with(|one| one.set(one_lock));
                 crate::bindless::tests::ONE_PART.with(|one| one.set(one_lock));
+                host::tests::SYNC_THREADS.with(|threads| threads.set(helpers));
                 let host = crate::host::host().expect("checked");
                 let mut round = 0u32;
                 while !stop.load(Relaxed) {
@@ -1619,6 +1708,7 @@ pub(crate) mod tests {
         HEAPS_ALONE.with(|a| a.set(false));
         ONE_LOCK.with(|one| one.set(false));
         crate::bindless::tests::ONE_PART.with(|one| one.set(false));
+        host::tests::SYNC_THREADS.with(|threads| threads.set(None));
     }
 
     /// Several threads write the same slots of a heap no sync looks at, at
@@ -1742,6 +1832,74 @@ pub(crate) mod tests {
                 assert_eq!(host.made_key(i), key, "round {round}, slot {i}");
             }
         }
+    }
+
+    /// A heap sync (its runs on helper threads) and a title thread make the
+    /// same slots at once: the sync from records copied in as bytes, the
+    /// title thread from records it writes by calls meanwhile. Each slot
+    /// ends made from the record it holds, with no sync after.
+    #[cfg(windows)]
+    #[test]
+    fn a_sync_and_a_title_thread_making_the_same_slots_leave_each_as_its_record() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const SLOTS: u32 = 2048;
+        const FIRST: u32 = 64;
+        let memory = crate::watch::tests::pool(1);
+        let title = owner(
+            HeapDesc { kind: SAMPLERS, count: SLOTS, flags: SHADER_VISIBLE, nodes: 1 },
+            Placement { address: memory as u64, size: u64::from(SLOTS) * 16 },
+        );
+        let Some(slots) = heap(title.0).host() else {
+            drop(title);
+            return crate::watch::tests::free(memory);
+        };
+        let at = |i: u32| memory as u64 + u64::from(i) * 16;
+        let sampler = |k: u32| [21, 1 + k % 4, 1 + k / 4 % 4, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+        // Records of sixteen samplers, where no heap sees them.
+        let records = [0u64; 2 * 16];
+        let from = |k: u32| records.as_ptr() as u64 + 16 * u64::from(k % 16);
+        (0..16).for_each(|k| create_sampler(std::ptr::null(), &sampler(k), from(k)));
+        for round in 0..300u32 {
+            // No other test's submission syncs the heap meanwhile (it would
+            // take the changed pages and still be making their slots when
+            // this round looks).
+            host.between_submissions(|| {
+                // Copied in as bytes: the sync finds these (another sampler
+                // than the round before left).
+                for i in FIRST..SLOTS {
+                    // SAFETY: a record of ours into a slot of the heap.
+                    unsafe { std::ptr::copy_nonoverlapping(from(round + i) as *const u8, at(i) as *mut u8, 12) };
+                }
+                let barrier = std::sync::Barrier::new(2);
+                std::thread::scope(|scope| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        host::tests::SYNC_THREADS.with(|threads| threads.set(Some(4)));
+                        barrier.wait();
+                        sync_heaps();
+                    });
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for i in (FIRST..SLOTS).step_by(3) {
+                            create_sampler(std::ptr::null(), &sampler(round + i + 5), at(i));
+                        }
+                    });
+                });
+                for i in FIRST..SLOTS {
+                    // SAFETY: a slot of the heap.
+                    let record = unsafe { (at(i) as *const [u32; 3]).read_unaligned() };
+                    let key = match views_current(&[record])[0] {
+                        true => u64::from(record[2]) << 32 | u64::from(record[1]),
+                        false => 0,
+                    };
+                    assert_eq!(slots.made_key(i), key, "round {round}, slot {i}");
+                }
+            });
+        }
+        drop(title);
+        crate::watch::tests::free(memory);
     }
 
     #[cfg(windows)]

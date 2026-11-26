@@ -207,6 +207,9 @@ pub(crate) enum C {
     SyncProbeUs,
     SyncPrepareUs,
     SyncMakeUs,
+    /// The submitting thread's time making a sync's runs, on it and on
+    /// helper threads (the two above are summed over the threads).
+    SyncRunsUs,
     /// The submitting thread's own waits (heap syncs, slots shaders read)
     /// for what a heap's slots view and for the views table.
     ViewedSyncWaitUs,
@@ -714,9 +717,10 @@ pub(crate) fn log(frames: f64) {
         more(frames);
     }
     tracing::info!(
-        "  heap sync time per frame: taking the heaps' changed pages {:.1} ms, asking whether pages are mapped {:.1} ms, making what views need {:.1} ms, making slots under their runs' locks {:.1} ms; the submitting thread waited {:.1} ms ({:.0} times) for what a heap's slots view and {:.1} ms ({:.0}) for the views table",
+        "  heap sync time per frame: taking the heaps' changed pages {:.1} ms, asking whether pages are mapped {:.1} ms, making the slots {:.1} ms of the submitting thread's time (summed over the threads that made them: what views need {:.1} ms, slots under their runs' locks {:.1} ms); the submitting thread and its helpers waited {:.1} ms ({:.0} times) for what a heap's slots view and {:.1} ms ({:.0}) for the views table",
         ms(c[C::SyncTakeUs as usize]),
         ms(c[C::SyncProbeUs as usize]),
+        ms(c[C::SyncRunsUs as usize]),
         ms(c[C::SyncPrepareUs as usize]),
         ms(c[C::SyncMakeUs as usize]),
         ms(c[C::ViewedSyncWaitUs as usize]),
