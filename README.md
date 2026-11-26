@@ -71,6 +71,16 @@ Copy `victory.example.toml` to `victory.toml`, set the application folder (`game
 tools/macos/victory.sh run --execute <the application's executable>
 ```
 
+### Recommended setup on macOS
+
+- **Profile:** add `--console series-s`. The application then renders a lighter scene and upscales it. On an M5 Pro (diagnostics build, same view) a frame took about 261 ms against 350 ms with the default profile (about 25% faster), and peak memory was about 29 GB against 34 GB. It is still a few frames a second (about 4 to 5 in light scenes), not playable yet.
+- **Upscaler (recommended):** AMD's PC upscaler. Download `amd_fidelityfx_upscaler_dx12.dll` yourself from AMD's [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) (`Kits/FidelityFX/signedbin/`, tested with v2.4.0), put it in a folder outside this repository, and point `fidelityfx_dir` in `victory.toml` (or `VICTORY_FIDELITYFX_DIR`) at that folder. The DLL is not included or redistributed here.
+- **Upscaler (without the DLL):** the application's own console upscaler now translates and works as a fallback. It has not been compared with the PC upscaler for speed yet.
+- **Presentation:** when two planes are presented, plane 0 (the scene) is shown with plane 1 (the interface) blended over it. `VICTORY_PRESENT_PLANE=<n>` and `VICTORY_PRESENT_COMPOSITE=0|1` override this.
+- **Memory:** the descriptor-view leak is fixed. Constant buffer views and views of placed memory are kept inside the descriptor (on by default; `VICTORY_VIEW_INLINE=0` turns it off), so long sessions no longer grow the heap by about 0.28 GB a minute.
+
+Known issues: blocky dark patches on hair with the PC upscaler; the console upscaler's spin-waits are capped at 16,384 tries.
+
 ## Running the tests
 
 Natively on the Mac:

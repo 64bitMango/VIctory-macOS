@@ -216,6 +216,11 @@ pub(crate) enum Shape {
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
+    /// VGPR values the section leaves whose lanes differ in no shape
+    /// [`Shape`] covers, by lane (a reduction over each 32-lane half, then
+    /// over the whole wave in the high half's lanes): what each lane holds,
+    /// for a read of one lane (`v_readlane_b32` at a constant lane).
+    pub lanes: HashMap<Value, Vec<Option<Shape>>>,
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -250,14 +255,34 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
             insts[j].write(Reg::S(EXEC)).is_some()
                 && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
         });
+        // A section the program never restores (a reduction whose result
+        // only one lane goes on to store, before the end): it ends where
+        // EXEC is next written, with the lanes kept from there on.
+        let reads_saved = |x: &Inst| x.read(Reg::S(saved_code(inst))) == Some(saved);
+        let end = end.or_else(|| {
+            (i + 1..insts.len()).find(|&j| {
+                insts[j].write(Reg::S(EXEC)).is_some()
+                    && !reads_saved(&insts[j])
+                    && insts[i + 1..j]
+                        .iter()
+                        .all(|x| !reads_saved(x) || masks_lanes(x))
+            })
+        });
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
+        let (shapes, lanes) = simulate(&insts[i + 1..end], wave, saved);
+        out.insert(i, Section { end, shapes, lanes });
         i = end + 1;
     }
     out
+}
+
+/// Whether `inst` reads a saved EXEC only as the lanes of a whole-wave
+/// section's input (`v_cndmask_b32` putting the identity into the others,
+/// or `s_and` deriving a mask from it).
+fn masks_lanes(inst: &Inst) -> bool {
+    matches!(inst.name(), "v_cndmask_b32") || inst.name().starts_with("s_and_b")
 }
 
 fn saved_code(inst: &Inst) -> u8 {
@@ -403,7 +428,11 @@ fn half(op: Op, a: Sym, b: Option<Sym>, old: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+/// The values a section leaves, by shape and, for the VGPRs no shape
+/// covers, by lane ([`Section::lanes`]).
+type Found = (HashMap<Value, Shape>, HashMap<Value, Vec<Option<Shape>>>);
+
+fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Found {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -762,12 +791,9 @@ fn constant(inst: &Inst) -> Option<u64> {
     }
 }
 
-/// The shape of each value, where every lane agrees on one.
-fn shapes(
-    vec: HashMap<Value, Vec<Sym>>,
-    uni: HashMap<Value, Sym>,
-    wave: u32,
-) -> HashMap<Value, Shape> {
+/// The shape of each value, where every lane agrees on one; for a VGPR
+/// whose lanes do not, the shape of each lane's value ([`Section::lanes`]).
+fn shapes(vec: HashMap<Value, Vec<Sym>>, uni: HashMap<Value, Sym>, wave: u32) -> Found {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -806,12 +832,18 @@ fn shapes(
             out.insert(v, sh);
         }
     }
+    let mut by_lane = HashMap::new();
     for (v, lanes) in vec {
-        if let Some(sh) = per_lane(&lanes, all) {
-            out.insert(v, sh);
+        match per_lane(&lanes, all) {
+            Some(sh) => {
+                out.insert(v, sh);
+            }
+            None => {
+                by_lane.insert(v, lanes.into_iter().map(single).collect());
+            }
         }
     }
-    out
+    (out, by_lane)
 }
 
 fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {

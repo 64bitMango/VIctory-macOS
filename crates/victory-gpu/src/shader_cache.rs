@@ -52,8 +52,8 @@ pub fn counts() -> (u64, u64) {
 /// What a translation depends on besides its container: the translator
 /// (`victory_shader::SOURCE_HASH`: its sources, manifest, the lock file and
 /// the compiler), the entry's encoding (this file's text) and the
-/// translation settings (the loop limit, which a diagnostics build can
-/// change at run time).
+/// translation settings (`victory_shader::emit::translation_settings`: the
+/// loop limits and the clean-up passes, which switches change at run time).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -64,18 +64,22 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        key(
+            victory_shader::SOURCE_HASH,
+            ENCODING,
+            &victory_shader::emit::translation_settings(),
+        )
     })
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], settings: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
-    h.update(&limit.to_le_bytes());
+    h.update(settings);
     *h.finalize().as_bytes()
 }
 
@@ -144,6 +148,53 @@ fn narrow_waves() -> bool {
     })
 }
 
+/// Whether wave64 programs whose halves cannot meet are kept at
+/// `WaveSize(64)` instead of being made with the per-lane branches around
+/// those places taken by the whole wave (`emit::Options::no_wave_walk`):
+/// `VICTORY_WAVE_WALK=0`. Part of the translation: the shader cache keys on
+/// it. Read once, here.
+fn no_wave_walk() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| crate::switch::off("VICTORY_WAVE_WALK"))
+}
+
+/// The console float rules translations leave to the host's
+/// (`emit::Options::relax`): `safe` while `VICTORY_RELAX_FLOAT` is unset,
+/// otherwise those it names (`exact`: none), as a comma-separated list of `denormals`, `signed_zeros`, `legacy_mul`,
+/// `legacy_mul_nan`, `half_rounding` and `nan`, or `safe` (`denormals` and
+/// `signed_zeros`, which change a result only between a zero of either
+/// sign and a denormal) or `all`. Every stage takes
+/// them. Each combination has its own cache entries ([`host_shader_keeping`]).
+fn relax() -> victory_shader::emit::Relax {
+    static RELAX: OnceLock<victory_shader::emit::Relax> = OnceLock::new();
+    *RELAX.get_or_init(|| {
+        // Unset: `safe`, which changes no picture measurably (a recorded
+        // frame: within the noise of two unchanged runs) and saves 1-5 ms
+        // of GPU time a frame. `exact` (or any name not listed) for none.
+        let named = std::env::var("VICTORY_RELAX_FLOAT").unwrap_or_else(|_| "safe".into());
+        let relax = relax_named(&named);
+        if relax != victory_shader::emit::Relax::default() {
+            tracing::warn!(?relax, "VICTORY_RELAX_FLOAT: console float rules left to the host's");
+        }
+        relax
+    })
+}
+
+/// [`relax`] for the variable's text; names it does not know are ignored.
+fn relax_named(named: &str) -> victory_shader::emit::Relax {
+    let on = |kind: &str, safe: bool| {
+        named.split(',').map(str::trim).any(|n| n == kind || n == "all" || (safe && n == "safe"))
+    };
+    victory_shader::emit::Relax {
+        denormals: on("denormals", true),
+        signed_zeros: on("signed_zeros", true),
+        legacy_mul: on("legacy_mul", false),
+        legacy_mul_nan: on("legacy_mul_nan", false),
+        half_rounding: on("half_rounding", false),
+        nan: on("nan", false),
+    }
+}
+
 /// Whether the buffer atomics of the ray-tracing structure builder and its
 /// like stand between two fences (`emit::Options::atomic_fences`; after
 /// Belobug 72e748ea): `VICTORY_BVH_FENCES=0` makes them as before. Part of
@@ -193,14 +244,15 @@ fn warn_kept_wide() {
 /// made for dispatches counted in threads: their own cache entries, one
 /// per combination.
 fn options_build(o: &victory_shader::emit::Options) -> &'static [u8; 32] {
-    static BUILDS: [OnceLock<[u8; 32]>; 128] = [const { OnceLock::new() }; 128];
+    static BUILDS: [OnceLock<[u8; 32]>; 256] = [const { OnceLock::new() }; 256];
     let i = usize::from(o.atomic_locks)
         | usize::from(o.bias_as_gradients) << 1
         | usize::from(o.mesh_stores_last) << 2
         | usize::from(o.mesh_pack_outputs) << 3
         | usize::from(o.narrow_waves) << 4
         | usize::from(o.thread_counts) << 5
-        | usize::from(o.atomic_fences) << 6;
+        | usize::from(o.atomic_fences) << 6
+        | usize::from(o.no_wave_walk) << 7;
     BUILDS[i].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -225,8 +277,19 @@ fn options_build(o: &victory_shader::emit::Options) -> &'static [u8; 32] {
         if o.atomic_fences {
             h.update(b"atomic fences");
         }
+        if o.no_wave_walk {
+            h.update(b"no wave walk");
+        }
         *h.finalize().as_bytes()
     })
+}
+
+/// `build` for translations with console float rules relaxed.
+fn relaxed_build(build: &[u8; 32], relax: &victory_shader::emit::Relax) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(build);
+    h.update(format!("relaxed float rules\n{relax:?}").as_bytes());
+    *h.finalize().as_bytes()
 }
 
 /// The translation of a console shader container, from the cache when
@@ -275,6 +338,8 @@ pub fn host_shader_keeping(
         // before (`crate::threads::cut`).
         thread_counts: crate::threads::cut(),
         atomic_fences: atomic_fences(),
+        no_wave_walk: no_wave_walk(),
+        relax: relax(),
     };
     let translate = |c: &[u8]| {
         let r =
@@ -291,10 +356,19 @@ pub fn host_shader_keeping(
         || options.narrow_waves
         || options.thread_counts
         || options.atomic_fences
+        || options.no_wave_walk
     {
         options_build(&options)
     } else {
         build()
+    };
+    // Relaxed float rules: entries of their own, by the kinds relaxed.
+    let relaxed;
+    let build = if options.relax != victory_shader::emit::Relax::default() {
+        relaxed = relaxed_build(build, &options.relax);
+        &relaxed
+    } else {
+        build
     };
     let keeping;
     let build = match kept {
@@ -670,17 +744,17 @@ mod tests {
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let k = key("0123456789abcdef", b"encoding", &[0, 0, 16, 0]);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", &[0, 0, 16, 0]));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", &[0, 0, 16, 0]));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", &[0, 0, 16, 0]));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", &[0, 0, 8, 0]));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                &victory_shader::emit::translation_settings()
             )
         );
         // The encoding part is this file as built.
@@ -689,6 +763,39 @@ mod tests {
                 .unwrap()
                 .contains("fn encode(translation: &Result<HostShader, String>)")
         );
+    }
+
+    /// Each combination of relaxed float rules has its own entries, and
+    /// `VICTORY_RELAX_FLOAT` names the kinds.
+    #[test]
+    fn relaxed_float_rules_have_their_own_entries() {
+        use victory_shader::emit::Relax;
+        let none = Relax::default();
+        assert_eq!(relax_named(""), none);
+        assert_eq!(relax_named("0"), none);
+        let safe = relax_named("safe");
+        assert_eq!(safe, Relax { denormals: true, signed_zeros: true, ..none });
+        assert_eq!(relax_named("signed_zeros, denormals"), safe);
+        assert_eq!(relax_named("safe,half_rounding"), Relax { half_rounding: true, ..safe });
+        let all = relax_named("all");
+        assert_eq!(
+            all,
+            Relax {
+                denormals: true,
+                signed_zeros: true,
+                legacy_mul: true,
+                legacy_mul_nan: true,
+                half_rounding: true,
+                nan: true
+            }
+        );
+        let one = relax_named("half_rounding");
+        assert_eq!(one, Relax { half_rounding: true, ..none });
+        let base = [7u8; 32];
+        let keys = [relaxed_build(&base, &safe), relaxed_build(&base, &all), relaxed_build(&base, &one)];
+        assert!(keys.iter().all(|k| *k != base));
+        assert!(keys[0] != keys[1] && keys[1] != keys[2] && keys[0] != keys[2]);
+        assert_ne!(relaxed_build(&[8u8; 32], &safe), keys[0]);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

@@ -150,10 +150,12 @@ pub(crate) enum C {
     /// Time the heaps' lock was held alone by passes over the slots
     /// (`crate::descriptor::heaps_for_pass`).
     HeapsAloneUs,
-    /// Views the title recorded that the views table held already, and new
-    /// ones.
+    /// Views the title recorded that the views table held already, new
+    /// ones, and ones named whole in their records, no entries
+    /// (`VICTORY_VIEW_INLINE`).
     RecordFound,
     RecordNew,
+    RecordInline,
     /// A heap's slot locks (`crate::descriptor::host::HostHeap::made`), by
     /// who asked (title threads writing views, draws reading tables, the
     /// submitting thread): slots found made without a lock; locks taken;
@@ -701,7 +703,7 @@ pub(crate) fn log(frames: f64) {
     );
     let kept_waits = crate::descriptor::kept_waits().map(|n| n as f64 / frames);
     tracing::info!(
-        "  lock waits per frame (time, times a thread found the lock taken): title threads writing views for the heaps' lock {:.1} ms, {:.0} (held alone by passes over the slots {:.1} ms); for what a heap's slots hold {:.1} ms, {:.0}; for the views' entries, their readers {:.1} ms, {:.0}, and for the views' index, threads recording a view {:.1} ms, {:.0} ({:.0} views recorded were held already, {:.0} new); for what a heap's slots view {:.1} ms, {:.0}; for the copies' registries {:.1} ms, {:.0}",
+        "  lock waits per frame (time, times a thread found the lock taken): title threads writing views for the heaps' lock {:.1} ms, {:.0} (held alone by passes over the slots {:.1} ms); for what a heap's slots hold {:.1} ms, {:.0}; for the views' entries, their readers {:.1} ms, {:.0}, and for the views' index, threads recording a view {:.1} ms, {:.0} ({:.0} views recorded were held already, {:.0} new, {:.0} named whole in their records); for what a heap's slots view {:.1} ms, {:.0}; for the copies' registries {:.1} ms, {:.0}",
         ms(c[C::MirrorWaitUs as usize]),
         c[C::HeapsContended as usize],
         ms(c[C::HeapsAloneUs as usize]),
@@ -713,6 +715,7 @@ pub(crate) fn log(frames: f64) {
         c[C::ViewIndexContended as usize],
         c[C::RecordFound as usize],
         c[C::RecordNew as usize],
+        c[C::RecordInline as usize],
         ms(c[C::ViewedWaitUs as usize]),
         c[C::ViewedContended as usize],
         ms(c[C::CopiesWaitUs as usize]),

@@ -118,6 +118,7 @@ mod tests {
                 atomic_locks: false,
                 bias_as_gradients: false,
                 narrow_waves: false,
+                relax: Default::default(),
                 view_marks: false,
                 psv: None,
                 dropped_rows: Vec::new(),

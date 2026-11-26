@@ -215,10 +215,13 @@ mod counted_tests;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod flow_tests;
+#[cfg(test)]
+mod halves_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
 mod rect;
+pub use bitcode::census;
 pub use lower::kept_wide;
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
@@ -233,8 +236,12 @@ mod stride_tests;
 mod synthetic_tests;
 #[cfg(windows)]
 pub mod validator;
+#[cfg(test)]
+mod upscaler_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
+#[cfg(test)]
+mod walk_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
@@ -272,6 +279,81 @@ pub fn loop_limit() -> u32 {
             lower::LOOP_LIMIT
         }
     })
+}
+
+/// The loop limit of programs that test rays against tree nodes
+/// (`image_bvh*`), when below [`loop_limit`]: `VICTORY_SHADER_TRACE_LIMIT`
+/// (decimal or `0x` hex); unset, unreadable or 0, none (those loops stop at
+/// [`loop_limit`] as all others). A ray's walk of a well-formed tree visits
+/// some hundreds of nodes at most; a walk into a tree whose memory holds
+/// something else runs to the limit, and costs as much. After
+/// darkworldhm/victory-fork-darkworldhm (`TRACE_LOOP_LIMIT`, 1,024 there,
+/// on by default: the shadow mask took 2.4 ms of the card instead of
+/// 11.7 ms at 4,096). Part of the translation ([`translation_settings`]).
+pub fn trace_loop_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        parse_trace_limit(std::env::var("VICTORY_SHADER_TRACE_LIMIT").ok().as_deref())
+    })
+}
+
+/// `VICTORY_SHADER_TRACE_LIMIT`'s value; 0 (none) when it is unset or
+/// unreadable. Pure, for testing.
+fn parse_trace_limit(value: Option<&str>) -> u32 {
+    value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        })
+        .unwrap_or(0)
+}
+
+/// The clean-up passes that run over a translated program before it is
+/// written (`bitcode::opt`), and the lowering choices that share the
+/// switch: a set of `bitcode::opt` bits. `VICTORY_SHADER_OPT`:
+/// - unset or unreadable: [`bitcode::opt::DEFAULT`] (64, the four-dword
+///   reads).
+/// - a number (decimal or `0x` hex): those bits; 1 dead code, 2 integer
+///   constants and identities, 4 one instruction for one value (down the
+///   dominator tree), 8 what a branch taken says about its condition, 16
+///   one read or wave operation for one place within a block until an
+///   effect, 64 the dwords of one console load read four a call, as the
+///   fork reads them, 128 with 64: a call that reaches past its view's end
+///   read again a dword a call (for hosts that zero all of such a call;
+///   D3DMetal does not). 31 is every pass over the module, 95 those and
+///   the four-dword reads.
+///
+/// Part of the translation: the shader cache keys on it
+/// ([`translation_settings`]). After fxceless/victory-fork (16849898,
+/// c36971b2).
+pub fn shader_opt() -> u32 {
+    static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+/// `VICTORY_SHADER_OPT`'s value; the default when it is unset or
+/// unreadable. Pure, for testing.
+fn parse_shader_opt(value: Option<&str>) -> u32 {
+    let parsed = value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        });
+    parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
+}
+
+/// The settings a translation depends on besides the container and the
+/// translator's build, as bytes for the shader cache's key: the loop limit
+/// ([`loop_limit`]), the clean-up ([`shader_opt`]) and the loop limit of
+/// ray-testing programs ([`trace_loop_limit`]).
+pub fn translation_settings() -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(&loop_limit().to_le_bytes());
+    out.extend_from_slice(&shader_opt().to_le_bytes());
+    out.extend_from_slice(&trace_loop_limit().to_le_bytes());
+    out
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -445,6 +527,54 @@ pub struct Options {
     /// thread that comes after it. The console's waits for its writes there
     /// are not in the translated code.
     pub atomic_fences: bool,
+    /// [`Options::narrow_waves`]: a wave64 program whose halves cannot meet
+    /// is not made again with the per-lane branches around those places
+    /// taken by the whole wave (`widened`), and keeps `WaveSize(64)` as
+    /// before. Off (the walk made) by default.
+    pub no_wave_walk: bool,
+    /// Console float rules left to the host's (all off: the console's).
+    pub relax: Relax,
+}
+
+/// The console's float rules a translation may leave to the host's instead
+/// ([`Options::relax`]), one kind each: the instructions that reproduce
+/// them cost GPU time (a 25-tap min/max filter of the title runs
+/// in a third of the time without them), and what differs is noted per kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Relax {
+    /// Denormal operands of minimum, maximum and median, of the floor
+    /// conversions and of the output modifiers (x2, x4, /2) are no longer
+    /// read as zeros of their sign (the console's float mode; four integer
+    /// instructions an operand): the host's own treatment applies, so a
+    /// result may be a denormal (below 1.2e-38 in size) where the console
+    /// gives a zero.
+    pub denormals: bool,
+    /// Minimum and maximum of two zeros of different signs are the host's
+    /// (either zero) instead of the console's (-0 below +0; five integer
+    /// instructions an operation). Only the sign of a zero differs.
+    pub signed_zeros: bool,
+    /// `v_mul_legacy_f32` and its multiply-adds are plain multiplies: the
+    /// console's give 0 for 0 x infinity and 0 x NaN, the host's NaN
+    /// (two compares and a select a multiply).
+    pub legacy_mul: bool,
+    /// The same multiplies as plain multiplies whose NaN and zero results
+    /// are +0 (a compare and a select): 0 x infinity and 0 x NaN stay 0 as
+    /// on the console, so no NaN is made that the console does not make,
+    /// and a zero product keeps the console's sign; a NaN operand times a
+    /// non-zero number gives 0 where the console gives NaN, and a product
+    /// of non-zero operands that underflows to -0 gives +0.
+    /// [`Relax::legacy_mul`] takes precedence.
+    pub legacy_mul_nan: bool,
+    /// 16-bit float results are rounded by the host's conversion
+    /// (`legacyF32ToF16`) instead of on the bits (about fifty integer
+    /// instructions a result): the host's rounding (toward zero on some)
+    /// and its denormal, overflow and NaN payload handling apply, so a
+    /// result may differ in the last place of an f16.
+    pub half_rounding: bool,
+    /// The median of three with a NaN among them is the host's (the console
+    /// gives the minimum of the three), and the floor conversions give the
+    /// host's 0 for a NaN (the console saturates by the NaN's sign).
+    pub nan: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -487,30 +617,139 @@ pub fn translate_keeping(
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    translate_program(&c, &native, options, kept)
+}
+
+/// [`translate_keeping`] of the program `native` of container `c`.
+pub(crate) fn translate_program(
+    c: &Container,
+    native: &NativeProgram,
+    options: Options,
+    kept: Option<&Kept>,
+) -> Result<HostShader, ShaderError> {
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let code = native.patched_code();
     let (p, st) = crate::range::build(&code, native.wave64, native.vgprs)?;
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
+    let io = io::raise(&p, native)?;
     let st = st?;
     lower::take_wide();
-    let made = emit_keeping(&c, &native, &p, &st, &io, &res, options, kept);
-    let Some(why) = lower::take_wide() else {
+    let mut made = emit_keeping(c, native, &p, &st, &io, &res, options, kept);
+    let mut wide = lower::take_wide();
+    // A whole-wave section that a jump splits (two reductions a branch
+    // chooses between that share their end): once more with each such
+    // section in one block ([`ir::whole_sections`]), where the simulation
+    // follows it. The original's result if that does not translate. Tried
+    // for a program that translates too where it permutes lanes outside the
+    // sections followed (the title's water optical depth:
+    // `v_permlanex16_b32` before the jump): such a permute lowered on its
+    // own reads the lanes the host has as they are, where the console's
+    // section reads every lane, a lane outside the saved mask with the
+    // reduction's identity. After darkworldhm/victory-fork-darkworldhm.
+    if made.is_err() || permutes_outside_sections(&p) {
+        let mut q = None;
+        for _ in 0..4 {
+            match ir::whole_sections(q.as_ref().unwrap_or(&p)) {
+                Some(next) => q = Some(next),
+                None => break,
+            }
+        }
+        if let Some(q) = q {
+            let again = (|| {
+                let st = structure::structure(&q)?;
+                let res = resource::track(&q, &native.layout, native.stage, Some(&st))?;
+                let io = io::raise(&q, native)?;
+                emit_keeping(c, native, &q, &st, &io, &res, options, kept)
+            })();
+            let again_wide = lower::take_wide();
+            if again.is_ok() {
+                (made, wide) = (again, again_wide);
+            }
+        }
+    }
+    let Some(why) = wide else {
         return made;
     };
     // A wave64 program whose wave operations sit where the halves of a
     // wave cannot meet: again without the skips no lane sees, so that every
     // lane runs that code under EXEC. Kept only if it then runs in halves.
-    if let Some(again) = without_idle_skips(&c, &native, &code, &p, &st, options, kept) {
+    if let Some(again) = without_idle_skips(c, native, &code, &p, &st, options, kept) {
+        return Ok(again);
+    }
+    // Still apart somewhere: the per-lane branches around those places
+    // taken by the whole wave, as the console takes them.
+    if !options.no_wave_walk
+        && let Some(again) = widened(c, native, &p, options, kept)
+    {
         return Ok(again);
     }
     lower::count_wide(why);
     made
 }
 
+/// The translation of `p` (a wave64 compute program whose group is one
+/// console wave) with the per-lane branches around the places where its
+/// halves have to meet and cannot taken wave-wide
+/// ([`structure::structure_wide`], [`lower::branches_around`]), if that runs
+/// in 32-lane host waves ([`Options::narrow_waves`]): the halves exchange
+/// each such decision and go the same way, so they are together inside.
+/// Branches are added while the halves are still apart somewhere new; the
+/// branches to the program's end last.
+fn widened(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    options: Options,
+    kept: Option<&Kept>,
+) -> Option<HostShader> {
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return None;
+    };
+    if !options.narrow_waves || !native.wave64 || cs.threads.iter().product::<u32>() != 64 {
+        return None;
+    }
+    let mut wide = structure::Set::default();
+    let mut ending = false;
+    for _ in 0..64 {
+        let st = structure::structure_wide(p, &wide).ok()?;
+        let res = resource::track(p, &native.layout, native.stage, Some(&st)).ok()?;
+        let io = io::raise(p, native).ok()?;
+        let made = emit_keeping(c, native, p, &st, &io, &res, options, kept);
+        let needs = lower::take_needs();
+        let why = lower::take_wide();
+        if why.is_none() {
+            return made.ok();
+        }
+        let mut more = lower::branches_around(p, &st, &needs, ending);
+        if more.is_empty() && !ending {
+            ending = true;
+            more = lower::branches_around(p, &st, &needs, ending);
+        }
+        if more.is_empty() {
+            return None;
+        }
+        wide.extend(more);
+    }
+    None
+}
+
 /// The translation of `p` without its [`lower::idle_skips`], if that one
 /// runs in 32-lane host waves ([`Options::narrow_waves`]).
+/// Whether `p` has a `v_permlane16_b32` or `v_permlanex16_b32` that no
+/// whole-wave section the simulation follows ([`wave::sections`]) holds.
+fn permutes_outside_sections(p: &ir::Program) -> bool {
+    let permute = |inst: &ir::Inst| matches!(inst.name(), "v_permlane16_b32" | "v_permlanex16_b32");
+    p.blocks.iter().enumerate().any(|(b, block)| {
+        if !block.insts.iter().any(permute) {
+            return false;
+        }
+        let sections = wave::sections(p, b);
+        let held = |i: usize| sections.iter().any(|(&start, s)| start < i && i < s.end);
+        block.insts.iter().enumerate().any(|(i, inst)| permute(inst) && !held(i))
+    })
+}
+
 fn without_idle_skips(
     c: &Container,
     native: &NativeProgram,
@@ -864,6 +1103,7 @@ fn emit_keeping(
         atomic_locks: options.atomic_locks,
         bias_as_gradients: options.bias_as_gradients,
         narrow_waves: options.narrow_waves,
+        relax: options.relax,
     };
     // The structure builder's programs and their like are made for
     // dispatches counted in threads (`lower::counted`), and with fences
@@ -1300,7 +1540,94 @@ mod barycentric_tests {
 mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
-    use super::parse_loop_limit;
+    use super::{parse_loop_limit, parse_shader_opt, parse_trace_limit};
+
+    #[test]
+    fn the_clean_up_switch_parses_or_falls_back() {
+        let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
+        assert_eq!(usual, super::bitcode::opt::WIDE, "the four-dword reads");
+        assert_eq!(parse_shader_opt(None), usual);
+        assert_eq!(parse_shader_opt(Some("0")), 0);
+        assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
+        assert_eq!(parse_shader_opt(Some("0x10")), 16);
+        assert_eq!(parse_shader_opt(Some("31")), super::bitcode::opt::MODULE);
+        assert_eq!(parse_shader_opt(Some("127")), 95, "bit 32 is not read here");
+        assert_eq!(parse_shader_opt(Some("255")), all);
+        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
+        assert_eq!(parse_shader_opt(Some("on")), usual);
+    }
+
+    /// A branch on s0 picks a wave maximum or minimum, and the two
+    /// reductions share their end: each arm saves EXEC and reduces up to
+    /// the read of lane 32, the join reads lane 0 and restores EXEC (the
+    /// title's water optical depth). Neither block holds a whole section;
+    /// with the join's code in each arm both do. After
+    /// darkworldhm/victory-fork-darkworldhm's test of the paired form.
+    #[test]
+    fn two_reductions_that_share_their_end_become_two_sections() {
+        let arm = |init: u32, op: u32| {
+            let mut w = vec![
+                0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+                0x7E04_02FF,
+                init, // v_mov_b32 v2, init
+                0xD501_0002,
+                0x0032_0902, // v_cndmask_b32 v2, v2, v4, s[12:13]
+            ];
+            for dpp in [0xDE54_C102, 0x9360_1202, 0x0009_2402] {
+                w.extend([op << 25 | 0x0004_04E9, dpp]); // v_<op>_f32 v2, v2, v2 dpp8
+            }
+            w.extend([
+                op << 25 | 0x0004_04FA,
+                0xFF09_4002, // v_<op>_f32 v2, v2, v2 row_mirror bound_ctrl:1
+                0xD778_0003,
+                0x0201_0102,            // v_permlanex16_b32 v3, v2, 0, 0
+                op << 25 | 0x0004_0503, // v_<op>_f32 v2, v3, v2
+                0xD760_000E,
+                0x0001_4102,            // v_readlane_b32 s14, v2, 32
+                op << 25 | 0x0004_040E, // v_<op>_f32 v2, s14, v2
+            ]);
+            w
+        };
+        let mut words = vec![
+            0x7E08_0D00, // v_cvt_f32_u32 v4, v0
+            0x0608_08F2, // v_add_f32 v4, 1.0, v4
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0014, // s_cbranch_scc1 to the minimum
+        ];
+        words.extend(arm(0xFF80_0000, 0x10)); // the maximum from -inf
+        words.push(0xBF82_0013); // s_branch to the join
+        words.extend(arm(0x7F80_0000, 0x0F)); // the minimum from +inf
+        words.extend([
+            0xD760_000E,
+            0x0001_0102, // v_readlane_b32 s14, v2, 0
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            0x7E00_020E, // v_mov_b32 v0, s14
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 8).expect("ir::build");
+        let sections = |p: &crate::ir::Program| {
+            (0..p.blocks.len()).map(|b| super::wave::sections(p, b).len()).sum::<usize>()
+        };
+        assert_eq!(sections(&p), 0);
+        assert!(super::permutes_outside_sections(&p));
+        let q = crate::ir::whole_sections(&p).expect("sections to join");
+        assert_eq!(sections(&q), 2);
+        assert!(!super::permutes_outside_sections(&q));
+        assert!(crate::ir::whole_sections(&q).is_none(), "nothing left to join");
+        crate::structure::structure(&q).expect("the joined program structures");
+    }
+
+    #[test]
+    fn the_trace_limit_switch_parses_or_is_off() {
+        assert_eq!(parse_trace_limit(None), 0);
+        assert_eq!(parse_trace_limit(Some("1024")), 1024);
+        assert_eq!(parse_trace_limit(Some(" 0x400 ")), 1024);
+        assert_eq!(parse_trace_limit(Some("0")), 0);
+        assert_eq!(parse_trace_limit(Some("lots")), 0);
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {

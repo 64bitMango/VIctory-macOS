@@ -95,7 +95,7 @@ In the loading freeze from #50 every thread stops logging, and `VICTORY_STACKS` 
 
 ## Presented planes
 
-On Series S the application presents two planes. Plane 0 is a 1920x1080 overlay and plane 1 is the 3840x2160 picture (#15). The window shows the plane whose first resource has the most pixels, and `VICTORY_PRESENT_PLANE=<n>` picks another one. With `VICTORY_PRESENT_COMPOSITE=1` the other plane is also blended over the shown one by a compute pass (`victory-gpu/src/composite.rs`), scaled to it and using its alpha as straight alpha. The blend is off by default until a run with the application shows that the overlay is clear where the picture should show.
+On Series S the application presents two planes, listed from the bottom up: plane 0 is the 1920x1080 scene and plane 1 the 3840x2160 interface, mostly transparent (#15, #21). By default the window shows plane 0 with plane 1 blended over it by a compute pass (`victory-gpu/src/composite.rs`), scaled to it and using its alpha as straight alpha. `VICTORY_PRESENT_PLANE=<n>` shows another plane, and `VICTORY_PRESENT_COMPOSITE=0|1` turns the blend off or forces it on.
 
 ## D3DMetal's shader cache needs unique shader hashes
 
@@ -152,3 +152,11 @@ Host textures fed from title memory are given up when the application has not us
 - Memory freed through D3DMetal stays with the process. Released heaps, and released committed buffers, leave the process's physical footprint (`footprint -p`) where it was, 20 seconds later too, and `ID3D12Device::Evict` does not lower it. New resources reuse that memory first. So the process holds the most GPU memory it ever used, and textures help only if they are given up before that peak.
 
 `VICTORY_GPU_BUDGET_MB=<MB>` sets the budget the pass keeps host textures under, in place of the device's. A diagnostics build logs `host textures given up: N (M MB); made again after being given up: ...` with the statistics, so a run shows whether the pass gives textures up and whether it gives up ones still in use.
+
+## The views table no longer grows
+
+Every shader view the title writes into a descriptor is kept in a table (`victory_gpu::descriptor`), and the descriptor holds the entry's index and generation. Views of resource objects are freed with their resource, but constant buffer views and views of placed memory name no resource, so nothing ever freed them. The title writes thousands of constant buffer views a frame, each at a new address. On a Series X run from the opening save the table reached 544 MB after seven minutes, and the Rust heap grew about 0.28 GB a minute (#20).
+
+Those two kinds are now named whole in the descriptor's own words: a constant buffer view by its address and size, a view of placed memory by its address and the number of its shape (its description without the address). The table holds only bounded kinds: views of resources, samplers and the shapes. This came from fxceless's fork, where it is on by default. `VICTORY_VIEW_INLINE=0` turns it off for comparison.
+
+A diagnostics build logs `views table: N entries (F free), M MB with its index and shapes; ...` once a second beside the memory line. With the switch on, the entry count and size should level off after loading, and the counts named whole in records should keep rising.

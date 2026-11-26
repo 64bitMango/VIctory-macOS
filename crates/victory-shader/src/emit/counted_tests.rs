@@ -92,6 +92,7 @@ fn program(body: &[u32], wave64: bool, threads: [u32; 3], narrow: bool, fences: 
             atomic_locks: false,
             bias_as_gradients: false,
             narrow_waves: narrow,
+            relax: Default::default(),
             view_marks: false,
         },
         false,
@@ -291,6 +292,82 @@ fn lanes_counted_over_a_wave_are_those_below_the_count() {
     }
     if ran > 0 {
         eprintln!("ran on the hardware device: {ran} wave64 programs counted lanes past a count of threads");
+    }
+}
+
+/// `WaveActiveSum(v16)` as the console compiler expands it (as in the
+/// lowering's tests): the sum in s12, EXEC as it was saved in s[0:1]. It
+/// sets EXEC to every lane, lanes never launched among them (their
+/// operand zeroed by the saved EXEC).
+const WAVE_SUM_V16_S12: [u32; 19] = [
+    0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+    0xD501_0002,
+    0x0002_2080, // v_cndmask_b32 v2, 0, v16, s[0:1]
+    0x4A04_04E9,
+    0xDE54_C102, // v_add_nc_u32 v2, v2, v2 dpp8:[1,0,3,2,5,4,7,6]
+    0x4A04_04E9,
+    0x9360_1202, // v_add_nc_u32 v2, v2, v2 dpp8:[2,2,0,0,6,6,4,4]
+    0x4A04_04E9,
+    0x0009_2402, // v_add_nc_u32 v2, v2, v2 dpp8:[4,4,4,4,0,0,0,0]
+    0x4A04_04FA,
+    0xFF09_4002, // v_add_nc_u32 v2, v2, v2 row_mirror bound_ctrl:1
+    0xD778_0003,
+    0x0201_0102, // v_permlanex16_b32 v3, v2, 0, 0
+    0x4A04_0503, // v_add_nc_u32 v2, v3, v2
+    0xD760_0002,
+    0x0001_4102, // v_readlane_b32 s2, v2, 32
+    0x4A04_0402, // v_add_nc_u32 v2, s2, v2
+    0xD760_000C,
+    0x0001_0102, // v_readlane_b32 s12, v2, 0
+];
+
+/// A wave64 program in 32-lane host waves summing the thread ids of its
+/// console wave (a reduction across the halves, after
+/// avatarmanz/VIctory-7900XTX PR #66's test of the structure builder's
+/// programs): each thread adds the sum to the dword of its number in the
+/// group. Past a count a half may have no thread, or some: the sum is of
+/// the lanes the console would have launched. Groups of one console wave
+/// and of four.
+#[test]
+fn a_sum_over_a_wave_is_of_the_lanes_below_the_count() {
+    let mut body = vec![v_lshlrev(1, 2, 0), 0x7E20_0300]; // v_mov_b32 v16, v0
+    body.extend(WAVE_SUM_V16_S12);
+    body.push(0xBEFE_0400); // s_mov_b64 exec, s[0:1]
+    body.push(0x7E04_020C); // v_mov_b32 v2, s12
+    body.extend(ATOMIC_ADD_V2_AT_V1);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (threads, groups) in [(64u32, 2u32), (256, 1)] {
+        let shader = program(&body, true, [threads, 1, 1], true, false);
+        assert!(has_word(&shader, 0), "groups of {threads}");
+        let Some(made) = pipeline(&shader, true) else { continue };
+        let all = threads * groups;
+        for count in [0u32, 1, 10, 31, 32, 33, 45, 64, 74, 96, 100, 127, 128, 129, 200, 255, 256] {
+            if count > all {
+                continue;
+            }
+            let out = run(&made, &shader, [groups, 1, 1], [count, 0, 0], threads);
+            let runs = if count == 0 { all } else { count };
+            for (i, &word) in out.iter().enumerate() {
+                let i = i as u32;
+                // Every group's thread of this number, each with the sum of
+                // the ids of its console wave's live lanes.
+                let want: u32 = (0..groups)
+                    .filter(|&g| g * threads + i < runs)
+                    .map(|g| {
+                        let first = i / 64 * 64;
+                        (first..first + 64).filter(|&l| g * threads + l < runs).sum::<u32>()
+                    })
+                    .sum();
+                assert_eq!(word, want, "groups of {threads}, count {count}, thread {i}");
+            }
+        }
+        ran += 1;
+    }
+    if ran > 0 {
+        eprintln!(
+            "ran on the hardware device: {ran} wave64 programs summed lanes past a count of threads"
+        );
     }
 }
 

@@ -2916,8 +2916,12 @@ pub(crate) mod tests {
         let start = title_heap.start;
         // A view of no memory: a view of the test's own heap memory would get
         // a host copy whose 4 MiB window the guards may cover (the process
-        // heap guarded read-only hung the suite).
+        // heap guarded read-only hung the suite). A table entry, not named
+        // whole in its record: only an entry's record can name a generation
+        // its view does not have (below).
+        crate::descriptor::tests::ENTRIES_ONLY.with(|only| only.set(true));
         crate::descriptor::create_cbv(null, &[0, 0, 256, 0], start);
+        crate::descriptor::tests::ENTRIES_ONLY.with(|only| only.set(false));
         let host = title_heap.host().expect("a host view heap");
         // SAFETY: slots 0 and 1 of the heap's memory, 32 bytes each.
         unsafe { std::ptr::copy_nonoverlapping(start as *const u8, (start + 32) as *mut u8, 32) };
@@ -2942,6 +2946,14 @@ pub(crate) mod tests {
         }
         host.sync_slots(0, 4, start, 32);
         assert!(host.made(0) && !host.made(1), "a record gone stale leaves its slot");
+        // A constant buffer view named whole in its record (when not
+        // `VICTORY_VIEW_INLINE=0`), copied as bytes: made at the sync too.
+        crate::descriptor::create_cbv(null, &[0x100, 0, 256, 0], start + 64);
+        // SAFETY: slots 2 and 3 of the heap's memory.
+        unsafe { std::ptr::copy_nonoverlapping((start + 64) as *const u8, (start + 96) as *mut u8, 32) };
+        assert!(!host.made(3), "copied as bytes: not seen yet");
+        host.sync_slots(0, 4, start, 32);
+        assert!(host.made(2) && host.made(3));
     }
 
     /// The world's 16-byte view of 0 elements removed the device.

@@ -105,6 +105,38 @@ const HEAP_CONSTANT_WAVE32: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// As [`HEAP_CONSTANT_WAVE32`], four dwords from byte 8 on
+/// (`s_buffer_load_dwordx4`), stored to dwords 0-3 of the UAV.
+const HEAP_CONSTANT_X4_WAVE32: &[u32] = &[
+    0x8F04_8500, // s_lshl_b32 s4, s0, 5
+    0xBE86_0301, // s_mov_b32 s6, s1
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0203,
+    0x0800_0000, // s_load_dwordx4 s[8:11], s[6:7], s4
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF428_0504,
+    0xFA00_0008, // s_buffer_load_dwordx4 s[20:23], s[8:11], 0x8
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0x7E02_0214, // v_mov_b32 v1, s20
+    0xE070_1000,
+    0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
+    0x7E02_0215, // v_mov_b32 v1, s21
+    0xE070_1004,
+    0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen offset:4
+    0x7E02_0216, // v_mov_b32 v1, s22
+    0xE070_1008,
+    0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen offset:8
+    0x7E02_0217, // v_mov_b32 v1, s23
+    0xE070_100C,
+    0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen offset:12
+    0xBF81_0000, // s_endpgm
+];
+
 /// User data: s0 a table with a raw SRV, s2 a table with a raw UAV. Each
 /// lane loads the half at byte `2 × lane` and stores it to dword `lane`.
 const HALF_LOAD_WAVE32: &[u32] = &[
@@ -203,6 +235,7 @@ fn build(
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        relax: Default::default(),
         view_marks: false,
     })
     .expect("lower");
@@ -419,6 +452,74 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         assert_eq!(words[0], vec![9; 32], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A scalar load of four dwords whose last two lie past its view's end: the
+/// console answers those with zero and the first two as they are. With
+/// `VICTORY_SHADER_OPT` bit 64 the four are one call, taken as the host
+/// answers it (D3DMetal: as the console, measured with 0, 64 and 192); with
+/// 128 too, such a call is read again a dword a call. Run it with each.
+#[test]
+fn a_scalar_load_past_its_views_end_keeps_the_dwords_before_it() {
+    let shader = build(
+        HEAP_CONSTANT_X4_WAVE32,
+        vec![
+            param(RootType::Constants, 0),
+            param(RootType::ResourceHeap, 1),
+            param(RootType::Table, 2),
+        ],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    let data: Vec<u32> = vec![7, 8, 9, 10];
+    let views = [
+        View::RawUav(32),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                RootType::Constants => 1,
+                RootType::Table => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 4] })],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        eprintln!(
+            "{label}, VICTORY_SHADER_OPT bits {}: {:?}",
+            super::shader_opt(),
+            &words[0][..4]
+        );
+        assert_eq!(words[0][..4], [9, 10, 0, 0], "{label}");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

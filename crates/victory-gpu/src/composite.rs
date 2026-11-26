@@ -1,25 +1,33 @@
-//! Draws a presented overlay plane over the picture plane (#15).
+//! Draws a presented overlay plane over the picture plane (#15, #21).
 //!
-//! On Series S the title presents two planes: a 1920x1080
-//! overlay and the 3840x2160 picture. The console's display hardware blends
-//! the overlay over the picture. Here a compute pass does it into a texture
-//! of the picture's size, which is then copied to the swap chain:
-//! `picture * (1 - alpha) + overlay * alpha`, the overlay scaled to the
-//! picture by its nearest texel. The overlay's alpha is taken as straight
-//! (not premultiplied) until a run with the game shows otherwise.
+//! On the Series S profile the title presents two planes: plane 0, the
+//! 1920x1080 scene, and plane 1, a 3840x2160 interface layer that is
+//! transparent where the scene shows. The console's display hardware
+//! blends the upper plane over the lower one. Here a compute pass does it
+//! into a texture of the picture's size, which is then copied to the swap
+//! chain: `picture * (1 - alpha) + overlay * alpha`, the overlay scaled to
+//! the picture by its nearest texel. The overlay's alpha is taken as
+//! straight (not premultiplied): the frames saved so far do not tell the
+//! two apart.
 //!
-//! The pass is off unless `VICTORY_PRESENT_COMPOSITE=1`: if the overlay
-//! turns out opaque where the picture should show, compositing would bring
-//! the black window back.
+//! The pass runs whenever two planes are presented (the queue's
+//! `pick_planes`); `VICTORY_PRESENT_COMPOSITE=0` turns it off and `=1`
+//! also blends plane 0 over plane 1 when `VICTORY_PRESENT_PLANE=1` shows
+//! that one.
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::{Result, s};
 
-/// Whether `VICTORY_PRESENT_COMPOSITE=1` asks for the pass.
-pub(crate) fn wanted() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_PRESENT_COMPOSITE").is_ok_and(|v| v == "1"))
+/// `VICTORY_PRESENT_COMPOSITE`: `Some(true)` for `1`, `Some(false)` for
+/// `0`, `None` (the default choice) when unset or anything else.
+pub(crate) fn forced() -> Option<bool> {
+    static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_PRESENT_COMPOSITE").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    })
 }
 
 const SOURCE: &str = r#"

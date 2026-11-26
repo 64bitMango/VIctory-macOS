@@ -586,6 +586,13 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        // The clean-up (`VICTORY_SHADER_OPT`), before the flags are taken
+        // from what the code uses: a feature whose last use it removed must
+        // not be declared.
+        let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        if passes != 0 {
+            self.m.optimise(passes);
+        }
         // The flags of what lowering made, as the module writes it: what only
         // unread values or never-taken edges used is not written.
         let uses = self.m.uses();
@@ -931,6 +938,7 @@ impl Shader {
         self.m.named_md("dx.entryPoints", vec![entry]);
 
         let bitcode = self.m.write();
+        super::bitcode::census::note(&self.m, &bitcode);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
