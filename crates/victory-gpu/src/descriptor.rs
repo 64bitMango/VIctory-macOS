@@ -654,6 +654,11 @@ struct Views {
     /// record of the pages written ([`views_current`]), and an entry of
     /// `list` is 136 bytes, a cache line fetched per slot asked about.
     generations: Vec<u32>,
+}
+
+/// Where each view's entry is, the entries naming each resource, and the
+/// entries free: what recording and releasing a view look up and change.
+struct Index {
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
@@ -663,13 +668,68 @@ struct Views {
 // Read by every list recorder for every descriptor it binds: readers share
 // it. As a mutex it made the title's recording threads take turns (Belobug
 // ff920f2: 6,600 context switches a second each in a PIX timing capture).
-static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
-    list: Vec::new(),
-    generations: Vec::new(),
+//
+// The entries alone: with the index beside them under one lock, each of the
+// 9,500 views a frame the title records for the first time held every
+// reader off for its search and insert in a tree of 136-byte keys, and the
+// readers (200,000 looks a frame, the submitting thread's among them)
+// waited 75 ms a frame, 10,000 times (run with what slots view in parts).
+// The index has its own lock ([`VIEW_INDEX`]); the entries are held alone
+// only to write one entry.
+//
+// What the one lock gave, and what gives it now:
+// - An entry's view and generation are read together: both are written
+//   with this lock held alone.
+// - A record is written with its entry's own generation: `record` holds
+//   the index (shared for a view it finds, alone for a new one) from
+//   finding the entry to writing the record, and `forget`, which moves
+//   generations on, holds the index alone.
+// - An entry is freed and given to another view under the index held
+//   alone; its generation moved on when it was freed, so a record of the
+//   view it held before names no view from then on.
+//
+// Locked in the order: the index, then the entries.
+// `VICTORY_VIEWS_SPLIT=0`: readers hold the index too (shared), so a view
+// recorded or released holds them off for all of it, as under the one lock.
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views { list: Vec::new(), generations: Vec::new() });
+
+static VIEW_INDEX: std::sync::RwLock<Index> = std::sync::RwLock::new(Index {
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
 });
+
+/// Whether readers of the entries leave the index alone ([`VIEWS`]): unless
+/// `VICTORY_VIEWS_SPLIT=0`.
+fn views_split() -> bool {
+    #[cfg(test)]
+    if tests::VIEWS_ONE.with(|one| one.get()) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_VIEWS_SPLIT"))
+}
+
+/// The entries, to read; with the index held too (dropped after them) if
+/// the two are not split.
+struct Entries {
+    views: std::sync::RwLockReadGuard<'static, Views>,
+    _index: Option<std::sync::RwLockReadGuard<'static, Index>>,
+}
+
+impl std::ops::Deref for Entries {
+    type Target = Views;
+    fn deref(&self) -> &Views {
+        &self.views
+    }
+}
+
+/// The entries, to read. Not for a thread that holds the index.
+fn entries() -> Entries {
+    let _index = (!views_split()).then(|| crate::contend::read(&VIEW_INDEX, crate::contend::Lock::Views));
+    Entries { views: crate::contend::read(&VIEWS, crate::contend::Lock::Views), _index }
+}
+
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 impl View {
@@ -688,16 +748,16 @@ fn record(handle: u64, view: View) {
         return;
     }
     // A view recorded before (the title records the same views again and
-    // again, into other slots) is only looked up: readers share the table,
-    // and the recording threads took turns at it. Its record is written
-    // with the table held, as below: its generation is the entry's own
-    // then (`forget` holds the table alone).
+    // again, into other slots) is only looked up: recorders share the
+    // index, and took turns at it. Its record is written with the index
+    // held, as below: its generation is the entry's own then (`forget`
+    // holds the index alone).
     if record_shared() {
-        let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
-        if let Some(&i) = views.index.get(&view) {
-            let generation = views.list[i as usize].1;
+        let index = crate::contend::read(&VIEW_INDEX, crate::contend::Lock::Views);
+        if let Some(&i) = index.index.get(&view) {
+            let generation = VIEWS.read().unwrap_or_else(|e| e.into_inner()).generations[i as usize];
             write_record(handle, i, generation);
-            drop(views);
+            drop(index);
             #[cfg(all(windows, feature = "diagnostics"))]
             crate::copystat::add(crate::copystat::C::RecordFound, 1);
             #[cfg(windows)]
@@ -705,38 +765,43 @@ fn record(handle: u64, view: View) {
             return;
         }
     }
-    let mut views = crate::contend::write(&VIEWS, crate::contend::Lock::Views);
+    let mut index = crate::contend::write(&VIEW_INDEX, crate::contend::Lock::Views);
     // Looked up again: another thread may have entered it meanwhile.
-    let i = match views.index.get(&view) {
+    let i = match index.index.get(&view) {
         Some(&i) => {
             #[cfg(all(windows, feature = "diagnostics"))]
             crate::copystat::add(crate::copystat::C::RecordFound, 1);
             i
         }
         None => {
-            let i = match views.free.pop() {
-                Some(i) => {
-                    views.list[i as usize].0 = view.clone();
-                    i
-                }
-                None => {
-                    views.list.push((view.clone(), 1));
-                    views.generations.push(1);
-                    views.list.len() as u32 - 1
+            let free = index.free.pop();
+            let i = {
+                // The entries held alone for the one entry written.
+                let mut views = crate::contend::write(&VIEWS, crate::contend::Lock::Views);
+                match free {
+                    Some(i) => {
+                        views.list[i as usize].0 = view.clone();
+                        i
+                    }
+                    None => {
+                        views.list.push((view.clone(), 1));
+                        views.generations.push(1);
+                        views.list.len() as u32 - 1
+                    }
                 }
             };
             for r in view.resources().into_iter().filter(|&r| r != 0) {
-                views.by_resource.entry(r).or_default().push(i);
+                index.by_resource.entry(r).or_default().push(i);
             }
-            views.index.insert(view, i);
+            index.index.insert(view, i);
             #[cfg(all(windows, feature = "diagnostics"))]
             crate::copystat::add(crate::copystat::C::RecordNew, 1);
             i
         }
     };
-    let generation = views.list[i as usize].1;
+    let generation = VIEWS.read().unwrap_or_else(|e| e.into_inner()).generations[i as usize];
     write_record(handle, i, generation);
-    drop(views);
+    drop(index);
     #[cfg(windows)]
     mirror(handle);
 }
@@ -770,30 +835,41 @@ fn record_shared() -> bool {
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
-    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
-    let Some(entries) = views.by_resource.remove(&resource) else {
+    let mut index = VIEW_INDEX.write().unwrap_or_else(|e| e.into_inner());
+    let Some(entries) = index.by_resource.remove(&resource) else {
         return;
     };
-    for i in entries {
-        let (view, generation) = views.list[i as usize].clone();
-        // Entries freed through a view's other resource may hold another
-        // view by now.
-        if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
-            continue;
+    // Found with the entries shared, their generations moved on with them
+    // held alone, at once: no recorder looks meanwhile (the index is held).
+    let mut freed = Vec::new();
+    {
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        for i in entries {
+            let (view, _) = &views.list[i as usize];
+            // Entries freed through a view's other resource may hold another
+            // view by now.
+            if index.index.get(view) != Some(&i) || !view.resources().contains(&resource) {
+                continue;
+            }
+            index.index.remove(view);
+            freed.push(i);
         }
-        views.index.remove(&view);
-        views.list[i as usize].1 = generation.wrapping_add(1).max(1);
-        views.generations[i as usize] = views.list[i as usize].1;
+    }
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+    for i in freed {
+        let generation = views.list[i as usize].1.wrapping_add(1).max(1);
+        views.list[i as usize].1 = generation;
+        views.generations[i as usize] = generation;
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
-        views.free.push(i);
+        index.free.push(i);
     }
 }
 
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
+    let views = entries();
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
 }
@@ -805,7 +881,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 /// `VICTORY_SLOT_GENERATIONS=0`.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
-    let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
+    let views = entries();
     if generations_alone() {
         let generations = &views.generations;
         return records
@@ -840,7 +916,7 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = crate::contend::read(&VIEWS, crate::contend::Lock::Views);
+    let views = entries();
     let (view, current) = views.list.get(i as usize)?;
     (tag == VIEW_TAG && *current == generation).then(|| view.clone())
 }
@@ -1128,6 +1204,9 @@ pub(crate) mod tests {
         /// This thread takes the views table alone for every record (as
         /// `VICTORY_RECORD_SHARED=0`).
         pub(crate) static RECORD_ALONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// This thread's reads of the views' entries hold their index too (as
+        /// `VICTORY_VIEWS_SPLIT=0`).
+        pub(crate) static VIEWS_ONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// This thread holds the heaps' lock alone wherever it takes it (as
         /// `VICTORY_HEAPS_SHARED=0`).
         pub(crate) static HEAPS_ALONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1219,6 +1298,7 @@ pub(crate) mod tests {
             for t in 0..THREADS {
                 scope.spawn(move || {
                     RECORD_ALONE.with(|alone| alone.set(t % 3 == 2));
+                    VIEWS_ONE.with(|one| one.set(t % 2 == 1));
                     let slots = [0u64; 4 * 8];
                     let at = |i: usize| slots.as_ptr() as u64 + 32 * i as u64;
                     let mut seed = 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(t as u64 + 1);
