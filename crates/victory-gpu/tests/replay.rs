@@ -49,9 +49,9 @@ fn a_frame_recorded_through_the_host_layer_is_replayed() {
     assert_eq!((frame.number, frame.world, frame.partial), (9, 4, false));
     assert_eq!(frame.submits.len(), 3);
     assert_eq!(frame.submits.iter().map(|s| s.lists.len()).collect::<Vec<_>>(), [1, 2, 1]);
-    // The view replaced before the second submission, and what the CPU
-    // wrote before each.
-    assert!(frame.submits[1].views.len() == 1, "{:?}", frame.submits[1].views);
+    // The view made before the second submission and the one replaced
+    // before the third, and what the CPU wrote before each.
+    assert_eq!(frame.submits.iter().map(|s| s.views.len()).collect::<Vec<_>>(), [0, 1, 1]);
     assert!(frame.submits.iter().all(|s| !s.deltas.is_empty()));
     let report = player.run(&options).unwrap();
     println!("{}", report.text("each waited for"));
@@ -74,6 +74,36 @@ fn a_frame_recorded_through_the_host_layer_is_replayed() {
     // The picture is one of things drawn: not one colour.
     let texels: std::collections::HashSet<&[u8]> = made.picture.chunks(4).collect();
     assert!(texels.len() > 100, "{} colours", texels.len());
+
+    // The textures no command names hold what they were given: every
+    // format and shape was taken out of the GPU's memory and put back.
+    assert!(made.others.len() >= 20, "{} textures of other formats", made.others.len());
+    let mut wrong = Vec::new();
+    for other in &made.others {
+        let id = player.named(&other.name).unwrap_or_else(|| panic!("{} is in the capture", other.name));
+        assert!(!other.subs.is_empty(), "{}", other.name);
+        for (sub, rows) in other.subs.iter().enumerate() {
+            let now = player.contents_of(id, sub as u32).unwrap().unwrap();
+            if !rows.are_in(&now) {
+                // The first texels that differ, as they were given and as
+                // they are.
+                let differ: Vec<String> = (0..rows.rows)
+                    .flat_map(|y| (0..rows.row / 4).map(move |x| (y, x)))
+                    .filter_map(|(y, x)| {
+                        let was = rows.bytes.get(y * rows.row + x * 4..y * rows.row + x * 4 + 4)?;
+                        let is = now.get(y * rows.pitch + x * 4..y * rows.pitch + x * 4 + 4)?;
+                        (was != is).then(|| format!("({x},{y}) {was:02x?} -> {is:02x?}"))
+                    })
+                    .take(6)
+                    .collect();
+                wrong.push(format!("{} subresource {sub}: {}", other.name, differ.join(", ")));
+            }
+            // (What a depth target read back when it was made is not
+            // nothing.)
+            assert!(rows.bytes.iter().any(|&b| b != 0), "{} subresource {sub} is all zero", other.name);
+        }
+    }
+    assert!(wrong.is_empty(), "{} subresources differ:\n{}", wrong.len(), wrong.join("\n"));
 
     // Sent without waits, as one submission, in pieces, with a timestamp
     // after every command, with an idle gap: the same picture.

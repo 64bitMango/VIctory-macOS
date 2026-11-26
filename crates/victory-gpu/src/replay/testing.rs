@@ -11,8 +11,13 @@
 //!   of four lists, each draw behind or in front of the others;
 //! - a buffer the CPU writes anew before every submission, read by a
 //!   compute pass that writes another, which the draws read;
-//! - a view slot whose view is replaced between two submissions;
-//! - the picture copied to a buffer at the frame's end.
+//! - a view slot whose view is replaced between two submissions, and one
+//!   that holds no view until one is made in it between two others;
+//! - the picture copied to a buffer at the frame's end;
+//! - textures no command of the frame names, of the formats and shapes a
+//!   title's are (compressed, float, packed, depth with stencil, levels,
+//!   layers, volumes), filled once: what a capture must take of the GPU's
+//!   memory, and a replay put back, whatever the host makes of each.
 //!
 //! Every frame is the same, so what any frame leaves is what a replay of
 //! one of them must leave.
@@ -71,6 +76,54 @@ pub struct Made {
     pub picture: Vec<u8>,
     /// The buffer the compute passes write.
     pub results: Vec<u8>,
+    /// The textures of many formats: what each holds.
+    pub others: Vec<Other>,
+}
+
+/// A texture no command of the frame names.
+pub struct Other {
+    pub name: String,
+    /// By subresource: the bytes of its rows that mean something.
+    pub subs: Vec<Rows>,
+}
+
+/// A subresource's rows in the layout copies use: `rows` rows `pitch`
+/// bytes apart, `row` bytes of each meaning something; `bytes` holds those,
+/// row after row.
+pub struct Rows {
+    pub pitch: usize,
+    pub rows: usize,
+    pub row: usize,
+    pub bytes: Vec<u8>,
+}
+
+impl Rows {
+    /// Whether `layout` (a subresource read back, rows `pitch` apart) holds
+    /// these rows.
+    pub fn are_in(&self, layout: &[u8]) -> bool {
+        (0..self.rows).all(|y| {
+            layout.get(y * self.pitch..y * self.pitch + self.row)
+                == self.bytes.get(y * self.row..(y + 1) * self.row)
+        })
+    }
+}
+
+/// The formats of the textures no command names: colour ones by number
+/// (float, packed, compressed), then depth ones, and what a clear of 0.75
+/// and stencil 0x5a leaves is what they hold.
+const COLOURS: [i32; 21] = [
+    2, 10, 24, 26, 28, 29, 34, 41, 42, 49, 54, 56, 61, 67, 71, 77, 80, 83, 87, 95, 98,
+];
+const DEPTHS: [i32; 4] = [40, 20, 45, 55];
+
+struct Extra {
+    name: String,
+    res: ID3D12Resource,
+    desc: D3D12_RESOURCE_DESC,
+    subs: u32,
+    depth: bool,
+    /// What it holds, by subresource, once filled.
+    held: Vec<Rows>,
 }
 
 fn texture(
@@ -123,6 +176,7 @@ struct Program {
     compute_root: ID3D12RootSignature,
     compute: ID3D12PipelineState,
     lists: Vec<HostList>,
+    extras: Vec<Extra>,
 }
 
 fn compile(source: &str, entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
@@ -357,7 +411,60 @@ impl Program {
                 Ok(list)
             })
             .collect::<windows::core::Result<Vec<HostList>>>()?;
-        let program = Program {
+        // Textures no command names: every format in one shape, and one
+        // format in every shape.
+        let mut extras = Vec::new();
+        let mut extra = |name: String, desc: D3D12_RESOURCE_DESC, depth: bool| {
+            let state = if depth {
+                D3D12_RESOURCE_STATE_DEPTH_WRITE
+            } else {
+                D3D12_RESOURCE_STATE_COMMON
+            };
+            // A format this host does not make is left out, and said.
+            match committed(&desc, state) {
+                Ok(res) => {
+                    crate::host::name(&res, || name.clone());
+                    let planes: u32 = if matches!(desc.Format.0, 20 | 45) { 2 } else { 1 };
+                    let layers = match desc.Dimension {
+                        D3D12_RESOURCE_DIMENSION_TEXTURE3D => 1,
+                        _ => u32::from(desc.DepthOrArraySize),
+                    };
+                    extras.push(Extra {
+                        name,
+                        res,
+                        desc,
+                        subs: u32::from(desc.MipLevels) * layers * planes,
+                        depth,
+                        held: Vec::new(),
+                    });
+                }
+                Err(e) => eprintln!("replay test: no texture \"{name}\" on this host: {e}"),
+            }
+        };
+        for format in COLOURS {
+            let mut desc = texture(64, 3, DXGI_FORMAT(format), D3D12_RESOURCE_FLAG_NONE);
+            // Compressed levels are whole blocks.
+            if (70..=99).contains(&format) {
+                desc.MipLevels = 2;
+            }
+            extra(format!("replay test: format {format}"), desc, false);
+        }
+        for format in DEPTHS {
+            let desc = texture(
+                64,
+                1,
+                DXGI_FORMAT(format),
+                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            );
+            extra(format!("replay test: depth format {format}"), desc, true);
+        }
+        let mut layers = texture(32, 2, rgba, D3D12_RESOURCE_FLAG_NONE);
+        layers.DepthOrArraySize = 6;
+        extra("replay test: six layers".into(), layers, false);
+        let mut volume = texture(16, 2, rgba, D3D12_RESOURCE_FLAG_NONE);
+        (volume.Dimension, volume.DepthOrArraySize) = (D3D12_RESOURCE_DIMENSION_TEXTURE3D, 8);
+        extra("replay test: a volume".into(), volume, false);
+        let mut program = Program {
             target,
             depth,
             first,
@@ -374,8 +481,10 @@ impl Program {
             compute_root,
             compute,
             lists,
+            extras,
         };
         program.fill()?;
+        program.fill_extras()?;
         Ok(program)
     }
 
@@ -411,6 +520,25 @@ impl Program {
         unsafe {
             host.device
                 .CreateShaderResourceView(texture, Some(&desc), self.slot(i))
+        };
+    }
+
+    /// Makes the view in slot `i` one of nothing.
+    fn no_view(&self, i: usize) {
+        let Some(host) = host() else { return };
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            ..Default::default()
+        };
+        // SAFETY: a slot of our heap; a null view has a description.
+        unsafe {
+            host.device.CreateShaderResourceView(
+                None::<&ID3D12Resource>,
+                Some(&desc),
+                self.slot(i),
+            )
         };
     }
 
@@ -487,6 +615,173 @@ impl Program {
         self.view(0, &self.first);
         self.view(1, &self.second);
         self.view(2, &self.first);
+        Ok(())
+    }
+
+    /// The layout of a subresource of `desc` in a buffer: its footprint,
+    /// its rows and the bytes of each that mean something.
+    fn layout(desc: &D3D12_RESOURCE_DESC, sub: u32) -> (D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u32, u64, u64) {
+        let mut f = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let (mut rows, mut row, mut total) = (0, 0, 0);
+        if let Some(host) = host() {
+            // SAFETY: outputs for one subresource.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    desc,
+                    sub,
+                    1,
+                    0,
+                    Some(&mut f),
+                    Some(&mut rows),
+                    Some(&mut row),
+                    Some(&mut total),
+                )
+            };
+        }
+        (f, rows, row, total)
+    }
+
+    /// Fills the textures no command names, once: colour ones with bytes
+    /// from an upload buffer, depth ones by a clear; then reads every one
+    /// back: that is what they hold. (Mostly the bytes given. D3DMetal
+    /// keeps the values of the two packed float formats, not their bits:
+    /// what is not a number comes back as its plain form, a shared exponent
+    /// as the smallest that holds the values.)
+    fn fill_extras(&mut self) -> windows::core::Result<()> {
+        let host = host().ok_or_else(windows::core::Error::empty)?;
+        const ROOM: u64 = 32 << 20;
+        let (staging, data) = host
+            .upload_buffer(ROOM)
+            .ok_or_else(windows::core::Error::empty)?;
+        let (back, read) = host
+            .shared_buffer(ROOM)
+            .ok_or_else(windows::core::Error::empty)?;
+        let (fill, fetch) = (&self.lists[0], &self.lists[1]);
+        fill.reset();
+        fetch.reset();
+        let location = |res: &ID3D12Resource, sub: u32| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed; the location never releases it.
+            pResource: unsafe { std::mem::transmute_copy(res) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: sub,
+            },
+        };
+        let placed = |res: &ID3D12Resource, mut f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT, at: u64| {
+            f.Offset = at;
+            D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(res) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+            }
+        };
+        let mut at = 0u64;
+        // For each subresource: its texture, where it is read back to, its
+        // layout, and the bytes it was given (none for a depth target).
+        let mut reads: Vec<(usize, u64, usize, usize, usize, Vec<u8>)> = Vec::new();
+        for (index, e) in self.extras.iter().enumerate() {
+            // The state it is in once filled.
+            let filled = if e.depth {
+                D3D12_RESOURCE_STATE_DEPTH_WRITE
+            } else {
+                D3D12_RESOURCE_STATE_COPY_DEST
+            };
+            let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            // SAFETY: an open list; a live texture in that state by then.
+            unsafe { fetch.list.ResourceBarrier(&[transition(&e.res, filled, source)]) };
+            if e.depth {
+                let all = D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
+                let flags = if e.subs > 1 { all } else { D3D12_CLEAR_FLAG_DEPTH };
+                // SAFETY: an open list; a depth target in its state.
+                unsafe {
+                    fill.list.ClearDepthStencilView(
+                        host.dsv(&e.res, None),
+                        flags,
+                        0.75,
+                        0x5a,
+                        None,
+                    );
+                }
+            }
+            for sub in 0..e.subs {
+                let (f, rows, row, total) = Self::layout(&e.desc, sub);
+                let (pitch, slices) = (f.Footprint.RowPitch as usize, f.Footprint.Depth.max(1));
+                let (rows, row) = (rows as usize * slices as usize, row as usize);
+                assert!(at + total <= ROOM);
+                let mut given = Vec::new();
+                if !e.depth {
+                    given.reserve(rows * row);
+                    for y in 0..rows {
+                        for x in 0..row {
+                            let v =
+                                (index * 31 + sub as usize * 17 + y * 7 + x * 3 + (x >> 3)) as u8;
+                            // SAFETY: inside the upload buffer's mapping.
+                            unsafe { data.add(at as usize + y * pitch + x).write(v) };
+                            given.push(v);
+                        }
+                    }
+                    // SAFETY: an open list; live resources; the texture in
+                    // the common state, which a copy promotes.
+                    unsafe {
+                        fill.list.CopyTextureRegion(
+                            &location(&e.res, sub),
+                            0,
+                            0,
+                            0,
+                            &placed(&staging, f, at),
+                            None,
+                        );
+                    }
+                }
+                // SAFETY: an open list; live resources.
+                unsafe {
+                    fetch.list.CopyTextureRegion(
+                        &placed(&back, f, at),
+                        0,
+                        0,
+                        0,
+                        &location(&e.res, sub),
+                        None,
+                    );
+                }
+                reads.push((index, at, pitch, rows, row, given));
+                at += total.next_multiple_of(512);
+            }
+            // Depth targets go back to their state; the others stay copy
+            // sources.
+            if e.depth {
+                // SAFETY: as above.
+                unsafe { fetch.list.ResourceBarrier(&[transition(&e.res, source, filled)]) };
+            }
+        }
+        fill.close();
+        fetch.close();
+        host.execute(&[fill]);
+        host.execute(&[fetch]);
+        for (index, from, pitch, rows, row, given) in reads {
+            let mut bytes = Vec::with_capacity(rows * row);
+            for y in 0..rows {
+                // SAFETY: a row of the copy's buffer; the copy has run.
+                bytes.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(read.add(from as usize + y * pitch), row)
+                });
+            }
+            let e = &mut self.extras[index];
+            // What was given is what is held, but for the packed floats.
+            let packed = matches!(e.desc.Format.0, 26 | 67);
+            if !e.depth && !packed {
+                assert!(bytes == given, "{} does not hold the bytes it was given", e.name);
+            } else if !e.depth && bytes != given {
+                eprintln!("replay test: {} holds other bits than it was given", e.name);
+            }
+            e.held.push(Rows {
+                pitch,
+                rows,
+                row,
+                bytes,
+            });
+        }
         Ok(())
     }
 
@@ -573,6 +868,7 @@ impl Program {
         // texture.
         self.write_inputs(0);
         self.view(2, &self.first);
+        self.no_view(3);
         a.reset();
         // SAFETY: an open list; live objects.
         unsafe {
@@ -591,22 +887,23 @@ impl Program {
         self.rectangle(&a.list, [-0.9, -0.9, 1.2, 1.2], [1.0, 1.0, 1.0, 1.0], 0.6, 2);
         a.close();
         host.execute(&[a]);
-        // The second: other inputs, the slot's view replaced; two lists.
+        // The second: other inputs, a view where there was none; two lists.
         self.write_inputs(1);
-        self.view(2, &self.second);
+        self.view(3, &self.second);
         b.reset();
         self.pass(&b.list, 9);
         b.close();
         c.reset();
-        self.rectangle(&c.list, [-0.3, -0.5, 1.1, 1.0], [1.0, 0.6, 0.8, 1.0], 0.4, 2);
+        self.rectangle(&c.list, [-0.3, -0.5, 1.1, 1.0], [1.0, 0.6, 0.8, 1.0], 0.4, 3);
         c.close();
         host.execute(&[b, c]);
-        // The third: a rectangle between the two, and the picture copied
-        // out.
+        // The third: the view the first one drew with replaced, a
+        // rectangle between the two, and the picture copied out.
         self.write_inputs(2);
+        self.view(2, &self.second);
         d.reset();
         self.pass(&d.list, 1);
-        self.rectangle(&d.list, [-0.6, -0.2, 1.5, 0.9], [0.7, 1.0, 0.5, 1.0], 0.5, 0);
+        self.rectangle(&d.list, [-0.6, -0.2, 1.5, 0.9], [0.7, 1.0, 0.5, 1.0], 0.5, 2);
         // SAFETY: an open list; live objects.
         unsafe {
             let l = &d.list;
@@ -646,7 +943,28 @@ impl Program {
         // SAFETY: the buffer's mapping; its passes have run.
         let results =
             unsafe { std::slice::from_raw_parts(self.results.1, WORDS * 4) }.to_vec();
-        Made { picture, results }
+        let others = self
+            .extras
+            .iter()
+            .map(|e| Other {
+                name: e.name.clone(),
+                subs: e
+                    .held
+                    .iter()
+                    .map(|r| Rows {
+                        pitch: r.pitch,
+                        rows: r.rows,
+                        row: r.row,
+                        bytes: r.bytes.clone(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        Made {
+            picture,
+            results,
+            others,
+        }
     }
 }
 

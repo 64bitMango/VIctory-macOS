@@ -22,9 +22,7 @@ use windows::core::Interface;
 
 use super::gpu::{self, Seen, Worker};
 use super::plain;
-use super::record::{
-    At, Heap, LEAD, Ours, Recorder, Res, WORLD_DRAWS, lock, not_recorded_calls, read,
-};
+use super::record::{Heap, Ours, Recorder, Res, WORLD_DRAWS, lock, not_recorded_calls, read};
 use super::states::{COMMON, COPY_SOURCE, Change, States};
 use super::wire::{
     self, ALL, Cmd, Content, Delta, Loc, MISSING, NONE, Place, Slot, Va, ZERO, slot,
@@ -42,8 +40,6 @@ const PIECE: u64 = 32 << 20;
 const PAGE: usize = 4096;
 /// What one thread compares at a time.
 const CHUNK: usize = 1 << 20;
-/// Frames waited, at the most, for one whose lists are all recorded.
-const PATIENCE: u64 = 100;
 
 #[derive(Default)]
 enum Stage {
@@ -175,37 +171,26 @@ pub(super) fn present(
     let mut finished = None;
     match &mut phase.stage {
         Stage::Waiting => {
-            // The frame asked for, and whether its lists are recorded from
-            // now on.
-            let (target, due) = match r.settings.at {
-                At::Seconds(s) => (0, r.began.elapsed().as_secs_f64() >= s),
-                At::Frame(f) => (f, presents + LEAD >= f),
-                At::World(k) => (world + k, world != 0 && presents + LEAD >= world + k),
-                At::Trigger => (0, false),
-            };
-            let by_file = !due && phase.seen % 16 == 0 && triggered(r);
-            if due || by_file {
+            let seconds = r.began.elapsed().as_secs_f64();
+            let asked = plain::due(r.settings.at, presents, world, seconds);
+            let by_file = asked.is_none() && phase.seen % 16 == 0 && triggered(r);
+            if let Some(target) = asked.or(by_file.then_some(0)) {
                 tracing::info!(
                     presents,
                     target,
-                    "frame recorder: lists are recorded from now on"
+                    "frame recorder: a frame is captured soon (lists are recorded from now on, if they were not)"
                 );
                 r.arm(true);
-                phase.stage = Stage::Armed(presents, if by_file { 0 } else { target });
+                phase.stage = Stage::Armed(presents, target);
             }
         }
         Stage::Armed(since, target) => {
-            let waited = presents - *since;
             let whole = submits > 0 && missing == 0;
-            if waited >= 2 && presents + 1 >= *target && (whole || waited > PATIENCE) {
+            if plain::captures_next(presents, *since, *target, whole) {
                 if !whole {
                     r.problem("no frame was found whose lists were all recorded");
                 }
-                tracing::info!(
-                    presents,
-                    waited,
-                    "frame recorder: the next frame is captured"
-                );
+                tracing::info!(presents, "frame recorder: the next frame is captured");
                 match Capture::new(r, presents + 1, world) {
                     Ok(c) => phase.stage = Stage::Capturing(Box::new(c)),
                     Err(e) => stop(r, &mut phase, &*e),
@@ -577,7 +562,7 @@ impl Capture {
             }
             let desc = gpu::to_desc(&res.desc);
             let (_, total) = gpu::footprints(&device, &desc, 0, res.subs);
-            if total == u64::MAX {
+            if total == u64::MAX || total == 0 {
                 r.problem("contents of a texture without a copyable layout are not in the capture");
             } else if total <= STAGING {
                 pieces.push(Piece {

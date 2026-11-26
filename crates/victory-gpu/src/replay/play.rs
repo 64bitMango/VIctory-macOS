@@ -212,19 +212,30 @@ impl Report {
                 "  by the GPU's timestamps: {frame:.2} ms from the first list's start to the last one's end; submissions {busy:.2} ms, copies standing for CPU writes {delta:.2} ms"
             );
         }
-        let _ = writeln!(
-            t,
-            "  by submission (lists: ms on the wall clock / by timestamps): {}",
-            {
-                let f = |v: Option<f64>| v.map_or("-".to_owned(), |v| format!("{v:.2}"));
+        let f = |v: Option<f64>| v.map_or("-".to_owned(), |v| format!("{v:.2}"));
+        if self.submits.iter().any(|s| s.2.is_some()) {
+            let _ = writeln!(
+                t,
+                "  by submission (lists: ms on the wall clock / by timestamps): {}",
                 self.submits
                     .iter()
                     .enumerate()
                     .map(|(i, (n, wall, stamp))| format!("{i} ({n}): {} / {}", f(*wall), f(*stamp)))
                     .collect::<Vec<_>>()
                     .join(", ")
-            }
-        );
+            );
+        } else if self.submits.iter().any(|s| s.1.is_some()) {
+            let _ = writeln!(
+                t,
+                "  by submission (lists: ms on the wall clock): {}",
+                self.submits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (n, wall, _))| format!("{i} ({n}): {}", f(*wall)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         if let Some(how) = self.detail {
             let _ = writeln!(t, "  commands timed {how}");
         }
@@ -1484,6 +1495,9 @@ impl Player {
             ));
         }
         self.versions = versions;
+        if let Some(first) = self.versions.first() {
+            self.write_live(first);
+        }
         // Render target and depth views.
         let mut views: [HashSet<Slot>; 2] = Default::default();
         for c in self.commands.iter().flatten() {
@@ -1663,10 +1677,16 @@ impl Player {
         }
     }
 
-    /// Brings the live heaps to version `to` of the views.
+    /// Brings the live heaps to version `to` of the views. (The first
+    /// version is the frame's start with the views that came into slots
+    /// nothing used before any view in use was replaced: lists sent before
+    /// them do not name those slots.)
     fn live_views(&mut self, to: usize) {
         if to < self.live_version {
             self.write_live(&self.first_views);
+            if let Some(first) = self.versions.first() {
+                self.write_live(first);
+            }
             self.live_version = 0;
         }
         for v in self.live_version + 1..=to.min(self.versions.len().saturating_sub(1)) {
@@ -2549,7 +2569,8 @@ impl Player {
         version: Option<usize>,
         mut stamp: Option<(&ID3D12QueryHeap, &mut u32)>,
     ) -> Vec<Stamp> {
-        let (mesh, dispatches) = self.kinds();
+        // What commands are counted by, where they are timed.
+        let kinds = stamp.is_some().then(|| self.kinds());
         let mut stamps = Vec::new();
         let mut bound = NONE;
         for c in cmds {
@@ -2560,10 +2581,13 @@ impl Player {
             // the player; commands the host recorded the same way.
             unsafe { self.command(list, c, version) };
             let timed = c.works() || matches!(c, Cmd::Barriers { .. });
-            if timed && let Some((heap, next)) = &mut stamp {
+            if timed
+                && let Some((heap, next)) = &mut stamp
+                && let Some((mesh, dispatches)) = &kinds
+            {
                 // SAFETY: as above.
                 unsafe { list.EndQuery(*heap, D3D12_QUERY_TYPE_TIMESTAMP, **next) };
-                let kind = edit::kind(c, &dispatches, &mesh, bound);
+                let kind = edit::kind(c, dispatches, mesh, bound);
                 let runs = match c {
                     c if c.runs_shaders() => bound,
                     // Copies to textures by what they go to.
@@ -3924,7 +3948,7 @@ mod tests {
         assert_eq!(r.median_ms(), 7.0);
         let text = r.text("unchanged");
         assert!(text.contains("unchanged: 7.00 ms"));
-        assert!(text.contains("0 (2): 1.50 / -"));
+        assert!(text.contains("by submission (lists: ms on the wall clock): 0 (2): 1.50"));
         assert!(text.contains("the same bytes"));
         assert!(text.contains("note: one"));
     }

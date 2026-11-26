@@ -38,65 +38,33 @@ pub struct Settings {
     pub at: At,
     /// Frames to capture.
     pub frames: u32,
-    /// Record lists from the start on, not only once a capture is near: for
-    /// a title that submits lists it recorded long before.
+    /// Record lists from the start on, not only once a capture is near: a
+    /// title may submit lists it recorded long before.
     pub always: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum At {
-    /// Seconds after the device was made.
-    Seconds(f64),
-    /// A number of presents.
-    Frame(u64),
-    /// A number of presents after the world's first frame (the first that
-    /// ran [`WORLD_DRAWS`] draws on the host), as `VICTORY_CAPTURE_WORLD`
-    /// counts them.
-    World(u64),
-    /// When a file named `go` appears in the folder (this works in the
-    /// other cases too).
-    Trigger,
-}
-
-/// The draws of the world's first frame, at the least (`crate::capture`).
-pub const WORLD_DRAWS: u64 = 500;
-
-/// Frames lists are recorded ahead of the frame asked for: the title
-/// records lists before the frame that submits them.
-pub(super) const LEAD: u64 = 4;
+pub use super::plain::{At, WORLD_DRAWS};
 
 impl Settings {
     /// From `VICTORY_RECORD`, `VICTORY_RECORD_AT` (seconds, `f<frame>`, or
     /// `w<frames after the world's first>`), `VICTORY_RECORD_FRAMES` and
-    /// `VICTORY_RECORD_ALWAYS=1`.
+    /// `VICTORY_RECORD_ALWAYS=0`.
     pub fn from_env() -> Option<Settings> {
         let folder = PathBuf::from(std::env::var_os("VICTORY_RECORD").filter(|v| !v.is_empty())?);
-        let at = parse_at(&std::env::var("VICTORY_RECORD_AT").unwrap_or_default());
+        let at = super::plain::parse_at(&std::env::var("VICTORY_RECORD_AT").unwrap_or_default());
         let frames = std::env::var("VICTORY_RECORD_FRAMES")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(1);
-        let always = std::env::var_os("VICTORY_RECORD_ALWAYS").is_some_and(|v| v == "1");
+        // From the start unless told otherwise: a capture that lacks a
+        // list costs a run of the title.
+        let always = std::env::var_os("VICTORY_RECORD_ALWAYS").is_none_or(|v| v != "0");
         Some(Settings {
             folder,
             at,
             frames: std::cmp::max(frames, 1),
             always,
         })
-    }
-}
-
-fn parse_at(text: &str) -> At {
-    let text = text.trim();
-    if let Some(frame) = text.strip_prefix('f').and_then(|n| n.parse().ok()) {
-        return At::Frame(frame);
-    }
-    if let Some(frame) = text.strip_prefix('w').and_then(|n| n.parse().ok()) {
-        return At::World(frame);
-    }
-    match text.parse::<f64>() {
-        Ok(s) => At::Seconds(s),
-        Err(_) => At::Trigger,
     }
 }
 
@@ -2956,15 +2924,6 @@ const _: () = assert!(ALL == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn when_to_record() {
-        assert_eq!(parse_at("120"), At::Seconds(120.0));
-        assert_eq!(parse_at(" 1.5 "), At::Seconds(1.5));
-        assert_eq!(parse_at("f900"), At::Frame(900));
-        assert_eq!(parse_at(""), At::Trigger);
-        assert_eq!(parse_at("later"), At::Trigger);
-    }
 
     #[test]
     fn descriptor_heaps_are_found_by_address() {

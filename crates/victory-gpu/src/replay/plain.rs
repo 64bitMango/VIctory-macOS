@@ -39,6 +39,72 @@ pub(super) fn page_hash(bytes: &[u8]) -> u64 {
     h
 }
 
+/// When a frame is captured.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum At {
+    /// Seconds after the device was made.
+    Seconds(f64),
+    /// The frame of a number of presents.
+    Frame(u64),
+    /// The frame a number of presents after the world's first frame (the
+    /// first that ran [`WORLD_DRAWS`] draws on the host), as
+    /// `VICTORY_CAPTURE_WORLD` counts them.
+    World(u64),
+    /// When a file named `go` appears in the folder (this works in the
+    /// other cases too).
+    Trigger,
+}
+
+/// The draws of the world's first frame, at the least (`crate::capture`).
+pub const WORLD_DRAWS: u64 = 500;
+
+/// Frames before the frame asked for from which a capture is prepared (and
+/// lists are recorded, where they are not from the start): a title records
+/// lists ahead of the frame that submits them.
+pub(super) const LEAD: u64 = 8;
+
+/// Frames waited after the frame asked for, at the most, for one whose
+/// predecessor's lists were all recorded.
+pub(super) const PATIENCE: u64 = 4;
+
+/// `VICTORY_RECORD_AT`: seconds, `f<frame>`, or `w<frames after the
+/// world's first>`; anything else waits for the file.
+pub(super) fn parse_at(text: &str) -> At {
+    let text = text.trim();
+    if let Some(frame) = text.strip_prefix('f').and_then(|n| n.parse().ok()) {
+        return At::Frame(frame);
+    }
+    if let Some(frame) = text.strip_prefix('w').and_then(|n| n.parse().ok()) {
+        return At::World(frame);
+    }
+    match text.parse::<f64>() {
+        Ok(s) => At::Seconds(s),
+        Err(_) => At::Trigger,
+    }
+}
+
+/// Whether a capture is prepared from present `presents` on, `seconds`
+/// after the device was made, the world's first frame being `world` (0: not
+/// seen yet): the frame asked for (0: the first that can be captured).
+pub(super) fn due(at: At, presents: u64, world: u64, seconds: f64) -> Option<u64> {
+    match at {
+        At::Seconds(s) => (seconds >= s).then_some(0),
+        At::Frame(f) => (presents + LEAD >= f).then_some(f),
+        At::World(k) => (world != 0 && presents + LEAD >= world + k).then_some(world + k),
+        At::Trigger => None,
+    }
+}
+
+/// Whether the frame after present `presents` is the one captured: the
+/// capture is prepared since present `since`, `target` is the frame asked
+/// for (0: none), and `whole` says whether all lists of the frame just
+/// presented were recorded.
+pub(super) fn captures_next(presents: u64, since: u64, target: u64, whole: bool) -> bool {
+    // Two frames of lists at the least, and not before the frame asked for.
+    let first = target.max(since + 3);
+    presents + 1 >= first && (whole || presents + 1 >= first + PATIENCE)
+}
+
 /// The middle one of `v` in order (the upper of two); 0 of none.
 pub(super) fn median(v: &[f64]) -> f64 {
     let mut v = v.to_vec();
@@ -171,6 +237,54 @@ mod tests {
         assert!(rgb(2, 2, 8, 28, &[0; 12]).is_none(), "too few rows");
         assert_eq!(psnr(&[1, 2], &[1, 2]), f64::INFINITY);
         assert!((psnr(&[0; 4], &[255; 4])).abs() < 1e-9);
+    }
+
+    #[test]
+    fn when_to_record() {
+        assert_eq!(parse_at("120"), At::Seconds(120.0));
+        assert_eq!(parse_at(" 1.5 "), At::Seconds(1.5));
+        assert_eq!(parse_at("f900"), At::Frame(900));
+        assert_eq!(parse_at("w70"), At::World(70));
+        assert_eq!(parse_at(""), At::Trigger);
+        assert_eq!(parse_at("later"), At::Trigger);
+        assert_eq!(parse_at("w"), At::Trigger);
+    }
+
+    #[test]
+    fn the_frame_asked_for_is_the_one_captured() {
+        // 70 frames after the world's first frame, 1164: frame 1234.
+        let at = At::World(70);
+        assert_eq!(due(at, 5000, 0, 9.0), None, "the world's first frame was not seen");
+        assert_eq!(due(at, 1164, 1164, 9.0), None);
+        assert_eq!(due(at, 1234 - LEAD - 1, 1164, 9.0), None);
+        let since = 1234 - LEAD;
+        assert_eq!(due(at, since, 1164, 9.0), Some(1234));
+        // Decided at the present before it.
+        for presents in since..1233 {
+            assert!(!captures_next(presents, since, 1234, true), "{presents}");
+        }
+        assert!(captures_next(1233, since, 1234, true));
+        // A frame with lists that were not recorded puts it off, for so
+        // many frames.
+        for presents in 1233..1233 + PATIENCE {
+            assert!(!captures_next(presents, since, 1234, false), "{presents}");
+            assert!(captures_next(presents, since, 1234, true), "{presents}");
+        }
+        assert!(captures_next(1233 + PATIENCE, since, 1234, false));
+        // By frame number; one that is past, or nearly, as soon as two
+        // frames of lists are there.
+        assert_eq!(due(At::Frame(900), 900 - LEAD, 0, 0.0), Some(900));
+        assert_eq!(due(At::Frame(3), 1, 0, 0.0), Some(3));
+        assert!(!captures_next(2, 1, 3, true));
+        assert!(captures_next(3, 1, 3, true));
+        // By time and by the file: the first frame that can be.
+        assert_eq!(due(At::Seconds(5.0), 7, 0, 4.9), None);
+        assert_eq!(due(At::Seconds(5.0), 7, 0, 5.0), Some(0));
+        assert_eq!(due(At::Trigger, 7, 3, 99.0), None);
+        assert!(!captures_next(8, 7, 0, true));
+        assert!(captures_next(9, 7, 0, true));
+        assert!(!captures_next(9 + PATIENCE - 1, 7, 0, false));
+        assert!(captures_next(9 + PATIENCE, 7, 0, false));
     }
 
     #[test]
