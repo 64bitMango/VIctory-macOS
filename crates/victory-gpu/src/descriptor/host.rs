@@ -76,6 +76,11 @@ pub(crate) struct HostHeap {
     held: Box<[AtomicU64]>,
     /// The slots' locks ([`HostHeap::lock_slot`]).
     locks: Box<[Stripe]>,
+    /// Whether slots have locks by run and are looked at without one
+    /// ([`slot_locks`]), and whether a sync makes a run's slots under one
+    /// hold ([`sync_runs`]), as they were when the heap was made: every
+    /// thread takes the same lock for a slot.
+    by_run: [bool; 2],
     /// Diagnostics, per title slot: the frame (plus 1) a draw last read it
     /// through a table, and a heap sync last made it null for a record that
     /// names no view.
@@ -408,6 +413,7 @@ impl HostHeap {
             made: zeroed(count as usize),
             held: zeroed((count as usize).div_ceil(64)),
             locks: (0..STRIPES).map(|_| Stripe::default()).collect(),
+            by_run: [slot_locks(), sync_runs()],
             #[cfg(feature = "diagnostics")]
             noted: [zeroed32(count as usize), zeroed32(count as usize)],
             kept: Mutex::new(Paged::new((count + extra) as usize)),
@@ -934,7 +940,7 @@ impl HostHeap {
                 }
             }
         };
-        if !sync_runs() {
+        if !self.by_run[1] {
             for i in stale {
                 made(&self.mirror(i, at(i), false));
             }
@@ -1060,7 +1066,7 @@ impl HostHeap {
     /// The lock of slot `index` ([`HostHeap::made`]), for a draw or not
     /// (diagnostics: the wait is counted by who waited and who held it).
     fn lock_slot(&self, index: u32, _for_draw: bool) -> std::sync::MutexGuard<'_, ()> {
-        let stripe = &self.locks[if slot_locks() { (index / RUN) as usize % STRIPES } else { 0 }];
+        let stripe = &self.locks[if self.by_run[0] { (index / RUN) as usize % STRIPES } else { 0 }];
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -1168,7 +1174,7 @@ impl HostHeap {
         if for_draw && !crate::contend::in_sync() {
             self.noted[0][index as usize].store(crate::frame::current() as u32 + 1, Relaxed);
         }
-        if slot_locks()
+        if self.by_run[0]
             && let Some(found) = self.made_already(index, handle, for_draw)
         {
             #[cfg(feature = "diagnostics")]
@@ -2406,9 +2412,9 @@ pub(crate) mod tests {
     }
 
     thread_local! {
-        /// This thread takes one lock for all of a heap's slots, for every
-        /// look and each slot a sync makes (as `VICTORY_SLOT_LOCKS=0` and
-        /// `VICTORY_SYNC_RUNS=0`).
+        /// Heaps made on this thread have one lock for all their slots, taken
+        /// for every look and each slot a sync makes (as
+        /// `VICTORY_SLOT_LOCKS=0` and `VICTORY_SYNC_RUNS=0`).
         pub(crate) static ONE_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// This thread leaves the null view of a slot that shows nothing (as
         /// `VICTORY_NULL_ONCE=1`).

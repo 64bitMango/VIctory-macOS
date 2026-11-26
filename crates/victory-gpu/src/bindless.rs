@@ -70,6 +70,9 @@ const KINDS: [&str; 4] = ["buffer", "unordered buffer", "placed texture", "other
 pub(crate) struct Viewed {
     slots: Box<[Part<crate::quick::Map<u32, Seen>>]>,
     counts: Box<[Part<Inner>]>,
+    /// Whether it is kept in parts ([`in_parts`] when it was made): every
+    /// thread finds a slot or a copy in the same part.
+    parts: bool,
 }
 
 /// Parts of each kind to a heap ([`Viewed`]).
@@ -94,6 +97,7 @@ impl Default for Viewed {
         Self {
             slots: (0..PARTS).map(|_| Part::default()).collect(),
             counts: (0..PARTS).map(|_| Part::default()).collect(),
+            parts: in_parts(),
         }
     }
 }
@@ -231,7 +235,7 @@ impl Viewed {
 
     /// The part slot `index`'s entry is in.
     fn slots_part(&self, index: u32) -> usize {
-        if in_parts() { (index / RUN) as usize % PARTS } else { 0 }
+        if self.parts { (index / RUN) as usize % PARTS } else { 0 }
     }
 
     /// The part the counts of what `seen` names are in, if it is counted.
@@ -246,13 +250,13 @@ impl Viewed {
     /// The counts part of the copy or texture at `address`.
     fn part_of(&self, address: usize) -> usize {
         use std::hash::BuildHasher;
-        if in_parts() { crate::quick::Build.hash_one(address) as usize % PARTS } else { 0 }
+        if self.parts { crate::quick::Build.hash_one(address) as usize % PARTS } else { 0 }
     }
 
     /// With one part of each: every slot held off until dropped, as a
     /// reader of the one lock held them off.
     fn hold(&self) -> Option<std::sync::MutexGuard<'_, crate::quick::Map<u32, Seen>>> {
-        (!in_parts()).then(|| self.slots[0].lock())
+        (!self.parts).then(|| self.slots[0].lock())
     }
 
     /// How many title slots hold a view (tests).
@@ -601,8 +605,8 @@ pub(crate) mod tests {
     use crate::object::{HRESULT, S_OK};
 
     thread_local! {
-        /// This thread keeps what heaps' slots view in one part (as
-        /// `VICTORY_VIEWED_PARTS=0`).
+        /// What heaps made on this thread have their slots view is kept in
+        /// one part (as `VICTORY_VIEWED_PARTS=0`).
         pub(crate) static ONE_PART: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 

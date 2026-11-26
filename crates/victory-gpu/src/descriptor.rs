@@ -1647,7 +1647,11 @@ pub(crate) mod tests {
             Placement { address: 0, size: 0 },
         );
         let start = heap(title.0).start;
-        let Some(host) = heap(title.0).host() else { return };
+        // The heap's locks are as this thread has them when it is made.
+        host::tests::ONE_LOCK.with(|one| one.set(one_lock));
+        let host = heap(title.0).host();
+        host::tests::ONE_LOCK.with(|one| one.set(false));
+        let Some(host) = host else { return };
         let textures = vec![0u8; 16 << 12];
         let textures_at = textures.as_ptr() as u64;
         for round in 0..400u64 {
