@@ -401,7 +401,7 @@ mod tests {
         let mut file = MAGIC.to_vec();
         file.extend_from_slice(&[1, 2, 3, 4]);
         file.extend(record_bytes(
-            "a title shader",
+            "vs_blit_0011aabb",
             0x32,
             b"first container",
         ));
@@ -412,7 +412,7 @@ mod tests {
         assert!(is_sgd5(&file));
         let found = records(&file);
         assert_eq!(found.len(), 2);
-        assert_eq!(found[0].name, Some("a title shader"));
+        assert_eq!(found[0].name, Some("vs_blit_0011aabb"));
         assert_eq!(found[0].kind, 0x32);
         assert_eq!(found[0].unpack().as_deref(), Some(&b"first container"[..]));
         assert_eq!(found[1].name, Some(long.as_str()));

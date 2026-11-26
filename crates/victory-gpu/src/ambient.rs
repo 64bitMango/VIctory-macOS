@@ -27,8 +27,8 @@ use windows::core::s;
 use crate::host::{HostList, host};
 use crate::object::This;
 
-/// The programs it follows, by the start of their name.
-pub(crate) const PROGRAM: &[u8] = b"a title shader";
+/// The programs it follows are named by `VICTORY_HOOK_AMBIENT`
+/// ([`crate::pipeline::Hook`]).
 /// Where they write the indirect diffuse light (R9G9B9E5 as 32-bit
 /// integers): root parameter and place in its table.
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
@@ -92,8 +92,8 @@ static LIVE: std::sync::Mutex<Option<(f32, [f32; 3])>> = std::sync::Mutex::new(N
 /// surface is glossy: indoors a wooden floor, a counter and glass tops wore
 /// a white glaze five to ten times brighter than anything in the room (the
 /// fork's run ciel1, 2026-11-25; it did not move with the ambient level).
-/// They are held to a part of the light around ([`keep`]).
-pub(crate) const REFLECTED: &[u8] = b"a title shader";
+/// They are held to a part of the light around ([`keep`]). The program is
+/// named by `VICTORY_HOOK_REFLECTED` ([`crate::pipeline::Hook`]).
 pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
 
 /// The most a reflection may hold, as a part of the ambient light's level:
@@ -122,9 +122,9 @@ fn keep() -> f32 {
     })
 }
 
-/// The program that draws the sky as the title reflects it, by the start of
-/// its name: a small image of the whole sky, in the light's own units.
-pub(crate) const SKY: &[u8] = b"a title shader";
+/// The program that draws the sky as the title reflects it, named by
+/// `VICTORY_HOOK_SKY` ([`crate::pipeline::Hook`]): a small image of the whole
+/// sky, in the light's own units.
 
 type Copy = std::sync::Arc<crate::resource::HostTexture>;
 

@@ -71,11 +71,11 @@ pub(crate) struct Shader {
     /// Its result gets the least indirect light ([`crate::ambient`]).
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
-    /// It draws the sky as the title reflects it ([`crate::ambient::SKY`]).
+    /// It draws the sky as the title reflects it (`VICTORY_HOOK_SKY`).
     #[cfg(windows)]
     pub(crate) draws_sky: bool,
     /// It writes the title's reflections for the last time in a frame
-    /// ([`crate::ambient::REFLECTED`]).
+    /// (`VICTORY_HOOK_REFLECTED`).
     #[cfg(windows)]
     pub(crate) ends_reflections: bool,
     /// It serves rays that do not run ([`activates_rays`]).
@@ -119,17 +119,11 @@ impl Shader {
             #[cfg(any(windows, test))]
             container: Mutex::new(bytes.to_vec()),
             #[cfg(windows)]
-            resolves_light: bytes
-                .windows(crate::ambient::PROGRAM.len())
-                .any(|w| w == crate::ambient::PROGRAM),
+            resolves_light: names(bytes, hook(Hook::Ambient)),
             #[cfg(windows)]
-            draws_sky: bytes
-                .windows(crate::ambient::SKY.len())
-                .any(|w| w == crate::ambient::SKY),
+            draws_sky: names(bytes, hook(Hook::Sky)),
             #[cfg(windows)]
-            ends_reflections: bytes
-                .windows(crate::ambient::REFLECTED.len())
-                .any(|w| w == crate::ambient::REFLECTED),
+            ends_reflections: names(bytes, hook(Hook::Reflected)),
             #[cfg(windows)]
             activates_rays: activates_rays(bytes),
             #[cfg(windows)]
@@ -425,8 +419,47 @@ fn bvh_builds() -> bool {
     })
 }
 
+/// Programs of the running title that some workarounds recognise, by a name
+/// in their container. The names come from the user's own title profile in
+/// the environment and are never kept in this repository
+/// (docs/asset-policy.md); one left unset leaves its workaround off.
+/// - `VICTORY_HOOK_AMBIENT`: the program whose result the ambient stand-in
+///   replaces ([`crate::ambient`]).
+/// - `VICTORY_HOOK_REFLECTED`: the program that writes the title's
+///   reflections for the last time in a frame.
+/// - `VICTORY_HOOK_SKY`: the program that draws the sky as the title
+///   reflects it.
+/// - `VICTORY_HOOK_RAYS`: the program that turns the title's ray tracing on,
+///   left out with the structure builds ([`activates_rays`]).
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy)]
+pub(crate) enum Hook {
+    Ambient,
+    Reflected,
+    Sky,
+    Rays,
+}
+
+/// The name [`Hook`] `which` is given, read once; empty when unset.
+#[cfg(any(windows, test))]
+pub(crate) fn hook(which: Hook) -> &'static [u8] {
+    static NAMES: std::sync::OnceLock<[Vec<u8>; 4]> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        ["VICTORY_HOOK_AMBIENT", "VICTORY_HOOK_REFLECTED", "VICTORY_HOOK_SKY", "VICTORY_HOOK_RAYS"]
+            .map(|var| std::env::var(var).unwrap_or_default().trim().as_bytes().to_vec())
+    });
+    &names[which as usize]
+}
+
+/// Whether `bytes` holds `name` (never, for an empty name).
+#[cfg(any(windows, test))]
+pub(crate) fn names(bytes: &[u8], name: &[u8]) -> bool {
+    !name.is_empty() && bytes.windows(name.len()).any(|w| w == name)
+}
+
 /// Whether a container's program only makes sense with the title's rays:
-/// the one that tells the screen probes which rays to trace, by its name.
+/// the one that tells the screen probes which rays to trace, by its name
+/// (`VICTORY_HOOK_RAYS`).
 /// shortcut: left out with the structure builds (`VICTORY_BVH_BUILDS=0`),
 /// which stand for "no rays" here as an unset `VICTORY_RAYS` does on the
 /// Belobug fork. There, once it ran with no rays behind it, the whole
@@ -434,8 +467,7 @@ fn bvh_builds() -> bool {
 /// sans39, 2026-11-25).
 #[cfg(any(windows, test))]
 fn activates_rays(container: &[u8]) -> bool {
-    const NAME: &[u8] = b"a title shader";
-    container.windows(NAME.len()).any(|w| w == NAME)
+    names(container, hook(Hook::Rays))
 }
 
 /// Whether `this` is one of the title's BVH builder programs, or the one
@@ -868,10 +900,13 @@ pub fn wanted_early(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn the_ray_activation_is_known_by_its_name() {
-        assert!(super::activates_rays(b"DXBC....a title shader\0main"));
-        assert!(!super::activates_rays(b"DXBC....a title shader\0main"));
-        assert!(!super::activates_rays(b"a title shader"));
+    fn a_hooked_program_is_known_by_its_name() {
+        let name: &[u8] = b"Example_Probes_Activate";
+        assert!(super::names(b"DXBC....Example_Probes_Activate_0\0main", name));
+        assert!(!super::names(b"DXBC....Example_Probes_Resolve_0\0main", name));
+        assert!(!super::names(b"Example_Probes_Act", name));
+        // An unset hook names nothing.
+        assert!(!super::names(b"DXBC....Example_Probes_Activate_0\0main", b""));
     }
 
     #[cfg(all(windows, feature = "diagnostics"))]
