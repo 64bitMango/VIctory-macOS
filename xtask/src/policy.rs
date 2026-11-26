@@ -10,7 +10,9 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-const MAX_FILE_SIZE: usize = 512 * 1024;
+// 1 MiB: the shader translator's hand-written `emit/lower.rs` passed 512 KiB
+// (629 KB, 2026-11-25). Splitting it waits until no open branch edits it.
+const MAX_FILE_SIZE: usize = 1024 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
