@@ -1,59 +1,79 @@
 //! The copy side of the checker of `crate::unwaited`
 //! (`VICTORY_UNWAITED_CHECK=1`; `docs/unwaited.md` 10, rules C3 and C4),
-//! which runs with submissions waited for or not.
+//! which runs with submissions waited for or not. It keeps no bytes of its
+//! own: what a range held before its submission is what the copy-back
+//! itself compares with.
 //!
-//! C3, a copy-back over a title write. When shaders are declared to write a
-//! range, the checker keeps the copy's bytes and title memory's there. At
-//! the copy-back, where the copy has changed (the shaders wrote: nothing
-//! else writes a copy while its submission runs, rule C1) and title memory
-//! has changed too, to something else than what is about to be written, the
-//! copy-back is about to undo a title write. Unmarked ranges are kept
-//! whole. Of marked ranges only the pages shaders marked in the last
-//! [`RECENT`] submissions are kept (the ranges are the views' whole reach,
-//! a gigabyte in the world; the pages written repeat from frame to frame);
-//! pages marked for the first time in a while are counted as unchecked.
+//! C3, a copy-back over a title write: a byte the shaders changed in the
+//! copy (it differs from what the copy held before; nothing else writes a
+//! copy while its submission runs, rule C1) that the title changed too, to
+//! something else than what is about to be written.
+//! - Unmarked declared ranges: "before" is the copy's snapshot. Only pages
+//!   the title wrote since the copy took them can hold a title write, and
+//!   only where the copy held title memory's bytes at the declaration (the
+//!   page was unchanged then, or a refresh under the range took it since)
+//!   is the snapshot also what title memory held: those pages are read and
+//!   compared, the others counted as unchecked.
+//! - Marked pages: a page the title wrote while armed has its bytes from
+//!   before that write saved by the tracker; they are "before". A page the
+//!   title did not write has no title write to undo.
 //!
 //! C4, the trackers' word. The copy-back of a marked page the title has not
 //! written since the copy took it writes every byte in which the copy
 //! differs from title memory. So "unchanged since taken" must mean "title
-//! memory equals the copy" there: checked when such a page is kept before
-//! its submission, and when a copy-back (or, with
-//! `VICTORY_UNWAITED_CHECK_REFRESH=1`, a refresh) has just taken pages.
-//! A title write that races the check has set "changed" before it lands
-//! (the page is guarded first), so a difference with "unchanged" still
-//! standing is a title write the copy never saw.
+//! memory equals the copy" there. Checked where it is made so (every page a
+//! copy-back takes and reads again; with `VICTORY_UNWAITED_CHECK_REFRESH=1`
+//! every page a refresh takes) and where it is relied on: a page shaders
+//! marked in the last [`RECENT`] submissions is read and compared when it
+//! is declared again, once per taking and again every [`AGAIN`]
+//! submissions (each of a frame's twenty submissions declares the same
+//! pages: all of them every time read gigabytes a frame). A title write
+//! that races the check has set "changed" before it lands (the page is
+//! guarded first), so a difference with "unchanged" still standing is a
+//! title write the copy never saw.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use super::*;
 use crate::unwaited::{C, add, violation};
 
-/// Submissions a page stays "marked lately" for.
+/// Submissions a page stays "marked lately" for, and a page found equal to
+/// title memory is taken as equal for (unless it is taken again first).
 const RECENT: u64 = 256;
+const AGAIN: u64 = 64;
 
 /// What the checker keeps of a copy from its declarations to its copy-back.
 #[derive(Default)]
 struct Kept {
-    /// Unmarked declared ranges, apart: offset in the copy, the copy's
-    /// bytes before, title memory's before.
-    regions: Vec<(usize, Vec<u8>, Vec<u8>)>,
+    /// The unmarked declared ranges, as offsets in the copy.
     covered: crate::ranges::Ranges,
-    /// Marked pages (by address): title memory's bytes before, cut to the
-    /// copy.
-    pages: HashMap<usize, Vec<u8>>,
+    /// Pages (by address) of them where the snapshot is also what title
+    /// memory held.
+    judged: HashSet<usize>,
 }
 
 /// By copy (its address: held by its lists until the copy-back).
 static KEPT: Mutex<Option<HashMap<usize, Kept>>> = Mutex::new(None);
 /// Pages shaders marked lately (by address), and the submission they did.
 static MARKED: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+/// Pages found equal to title memory while unchanged (by address), and the
+/// submission that found them so; taken out when taken again.
+static EQUAL: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
 static SUBMISSION: AtomicU64 = AtomicU64::new(0);
 /// Pages (by address) whose copies hold what shaders wrote and a submission
 /// withheld from title memory (`crate::memory::drop_withheld`), and when:
 /// there the copy differs from title memory by intent, for a while.
 static WITHHELD: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+
+fn kept() -> std::sync::MutexGuard<'static, Option<HashMap<usize, Kept>>> {
+    KEPT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn equal() -> std::sync::MutexGuard<'static, BTreeMap<usize, u64>> {
+    EQUAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// `[address, address + len)` was withheld: not judged for a while.
 pub(crate) fn exempt(address: usize, len: usize) {
@@ -69,24 +89,25 @@ fn exempted(page: usize) -> bool {
     WITHHELD.lock().unwrap_or_else(|e| e.into_inner()).get(&page).is_some_and(|&when| when >= oldest)
 }
 
-fn kept() -> std::sync::MutexGuard<'static, Option<HashMap<usize, Kept>>> {
-    KEPT.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// Title memory `[at, at + n)`, if all of it can be read.
 fn title(at: usize, n: usize) -> Option<Vec<u8>> {
     let mut bytes = vec![0u8; n];
     crate::host::read_into(at as *const u8, &mut bytes).then_some(bytes)
 }
 
-/// The first byte where the copy changed (`host` against `before`) and
-/// title memory changed too (`now` against `was`) to something else than
-/// the copy's byte: its offset.
-fn undone(host: &[u8], before: &[u8], now: &[u8], was: &[u8]) -> Option<usize> {
-    if now == was || host == before {
+/// The first byte the shaders changed (`host` against `before`) that the
+/// title changed too (`now` against `before`, which title memory held as
+/// well) to something else than the copy's byte: its offset.
+fn undone(host: &[u8], before: &[u8], now: &[u8]) -> Option<usize> {
+    if now == before || host == before {
         return None;
     }
-    (0..host.len()).find(|&i| host[i] != before[i] && now[i] != was[i] && now[i] != host[i])
+    (0..host.len()).find(|&i| host[i] != before[i] && now[i] != before[i] && now[i] != host[i])
+}
+
+/// The 64 KiB pages (by address) title memory `[from, to)` touches.
+fn pages_of(from: usize, to: usize) -> impl Iterator<Item = usize> {
+    (from / PAGE * PAGE..to).step_by(PAGE)
 }
 
 impl Shadow {
@@ -98,8 +119,8 @@ impl Shadow {
     }
 
     /// Whether the tracker stands for "title memory equals the copy" in the
-    /// 64 KiB page at `page`: it is tracked whole, not written since it was
-    /// taken and not left open.
+    /// 64 KiB page at `page`: the copy holds it whole, it is tracked whole,
+    /// not written since it was taken, not left open, nothing withheld.
     fn check_stands(&self, page: usize) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         page >= start
@@ -110,43 +131,13 @@ impl Shadow {
             && !exempted(page)
     }
 
-    /// A refresh under a range declared written (`Shadow::update_busy`)
-    /// brought title memory `[from, to)` into the copy: what the checker
-    /// keeps there is the copy's bytes now, as the snapshot's are.
-    pub(super) fn check_patched(&self, from: usize, to: usize) {
-        let _cost = crate::unwaited::checked();
-        let start = self.start as usize;
-        let (from, to) = (from.max(start), to.min(start + self.len as usize));
-        if from >= to {
-            return;
-        }
-        let mut all = kept();
-        let Some(kept) = all.as_mut().and_then(|k| k.get_mut(&(self as *const Shadow as usize))) else {
-            return;
-        };
-        let (a, b) = (from - start, to - start);
-        for (at, before, was) in kept.regions.iter_mut() {
-            let (s, e) = ((*at).max(a), (*at + before.len()).min(b));
-            if s < e {
-                let host = self.check_host(s, e);
-                before[s - *at..e - *at].copy_from_slice(host);
-                was[s - *at..e - *at].copy_from_slice(host);
-            }
-        }
-        for (&page, was) in kept.pages.iter_mut() {
-            let (s, e) = (page.max(from), (page + was.len()).min(to));
-            if s < e {
-                was[s - page..e - page].copy_from_slice(self.check_host(s - start, e - start));
-            }
-        }
-    }
-
     /// C4 for the whole pages in title memory `[from, to)`: where the
     /// tracker says unchanged, title memory equals the copy. `when` says
     /// what has just relied on it or made it so.
     pub(super) fn check_equal(&self, from: usize, to: usize, when: &str) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start).next_multiple_of(PAGE), to.min(end) / PAGE * PAGE);
+        let now_is = SUBMISSION.load(Relaxed);
         let mut page = from;
         while page < to {
             if self.check_stands(page)
@@ -154,7 +145,9 @@ impl Shadow {
             {
                 add(C::CheckBytes, PAGE as u64);
                 let host = self.check_host(page - start, page - start + PAGE);
-                if now != host && self.check_stands(page) {
+                if now == host {
+                    equal().insert(page, now_is);
+                } else if self.check_stands(page) {
                     let i = (0..PAGE).find(|&i| now[i] != host[i]).unwrap_or(0);
                     violation(
                         "C4",
@@ -172,9 +165,26 @@ impl Shadow {
         }
     }
 
+    /// A refresh took the pages of title memory `[from, to)` again: whether
+    /// they equal the copy is to be found anew, and under a range declared
+    /// written (`under`, from `Shadow::update_busy`, which brings the same
+    /// bytes into the snapshot) the snapshot is what title memory held.
+    pub(super) fn check_retaken(&self, from: usize, to: usize, under: bool) {
+        let whole = (from.next_multiple_of(PAGE)..to / PAGE * PAGE).step_by(PAGE);
+        {
+            let mut equal = equal();
+            for page in whole.clone() {
+                equal.remove(&page);
+            }
+        }
+        if under && let Some(kept) = kept().as_mut().and_then(|k| k.get_mut(&(self as *const Shadow as usize))) {
+            kept.judged.extend(whole);
+        }
+    }
+
     /// At a declaration (`Shadow::writing`, after the range's refresh):
-    /// keeps what C3 compares at the copy-back, and checks C4 for the
-    /// marked pages kept.
+    /// notes what C3 judges at the copy-back, and checks C4 for the pages
+    /// of a marked range that shaders marked lately.
     pub(super) fn check_declared(&self, address: usize, len: usize, marked: bool) {
         let _cost = crate::unwaited::checked();
         let start = self.start as usize;
@@ -182,88 +192,65 @@ impl Shadow {
         if from >= to {
             return;
         }
-        let mut all = kept();
-        let kept = all.get_or_insert_with(HashMap::new).entry(self as *const Shadow as usize).or_default();
         if !(marked && self.tracked.is_some()) {
+            let mut all = kept();
+            let kept = all.get_or_insert_with(HashMap::new).entry(self as *const Shadow as usize).or_default();
             for (a, b) in kept.covered.missing(from, to) {
-                match title(start + a, b - a) {
-                    Some(was) => {
-                        add(C::CheckBytes, 2 * (b - a) as u64);
-                        kept.regions.push((a, self.check_host(a, b).to_vec(), was));
-                    }
-                    None => add(C::Unchecked, 1),
-                }
+                kept.judged.extend(pages_of(start + a, start + b).filter(|&page| self.check_stands(page)));
                 kept.covered.insert(a, b, 0);
             }
             return;
         }
-        // The pages of the range marked lately.
-        let oldest = SUBMISSION.load(Relaxed).saturating_sub(RECENT);
+        let now_is = SUBMISSION.load(Relaxed);
         let lately: Vec<usize> = {
             let marks = MARKED.lock().unwrap_or_else(|e| e.into_inner());
+            let equal = equal();
             marks
                 .range((start + from) / PAGE * PAGE..start + to)
-                .filter(|&(_, &when)| when >= oldest)
+                .filter(|&(page, &when)| {
+                    when + RECENT >= now_is && equal.get(page).is_none_or(|&found| found + AGAIN < now_is)
+                })
                 .map(|(&page, _)| page)
                 .collect()
         };
         for page in lately {
-            if kept.pages.contains_key(&page) || !self.check_stands(page) {
-                continue;
-            }
-            let (a, b) = (page.max(start), (page + PAGE).min(start + self.len as usize));
-            let Some(was) = title(a, b - a) else { continue };
-            add(C::CheckBytes, (b - a) as u64);
-            let host = self.check_host(a - start, b - start);
-            if was != host && self.check_stands(page) {
-                let i = (0..was.len()).find(|&i| was[i] != host[i]).unwrap_or(0);
-                violation(
-                    "C4",
-                    format_args!(
-                        "before a submission whose shaders may write it: the page at {page:#x} of copy {start:#x}+{:#x} is unchanged since taken by its tracker, but title memory differs from the copy, first at {:#x} (title {:02x?}, copy {:02x?})",
-                        self.len,
-                        a + i,
-                        &was[i..(i + 8).min(was.len())],
-                        &host[i..(i + 8).min(host.len())]
-                    ),
-                );
-                continue;
-            }
-            kept.pages.insert(page, was);
+            self.check_equal(page, page + PAGE, "before a submission whose shaders may write it");
         }
     }
 }
 
 /// Before the copy-back of the pages shaders marked (per copy, by address):
-/// C3 for those kept, and all of them are marked lately from now on.
+/// C3 for those the title wrote while they were armed, and all of them are
+/// marked lately from now on.
 pub(super) fn marked(by_copy: &[(Arc<Shadow>, Vec<usize>)]) {
     let _cost = crate::unwaited::checked();
     let now_is = SUBMISSION.load(Relaxed);
-    let mut all = kept();
     let mut marks = MARKED.lock().unwrap_or_else(|e| e.into_inner());
     for (copy, pages) in by_copy {
-        let start = copy.start as usize;
-        let mut kept = all.as_mut().and_then(|k| k.get_mut(&(Arc::as_ptr(copy) as usize)));
+        let (start, end) = (copy.start as usize, (copy.start + copy.len) as usize);
         for &page in pages {
             marks.insert(page, now_is);
-            let Some(was) = kept.as_mut().and_then(|k| k.pages.remove(&page)) else {
-                add(C::Unchecked, 1);
+            let Some(t) = &copy.tracked else { continue };
+            let Some(saved) = t.saved_peek(page / PAGE) else {
+                // Unchanged: no title write to undo. Changed and not armed:
+                // the title's bytes are kept.
                 continue;
             };
-            let a = page.max(start);
-            let Some(now) = title(a, was.len()) else { continue };
-            add(C::CheckBytes, 2 * was.len() as u64);
-            let host = copy.check_host(a - start, a - start + was.len());
-            // The page held title memory's bytes before (C4, checked when
-            // it was kept): they are the copy's before as well.
-            if let Some(i) = undone(host, &was, &now, &was) {
+            let (a, b) = (page.max(start), (page + PAGE).min(end));
+            if a >= b || saved.len() < b - page {
+                continue;
+            }
+            let Some(now) = title(a, b - a) else { continue };
+            add(C::CheckBytes, 2 * (b - a) as u64);
+            let (host, before) = (copy.check_host(a - start, b - start), &saved[a - page..b - page]);
+            if let Some(i) = undone(host, before, &now) {
                 violation(
                     "C3",
                     format_args!(
                         "the copy-back of the marked page at {page:#x} of copy {start:#x}+{:#x} would overwrite a title write at {:#x}: it held {:#04x} before the submission, the title wrote {:#04x}, the shaders {:#04x}",
                         copy.len,
                         a + i,
-                        was[i],
+                        before[i],
                         now[i],
                         host[i]
                     ),
@@ -272,45 +259,62 @@ pub(super) fn marked(by_copy: &[(Arc<Shadow>, Vec<usize>)]) {
         }
     }
     if marks.len() > 1 << 17 {
-        let oldest = now_is.saturating_sub(RECENT);
-        marks.retain(|_, when| *when >= oldest);
+        marks.retain(|_, when| *when + RECENT >= now_is);
     }
 }
 
 /// Before the copy-back of the declared ranges `back` (copy, address,
 /// bytes, whether it goes back), which ends the submission: C3 for the
-/// unmarked ranges kept, and nothing is kept any more.
+/// unmarked ranges noted, and nothing is kept any more.
 pub(super) fn declared(back: &[(Arc<Shadow>, usize, usize, bool)]) {
     let _cost = crate::unwaited::checked();
     SUBMISSION.fetch_add(1, Relaxed);
     let Some(all) = kept().take() else { return };
+    let mut gathered = Vec::new();
     for (key, kept) in all {
         let Some((copy, ..)) = back.iter().find(|b| Arc::as_ptr(&b.0) as usize == key) else {
             continue;
         };
+        let Some(t) = &copy.tracked else {
+            add(C::Unchecked, 1);
+            continue;
+        };
         // Ranges withheld stay in the copy: nothing of this copy is judged.
         if back.iter().any(|b| Arc::as_ptr(&b.0) as usize == key && !b.3) {
-            add(C::Unchecked, kept.regions.len() as u64);
+            add(C::Unchecked, 1);
             continue;
         }
         let start = copy.start as usize;
-        for (at, before, was) in &kept.regions {
-            let Some(now) = title(start + at, was.len()) else { continue };
-            add(C::CheckBytes, 2 * was.len() as u64);
-            let host = copy.check_host(*at, at + before.len());
-            if let Some(i) = undone(host, before, &now, was) {
-                violation(
-                    "C3",
-                    format_args!(
-                        "the copy-back of a declared range of copy {start:#x}+{:#x} would overwrite a title write at {:#x}: title memory held {:#04x} before the submission and {:#04x} now, the shaders wrote {:#04x} over {:#04x}",
-                        copy.len,
-                        start + at + i,
-                        was[i],
-                        now[i],
-                        host[i],
-                        before[i]
-                    ),
-                );
+        let snapshot = copy.before.lock().unwrap_or_else(|e| e.into_inner());
+        for (a, b) in kept.covered.iter() {
+            for page in pages_of(start + a, start + b) {
+                // Not written by the title since the copy took it: nothing
+                // of the title's to undo.
+                if !t.changed(page / PAGE) {
+                    continue;
+                }
+                let (s, e) = (a.max(page.saturating_sub(start)), b.min(page + PAGE - start));
+                if !kept.judged.contains(&page) || !crate::segments::covered(&snapshot.0, s, e) {
+                    add(C::Unchecked, 1);
+                    continue;
+                }
+                let Some(now) = title(start + s, e - s) else { continue };
+                add(C::CheckBytes, 2 * (e - s) as u64);
+                let before = crate::segments::held(&snapshot.0, s, e, &mut gathered);
+                let host = copy.check_host(s, e);
+                if let Some(i) = undone(host, before, &now) {
+                    violation(
+                        "C3",
+                        format_args!(
+                            "the copy-back of a declared range of copy {start:#x}+{:#x} would overwrite a title write at {:#x}: it held {:#04x} before the submission, the title wrote {:#04x}, the shaders {:#04x}",
+                            copy.len,
+                            start + s + i,
+                            before[i],
+                            now[i],
+                            host[i]
+                        ),
+                    );
+                }
             }
         }
     }
@@ -335,17 +339,15 @@ mod tests {
     fn only_a_byte_both_wrote_differently_is_a_title_write_undone() {
         let before = [1u8, 2, 3, 4];
         // The shaders wrote byte 1, the title byte 2: nothing undone.
-        assert_eq!(undone(&[1, 9, 3, 4], &before, &[1, 2, 7, 4], &before), None);
+        assert_eq!(undone(&[1, 9, 3, 4], &before, &[1, 2, 7, 4]), None);
         // Both wrote byte 1, differently.
-        assert_eq!(undone(&[1, 9, 3, 4], &before, &[1, 8, 3, 4], &before), Some(1));
+        assert_eq!(undone(&[1, 9, 3, 4], &before, &[1, 8, 3, 4]), Some(1));
         // Both wrote the same value.
-        assert_eq!(undone(&[1, 9, 3, 4], &before, &[1, 9, 3, 4], &before), None);
-        // Nobody wrote.
-        assert_eq!(undone(&before, &before, &before, &before), None);
-        // The copy's bytes before differ from title memory's (an unmarked
-        // range whose copy was stale): only the copy's change counts.
-        assert_eq!(undone(&[5, 9], &[5, 6], &[1, 7], &[1, 2]), Some(1));
-        assert_eq!(undone(&[5, 6], &[5, 6], &[1, 7], &[1, 2]), None);
+        assert_eq!(undone(&[1, 9, 3, 4], &before, &[1, 9, 3, 4]), None);
+        // Nobody wrote; only the title wrote; only the shaders wrote.
+        assert_eq!(undone(&before, &before, &before), None);
+        assert_eq!(undone(&before, &before, &[7, 7, 7, 7]), None);
+        assert_eq!(undone(&[7, 7, 7, 7], &before, &before), None);
     }
 }
 
@@ -423,6 +425,76 @@ mod copies {
         });
         assert!(found.len() == 1 && found[0].contains("rule C3") && found[0].contains(&format!("{:#x}", p + 20)), "{found:?}");
         done(p, copy);
+    }
+
+    /// What the checker costs: frames of 20 submissions over 16 copies of
+    /// 64 pages, each submission declaring 55 MB / 20 of unmarked ranges and
+    /// landing 96 marked pages (1,920 a frame, the same pages from frame to
+    /// frame, as the world's are), with the checker off and on.
+    #[test]
+    #[ignore = "synthetic release benchmark; run with --release --ignored --nocapture"]
+    fn benchmark_checker_release() {
+        const COPIES: usize = 16;
+        const EACH: usize = 64;
+        const UNMARKED: usize = 172 << 10;
+        let (Some(_), Some(b)) = (crate::host::host(), bitmap(false)) else { return };
+        let len = EACH * PAGE;
+        let p = crate::watch::tests::pool(COPIES * EACH);
+        let copies: Vec<Arc<Shadow>> = (0..COPIES)
+            .map(|k| {
+                register(p + k, (p + k * len) as u64, len as u64);
+                find((p + k * len) as u64, len as u64).expect("a copy")
+            })
+            .collect();
+        let mut round = 0u8;
+        let mut frame = || {
+            let started = std::time::Instant::now();
+            for submission in 0..20usize {
+                round = round.wrapping_add(1);
+                let mut back = Vec::new();
+                for (k, copy) in copies.iter().enumerate() {
+                    let start = p + k * len;
+                    copy.update(start, len);
+                    // Unmarked: the first pages; marked: the rest.
+                    copy.writing(start, UNMARKED, false);
+                    copy.writing(start + 4 * PAGE, len - 4 * PAGE, true);
+                    back.push((copy.clone(), start, UNMARKED, true));
+                    back.push((copy.clone(), start + 4 * PAGE, len - 4 * PAGE, true));
+                    copy.write_host((start + 4096 + submission) as u64, &[0x80 | round; 64]);
+                    for i in 0..6 {
+                        let page = start + (4 + (submission * 3 + i * 7) % 60) * PAGE;
+                        copy.write_host((page + 0x400) as u64, &[0x80 | round; 256]);
+                        let bit = copy.mark_entry(page as u64).expect("a bit").0;
+                        // SAFETY: a dword of the mapped bitmap.
+                        unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+                    }
+                }
+                copy_back_marks(&[], false);
+                copy_back_declared(&back);
+            }
+            started.elapsed().as_secs_f64() * 1e3
+        };
+        let off: Vec<f64> = (0..6).map(|_| frame()).collect();
+        let cost = |c: C| crate::unwaited::tests::count(c);
+        let (us, bytes, unchecked) = (cost(C::CheckUs), cost(C::CheckBytes), cost(C::Unchecked));
+        crate::unwaited::tests::REFRESHES.with(|r| r.set(false));
+        let (on, found) = caught(|| (0..6).map(|_| frame()).collect::<Vec<f64>>());
+        crate::unwaited::tests::REFRESHES.with(|r| r.set(true));
+        assert!(found.is_empty(), "{found:?}");
+        let frames = 5.0;
+        // The first frame with the checker on has no pages marked lately.
+        let mean = |v: &[f64]| v[1..].iter().sum::<f64>() / frames;
+        eprintln!(
+            "checker benchmark: {:.1} ms a frame without, {:.1} ms with (its own count: {:.1} ms a frame over all six, {:.1} MB compared, {:.0} pages or ranges unchecked a frame)",
+            mean(&off),
+            mean(&on),
+            (cost(C::CheckUs) - us) as f64 / 1e3 / 6.0,
+            (cost(C::CheckBytes) - bytes) as f64 / 1e6 / 6.0,
+            (cost(C::Unchecked) - unchecked) as f64 / 6.0,
+        );
+        drop(copies);
+        (0..COPIES).for_each(|k| unregister(p + k, (p + k * len) as u64));
+        crate::watch::tests::free(p);
     }
 
     /// C4: a page whose tracker says "unchanged since taken" while title

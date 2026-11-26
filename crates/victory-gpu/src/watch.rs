@@ -976,6 +976,12 @@ impl Tracked {
     pub(crate) fn saved(&self, page: usize) -> Option<Box<[u8]>> {
         self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page)
     }
+
+    /// A copy of what [`Tracked::saved`] would hand out, which stays (the
+    /// checker of `crate::unwaited` looks before the copy-back takes it).
+    pub(crate) fn saved_peek(&self, page: usize) -> Option<Box<[u8]>> {
+        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.get(&page).cloned()
+    }
 }
 
 /// Makes `pages` read-only where not already (in runs), and returns those

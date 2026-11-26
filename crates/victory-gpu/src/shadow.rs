@@ -769,7 +769,7 @@ impl Shadow {
                 }
             }
             if crate::unwaited::checking() {
-                self.check_patched(a + start, b + start);
+                self.check_retaken(a + start, b + start, true);
             }
         }
         copied
@@ -799,14 +799,17 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
             // Cut to the range: next to it shaders may be writing the copy.
-            let check = how == Take::All && crate::unwaited::checking_refreshes();
+            let (check, again) = (crate::unwaited::checking(), how == Take::All && crate::unwaited::checking_refreshes());
             let mut copied: usize = runs
                 .into_iter()
                 .map(|(a, b)| {
                     let copied = self.copy(a, b);
                     if check {
                         let _cost = crate::unwaited::checked();
-                        self.check_equal(a, b, "after a refresh took the page");
+                        self.check_retaken(a, b, false);
+                        if again {
+                            self.check_equal(a, b, "after a refresh took the page");
+                        }
                     }
                     copied
                 })

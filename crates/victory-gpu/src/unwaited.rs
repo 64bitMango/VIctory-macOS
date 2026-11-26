@@ -61,7 +61,7 @@ pub(crate) fn checking() -> bool {
 pub(crate) fn checking_refreshes() -> bool {
     #[cfg(test)]
     if let Some(on) = tests::CHECK.with(|c| c.get()) {
-        return on;
+        return on && tests::REFRESHES.with(|c| c.get());
     }
     static ON: OnceLock<bool> = OnceLock::new();
     checking() && *ON.get_or_init(|| crate::switch::on("VICTORY_UNWAITED_CHECK_REFRESH"))
@@ -543,6 +543,8 @@ pub(crate) mod tests {
     std::thread_local! {
         /// The checker switched on or off for this thread's test.
         pub(crate) static CHECK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+        /// Whether a test's checker reads refreshed pages again too.
+        pub(crate) static REFRESHES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// Violations caught instead of ending the run.
         pub(crate) static CAUGHT: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
     }
