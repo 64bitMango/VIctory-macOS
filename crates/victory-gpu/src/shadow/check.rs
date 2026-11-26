@@ -145,9 +145,19 @@ impl Shadow {
             {
                 add(C::CheckBytes, PAGE as u64);
                 let host = self.check_host(page - start, page - start + PAGE);
+                // Read a second time before it is called a violation: a page
+                // mapped anew between its guard and the read is told to the
+                // trackers a moment later.
+                let differs = |now: &[u8]| now != host && self.check_stands(page);
+                let now = if differs(&now) {
+                    std::thread::yield_now();
+                    title(page, PAGE).unwrap_or(now)
+                } else {
+                    now
+                };
                 if now == host {
                     equal().insert(page, now_is);
-                } else if self.check_stands(page) {
+                } else if differs(&now) {
                     let i = (0..PAGE).find(|&i| now[i] != host[i]).unwrap_or(0);
                     violation(
                         "C4",
