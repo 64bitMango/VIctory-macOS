@@ -203,6 +203,7 @@ fn build(
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        relax: Default::default(),
         view_marks: false,
     })
     .expect("lower");

@@ -193,6 +193,7 @@ fn program() -> HostShader {
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        relax: Default::default(),
         view_marks: false,
     })
     .expect("lower");
@@ -427,6 +428,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        relax: Default::default(),
         view_marks: false,
     })
     .expect("lower");
@@ -574,6 +576,7 @@ fn writes_through_views_mark_their_pages() {
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        relax: Default::default(),
         view_marks: true,
     })
     .expect("lower");
@@ -696,6 +699,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             psv: None,
             dropped_rows: Vec::new(),
             narrow_waves: false,
+            relax: Default::default(),
         })
         .expect("lower")
     };

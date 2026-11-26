@@ -419,6 +419,49 @@ pub struct Options {
     /// than 32 lanes gets group barriers where its lanes read LDS other
     /// lanes may have written, which the console's lockstep made safe.
     pub narrow_waves: bool,
+    /// Console float rules left to the host's (all off: the console's).
+    pub relax: Relax,
+}
+
+/// The console's float rules a translation may leave to the host's instead
+/// ([`Options::relax`]), one kind each: the instructions that reproduce
+/// them cost GPU time (a 25-tap min/max filter of the title runs
+/// in a third of the time without them), and what differs is noted per kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Relax {
+    /// Denormal operands of minimum, maximum and median, of the floor
+    /// conversions and of the output modifiers (x2, x4, /2) are no longer
+    /// read as zeros of their sign (the console's float mode; four integer
+    /// instructions an operand): the host's own treatment applies, so a
+    /// result may be a denormal (below 1.2e-38 in size) where the console
+    /// gives a zero.
+    pub denormals: bool,
+    /// Minimum and maximum of two zeros of different signs are the host's
+    /// (either zero) instead of the console's (-0 below +0; five integer
+    /// instructions an operation). Only the sign of a zero differs.
+    pub signed_zeros: bool,
+    /// `v_mul_legacy_f32` and its multiply-adds are plain multiplies: the
+    /// console's give 0 for 0 x infinity and 0 x NaN, the host's NaN
+    /// (two compares and a select a multiply).
+    pub legacy_mul: bool,
+    /// The same multiplies as plain multiplies whose NaN and zero results
+    /// are +0 (a compare and a select): 0 x infinity and 0 x NaN stay 0 as
+    /// on the console, so no NaN is made that the console does not make,
+    /// and a zero product keeps the console's sign; a NaN operand times a
+    /// non-zero number gives 0 where the console gives NaN, and a product
+    /// of non-zero operands that underflows to -0 gives +0.
+    /// [`Relax::legacy_mul`] takes precedence.
+    pub legacy_mul_nan: bool,
+    /// 16-bit float results are rounded by the host's conversion
+    /// (`legacyF32ToF16`) instead of on the bits (about fifty integer
+    /// instructions a result): the host's rounding (toward zero on some)
+    /// and its denormal, overflow and NaN payload handling apply, so a
+    /// result may differ in the last place of an f16.
+    pub half_rounding: bool,
+    /// The median of three with a NaN among them is the host's (the console
+    /// gives the minimum of the three), and the floor conversions give the
+    /// host's 0 for a NaN (the console saturates by the NaN's sign).
+    pub nan: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -838,6 +881,7 @@ fn emit_keeping(
         atomic_locks: options.atomic_locks,
         bias_as_gradients: options.bias_as_gradients,
         narrow_waves: options.narrow_waves,
+        relax: options.relax,
     };
     // Most programs only interpolate with the barycentric VGPRs, or join
     // them in a former use no lane reads; one that cannot do without them

@@ -297,6 +297,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        relax: Default::default(),
         view_marks: false,
     })
     .map_err(e)?;
