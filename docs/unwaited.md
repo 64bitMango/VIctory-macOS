@@ -416,24 +416,27 @@ copy-back itself, which is the same code on both paths.
 - **C2 Order** (I1, I2): a launch with a flight in the air or with launches
   and settles out of step; a settle out of sequence; a landing before the
   host fence reached the flight's value.
-- **C3 Copy-back over a title write** (`shadow/check.rs`). At each
-  declaration the checker keeps the copy's bytes and title memory's: the
-  whole of unmarked ranges; of marked ranges the pages shaders marked in the
-  last 256 submissions (the ranges are the views' whole reach, a gigabyte in
-  the world, and the pages written repeat from frame to frame). Before the
-  copy-back, a byte the copy changed and title memory changed too, to
-  something else than what is about to be written, is a violation. Pages
-  marked for the first time in a while, ranges that are withheld and what
-  title-memory programs write at computed addresses are counted as unchecked.
+- **C3 Copy-back over a title write** (`shadow/check.rs`): a byte the
+  shaders changed in the copy that the title changed too, to something else
+  than what is about to be written. The checker keeps no bytes of its own.
+  For unmarked declared ranges "before" is the copy-back's own snapshot, and
+  only pages the title wrote since the copy took them are read, and only
+  where the snapshot is also what title memory held (the page was unchanged
+  at the declaration, or a refresh under the range took it since). For
+  marked pages "before" is what the tracker saved at the title's first write
+  to the armed page; a page the title did not write has nothing to undo.
+  Ranges withheld, pages already written at their declaration and what
+  title-memory programs write at computed addresses count as unchecked.
 - **C4 The trackers' word**: "unchanged since taken" must mean "title memory
   equals the copy", because the copy-back of a marked page writes every byte
-  in which they differ. Checked for a marked page when it is kept before its
-  submission, and for every page a copy-back has just taken and read again.
-  With `VICTORY_UNWAITED_CHECK_REFRESH=1` also for every page a refresh has
-  just taken (this reads everything refreshed a second time). A title write
-  racing the check has set "changed" first (the page is guarded before it is
-  read), so a difference with "unchanged" still standing is a write the copy
-  never saw: the fault of section 9.
+  in which they differ. Checked where it is made so: every page a copy-back
+  takes and reads again; with `VICTORY_UNWAITED_CHECK_REFRESH=1` every page a
+  refresh takes. And where it is relied on: a page shaders marked in the last
+  256 submissions is read and compared when it is declared again, once per
+  taking and again every 64 submissions. A title write racing the check has
+  set "changed" first (the page is guarded before it is read), so a
+  difference with "unchanged" still standing is a write the copy never saw:
+  the fault of section 9. Pages holding withheld writes are exempt.
 - **C5 Predicted waits**: every value the pump read through the overlay is
   in memory when the flight has landed.
 - **C6 Lifetime** (I6): the shared upload list reset, retired objects
@@ -444,12 +447,16 @@ copy-back itself, which is the same code on both paths.
 Not built: a rule on a kept Signal lower than the fence's value (a title may
 signal a lower value itself; the order is by construction and tested).
 
-Cost (the frame line reports it as "unwaited checker: ms/frame, MB
-compared"): see the hand-back for measured figures. By design it reads title
-memory once and the copy once per unmarked declared byte at the declaration
-and again at the copy-back (55 MB of snapshots a frame today), one page read
-per lately-marked page at arming and one at the copy-back (about 2,000 pages),
-and one page read per page a copy-back takes.
+Cost, measured (`shadow::check::copies::benchmark_checker_release`, release,
+Wine on the M5 Pro, frames of 20 submissions landing 1,920 marked pages and
+declaring 55 MB of unmarked ranges): 25.6 ms a frame without the checker,
+35.6 ms with, 147 MB compared a frame. It is one page read and compare per
+page a copy-back takes, plus the pages the title wrote under declared ranges.
+A first version that read every lately marked page at every declaration cost
+280 ms a frame. With `VICTORY_UNWAITED_CHECK_REFRESH=1` everything refreshed
+is read a second time (143 MB a frame in the world: about as much again,
+inferred). The frame line reports the real figure ("unwaited checker: ms/frame,
+MB compared").
 
 ## 11. Tests and deliberate breaks
 
