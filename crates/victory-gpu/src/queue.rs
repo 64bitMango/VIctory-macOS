@@ -192,6 +192,11 @@ const VALVE: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[cfg(windows)]
 fn pump(held: &mut Holding, why: Why) {
+    // Title pieces that return before the host GPU has run them
+    // (`VICTORY_UNWAITED=1`; without it this function is as it was).
+    if crate::unwaited::on() {
+        return pump_unwaited(held, why);
+    }
     if held.is_empty() {
         return;
     }
@@ -244,6 +249,114 @@ fn pump(held: &mut Holding, why: Why) {
             pump_held_if_free(Why::Timer);
         });
     });
+}
+
+/// [`pump`] with `VICTORY_UNWAITED` (`docs/unwaited.md` 4.3): a piece is
+/// left on the host queue as the flight (`Host::execute_unwaited`, which
+/// settles the flight before it first); a wait is tested against memory as
+/// it will be once the flight's bottom-of-pipe words are written, and a
+/// queue's fence wait against the fence as the Signals kept behind the
+/// flight will leave it, since whatever they release is prepared after the
+/// settle; a Signal reached while a flight is in the air is kept behind it.
+/// A head still blocked with a flight in the air settles the flight (a
+/// timestamp it may wait for is known only then) and is tested again.
+///
+/// KEEP IN STEP WITH [`pump`], whose copy this is.
+#[cfg(windows)]
+fn pump_unwaited(held: &mut Holding, why: Why) {
+    if held.is_empty() {
+        return;
+    }
+    let Some(host) = crate::host::host() else { return };
+    let read = |address: u64, bytes: u8| crate::unwaited::read_through(address, bytes, read_value(address, bytes));
+    for (queue, waits) in held.force_older_than(VALVE) {
+        account().forced += 1;
+        tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
+    }
+    let fence = |f: usize| {
+        let now = crate::fence::value(f as This);
+        crate::unwaited::pending_fence(f).map_or(now, |kept| kept.max(now))
+    };
+    loop {
+        let started = std::time::Instant::now();
+        let mut ran = std::time::Duration::ZERO;
+        let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
+            let at = std::time::Instant::now();
+            host.execute_unwaited(&segments);
+            ran += at.elapsed();
+            // The flight holds them until its settle.
+            segments.into_iter().for_each(crate::list::recycle);
+        };
+        let mut signal = |f: usize, value: u64| {
+            if crate::unwaited::keep_signal(f, value) {
+                return;
+            }
+            crate::fence::set(f as This, value);
+            crate::fence::let_go(f as This);
+        };
+        let pumped = held.pump(&mut crate::hold::World {
+            read: &read,
+            fence: &fence,
+            run: &mut run,
+            signal: &mut signal,
+        });
+        if pumped.segments > 0 || pumped.unknown > 0 {
+            let mut a = account();
+            a.pump += started.elapsed().saturating_sub(ran);
+            a.pieces += pumped.pieces;
+            a.segments += pumped.segments;
+            a.unknown += pumped.unknown;
+            for (queue, waited) in pumped.waited {
+                a.released.push((kind(queue), waited, why));
+            }
+        }
+        if held.blocked(&read).is_empty() {
+            return;
+        }
+        if !crate::unwaited::in_flight() {
+            break;
+        }
+        host.settle_flight(crate::unwaited::By::Pump);
+        // Not settled (this thread is inside a submission): the poll does.
+        if crate::unwaited::in_flight() {
+            break;
+        }
+    }
+    static TIMER: std::sync::Once = std::sync::Once::new();
+    TIMER.call_once(|| {
+        let _ = std::thread::Builder::new().name("victory held work".into()).spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            pump_held_if_free(Why::Timer);
+        });
+    });
+}
+
+/// The poll of `crate::unwaited`: settles the flight in the air if the host
+/// GPU is done with it, runs held work its words or fences let go, and
+/// gives back the lists of settled flights. Nothing if a thread is pumping.
+#[cfg(windows)]
+pub(crate) fn poll_unwaited() {
+    if let Ok(mut held) = HELD.try_lock() {
+        let settled = crate::host::host().is_some_and(|host| host.settle_flight_if_done(crate::unwaited::By::Poll));
+        if crate::unwaited::take_wants_pump() || settled {
+            pump(&mut held, Why::Timer);
+        }
+    }
+    crate::unwaited::recycle();
+}
+
+/// Settles the flight in the air (`VICTORY_UNWAITED`), waiting for the host
+/// GPU: before a call that must find its results, or the host idle. The
+/// caller holds no lock of ours.
+pub(crate) fn settle_unwaited(by: crate::unwaited::By) {
+    #[cfg(windows)]
+    if crate::unwaited::in_flight()
+        && let Some(host) = crate::host::host()
+    {
+        host.settle_flight(by);
+    }
+    #[cfg(not(windows))]
+    let _ = by;
 }
 
 /// The value a wait tests (4 or 8 bytes), if the memory can be read.
@@ -381,6 +494,14 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         if held.holds_work(this as usize) {
             crate::fence::keep(fence);
             held.push(this as usize, Item::Signal(fence as usize, value));
+        } else if crate::unwaited::in_flight() {
+            // Behind the flight (`VICTORY_UNWAITED`): made at its settle,
+            // or now if it was settled meanwhile.
+            crate::fence::keep(fence);
+            if !crate::unwaited::keep_signal(fence as usize, value) {
+                crate::fence::set(fence, value);
+                crate::fence::let_go(fence);
+            }
         } else {
             crate::fence::set(fence, value);
         }
@@ -691,6 +812,13 @@ extern "system" fn present(
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
     pump_held(Why::Present);
+    // The flight in the air (`VICTORY_UNWAITED`) has run before the frame
+    // is shown, and what its words let go too.
+    if crate::unwaited::in_flight() {
+        settle_unwaited(crate::unwaited::By::Present);
+        pump_held(Why::Present);
+        settle_unwaited(crate::unwaited::By::Present);
+    }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     account_frame(frame);
@@ -852,6 +980,11 @@ extern "system" fn copy_page_mappings(
     };
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
+    }
+    // A queue operation on the console: behind the flight in the air
+    // (`VICTORY_UNWAITED`), whose lists read the pages as they were mapped.
+    if crate::unwaited::in_flight() {
+        settle_unwaited(crate::unwaited::By::Mapping);
     }
     #[cfg(windows)]
     if held().holds_work(this as usize) {
@@ -1017,6 +1150,84 @@ mod tests {
         } else {
             0x70
         }
+    }
+
+    /// `pump_unwaited` (`VICTORY_UNWAITED`), on queues' work of its own: a
+    /// piece that waits for a word a flight will write at the bottom of the
+    /// pipe, and one behind a queue's wait for a fence the flight's Signal
+    /// will move, are run behind the flight: when they are prepared the
+    /// word is in memory and the fence has moved. A piece that waits for a
+    /// timestamp the flight will write cannot be told beforehand: the pump
+    /// settles the flight and tests it again.
+    #[cfg(windows)]
+    #[test]
+    fn work_waiting_for_what_a_flight_will_tell_runs_behind_it() {
+        use crate::hold::ValueWait;
+        use std::sync::{Arc, Mutex};
+        let Some(host) = crate::host::host() else { return };
+        let null = std::ptr::null();
+        let queue = |kind: u32| {
+            let mut q = null;
+            assert_eq!(create(null, &QueueDesc { kind, priority: 0, flags: 0, nodes: 0 }, &QUEUE_IIDS[0], &mut q), S_OK);
+            q as usize
+        };
+        let (qa, qb) = (queue(0), queue(2));
+        let mut fence = null;
+        assert_eq!(crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence), S_OK);
+        let fence = fence as usize;
+        let words = Box::leak(Box::new([0u64; 3])).as_mut_ptr() as usize;
+        let word = |i: usize| words + 8 * i;
+        // SAFETY: (all reads) our leaked words.
+        let read = |at: usize| unsafe { (at as *const u64).read_volatile() };
+        let log: Arc<Mutex<Vec<(&'static str, u64)>>> = Default::default();
+        let list = |write: Option<(usize, Written)>, says: &'static str, sees: Box<dyn Fn() -> u64 + Send>| {
+            let list = host.new_list().expect("a host list");
+            let at_preparation = log.clone();
+            list.defer(move || at_preparation.lock().unwrap().push((says, sees())));
+            if let Some((at, what)) = write {
+                list.defer_write(at as *mut u8, what, 8);
+            }
+            list.close();
+            Arc::new(list)
+        };
+        let (w0, w1, w2) = (word(0), word(1), word(2));
+        let first = list(Some((w0, Written::Value(5))), "first prepared", Box::new(|| 0));
+        first.defer_write(w2 as *mut u8, Written::GpuTimestamp, 8);
+        let second = list(Some((w1, Written::Value(6))), "second prepared, the word it waited for", Box::new(move || read(w0)));
+        let third = list(None, "third prepared, the fence its queue waited for", Box::new(move || crate::fence::value(fence as This)));
+        let fourth = list(None, "fourth prepared, the timestamp it waited for is there", Box::new(move || u64::from(read(w2) != 0)));
+        let wait = |address: usize, comparison: u32, reference: u64| ValueWait { address: address as u64, bytes: 8, comparison, reference, mask: u64::MAX };
+        let mut held: Holding = crate::hold::Held::new();
+        held.push(qa, Item::Segment(first, Vec::new()));
+        crate::fence::keep(fence as This);
+        held.push(qa, Item::Signal(fence, 7));
+        // GREATER_EQUAL 5, then a queue's wait for the fence.
+        held.push(qb, Item::Segment(second, vec![wait(w0, 7, 5)]));
+        held.push(qb, Item::FenceWait(fence, 7));
+        held.push(qb, Item::Segment(third, Vec::new()));
+        pump_unwaited(&mut held, Why::Submission);
+        assert!(held.is_empty(), "everything ran from one pump");
+        // NOT_EQUAL 0 of the timestamp a flight will write.
+        let stamped = list(Some((w2, Written::GpuTimestamp)), "stamped prepared", Box::new(|| 0));
+        unsafe { (w2 as *mut u64).write_volatile(0) };
+        held.push(qa, Item::Segment(stamped, Vec::new()));
+        held.push(qa, Item::Segment(fourth, vec![wait(w2, 6, 0)]));
+        pump_unwaited(&mut held, Why::Submission);
+        assert!(held.is_empty(), "the pump settled the flight for the timestamp and ran what waited");
+        settle_unwaited(crate::unwaited::By::Present);
+        crate::unwaited::recycle();
+        assert_eq!((read(w0), read(w1)), (5, 6));
+        assert_eq!(crate::fence::value(fence as This), 7);
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                ("first prepared", 0),
+                ("second prepared, the word it waited for", 5),
+                ("third prepared, the fence its queue waited for", 7),
+                ("stamped prepared", 0),
+                ("fourth prepared, the timestamp it waited for is there", 1),
+            ]
+        );
     }
 
     #[test]

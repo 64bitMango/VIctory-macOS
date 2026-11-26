@@ -930,6 +930,9 @@ impl State {
                 list.defer_heap(&host.viewed);
             }
             crate::bindless::note_draw(writes);
+            if writes {
+                list.note_heap_writes();
+            }
         }
         for stage in &p.stages {
             let t = stage.translated();

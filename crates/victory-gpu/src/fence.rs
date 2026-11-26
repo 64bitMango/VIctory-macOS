@@ -84,11 +84,22 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
 extern "system" fn completed(this: This) -> u64 {
+    // A flight the host GPU is done with (`VICTORY_UNWAITED`) is settled.
+    #[cfg(windows)]
+    if crate::unwaited::in_flight() {
+        crate::queue::poll_unwaited();
+    }
     // A title polling for a value: held work that may run now does first.
     crate::queue::pump_held_if_free(crate::queue::Why::Fence);
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
+    // The title is about to wait: a Signal kept behind the flight in the
+    // air (`VICTORY_UNWAITED`) is made first, with what it lets go.
+    if crate::unwaited::in_flight() && fence(this).value.load(Ordering::Acquire) < value {
+        crate::queue::settle_unwaited(crate::unwaited::By::Fence);
+        crate::queue::pump_held(crate::queue::Why::Fence);
+    }
     crate::queue::pump_held_if_free(crate::queue::Why::Fence);
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
@@ -110,6 +121,10 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
 /// The title's Signal from the CPU: what queues hold behind a Wait for it
 /// may run now (`crate::hold`).
 extern "system" fn signal(this: This, value: u64) -> HRESULT {
+    // After the Signals kept behind the flight in the air (`VICTORY_UNWAITED`).
+    if crate::unwaited::in_flight() {
+        crate::queue::settle_unwaited(crate::unwaited::By::Fence);
+    }
     let hr = set(this, value);
     crate::queue::pump_held(crate::queue::Why::Fence);
     hr
