@@ -426,6 +426,41 @@ fn pruned_mesh(ms: &Shader, ps: &Shader) -> (Option<Arc<Translated>>, Option<Arc
     (own, None)
 }
 
+/// For `victory replay --retranslate` (`crate::replay::play::retranslate`):
+/// the DXIL each stage of a pipeline of the title's containers `stages`
+/// (stage and container) gets from this build with this run's switches, as
+/// [`HostPipeline::new`] chooses it: the stage's own translation or, for a
+/// mesh pipeline over Metal's output limit, one made for the pipeline alone
+/// ([`pruned_mesh`]); and whether it is one made for the pipeline alone.
+pub(crate) fn retranslated(stages: &[(&'static str, &[u8])]) -> Vec<(Result<Vec<u8>, String>, bool)> {
+    let shaders: Vec<Arc<Shader>> = stages
+        .iter()
+        .map(|(stage, bytes)| super::shader(stage, bytes))
+        .collect();
+    let find = |stage| shaders.iter().find(|s| s.stage == stage);
+    let pruned = match (find("mesh"), find("pixel")) {
+        (Some(ms), Some(ps)) => pruned_mesh(ms, ps),
+        _ => (None, None),
+    };
+    shaders
+        .iter()
+        .map(|s| {
+            let alone = match s.stage {
+                "mesh" => pruned.0.as_ref(),
+                "pixel" => pruned.1.as_ref(),
+                _ => None,
+            };
+            match alone {
+                Some(t) => (Ok(t.host.dxil.clone()), true),
+                None => {
+                    let own = s.translated().map(|t| t.host.dxil.clone());
+                    (own.ok_or_else(|| "it does not translate (the log says why)".to_owned()), false)
+                }
+            }
+        })
+        .collect()
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());

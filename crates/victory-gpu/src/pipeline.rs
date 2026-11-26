@@ -112,9 +112,15 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 
 impl Shader {
     fn new(stage: &'static str, bytes: &[u8]) -> Shader {
+        let hash = blake3::hash(bytes).to_hex()[..16].to_owned();
+        // With the frame recorder asked for (`VICTORY_RECORD`), the
+        // container is kept beside its captures, so that a replay can
+        // translate it again.
+        #[cfg(windows)]
+        crate::replay::record::container(&hash, bytes);
         Shader {
             stage,
-            hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
+            hash,
             size: bytes.len(),
             #[cfg(any(windows, test))]
             container: Mutex::new(bytes.to_vec()),
