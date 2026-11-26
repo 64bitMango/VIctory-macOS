@@ -1834,6 +1834,74 @@ pub(crate) mod tests {
         }
     }
 
+    /// A heap sync (its runs on helper threads) and a title thread make the
+    /// same slots at once: the sync from records copied in as bytes, the
+    /// title thread from records it writes by calls meanwhile. Each slot
+    /// ends made from the record it holds, with no sync after.
+    #[cfg(windows)]
+    #[test]
+    fn a_sync_and_a_title_thread_making_the_same_slots_leave_each_as_its_record() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const SLOTS: u32 = 2048;
+        const FIRST: u32 = 64;
+        let memory = crate::watch::tests::pool(1);
+        let title = owner(
+            HeapDesc { kind: SAMPLERS, count: SLOTS, flags: SHADER_VISIBLE, nodes: 1 },
+            Placement { address: memory as u64, size: u64::from(SLOTS) * 16 },
+        );
+        let Some(slots) = heap(title.0).host() else {
+            drop(title);
+            return crate::watch::tests::free(memory);
+        };
+        let at = |i: u32| memory as u64 + u64::from(i) * 16;
+        let sampler = |k: u32| [21, 1 + k % 4, 1 + k / 4 % 4, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+        // Records of sixteen samplers, where no heap sees them.
+        let records = [0u64; 2 * 16];
+        let from = |k: u32| records.as_ptr() as u64 + 16 * u64::from(k % 16);
+        (0..16).for_each(|k| create_sampler(std::ptr::null(), &sampler(k), from(k)));
+        for round in 0..300u32 {
+            // No other test's submission syncs the heap meanwhile (it would
+            // take the changed pages and still be making their slots when
+            // this round looks).
+            host.between_submissions(|| {
+                // Copied in as bytes: the sync finds these (another sampler
+                // than the round before left).
+                for i in FIRST..SLOTS {
+                    // SAFETY: a record of ours into a slot of the heap.
+                    unsafe { std::ptr::copy_nonoverlapping(from(round + i) as *const u8, at(i) as *mut u8, 12) };
+                }
+                let barrier = std::sync::Barrier::new(2);
+                std::thread::scope(|scope| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        host::tests::SYNC_THREADS.with(|threads| threads.set(Some(4)));
+                        barrier.wait();
+                        sync_heaps();
+                    });
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for i in (FIRST..SLOTS).step_by(3) {
+                            create_sampler(std::ptr::null(), &sampler(round + i + 5), at(i));
+                        }
+                    });
+                });
+                for i in FIRST..SLOTS {
+                    // SAFETY: a slot of the heap.
+                    let record = unsafe { (at(i) as *const [u32; 3]).read_unaligned() };
+                    let key = match views_current(&[record])[0] {
+                        true => u64::from(record[2]) << 32 | u64::from(record[1]),
+                        false => 0,
+                    };
+                    assert_eq!(slots.made_key(i), key, "round {round}, slot {i}");
+                }
+            });
+        }
+        drop(title);
+        crate::watch::tests::free(memory);
+    }
+
     #[cfg(windows)]
     #[test]
     fn slots_written_from_several_threads_during_syncs_end_as_their_records() {

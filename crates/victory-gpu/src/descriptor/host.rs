@@ -979,7 +979,11 @@ impl HostHeap {
         let _making = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncRunsUs);
         let slots: usize = runs.iter().map(Vec::len).sum();
         let threads = if slots >= SPREAD || cfg!(test) { sync_threads() } else { 1 };
+        // The helpers work for this thread, which waits for them: where it
+        // holds the submission lock, so do they (`Host::quiet`).
+        let holding = crate::host::holds_submissions();
         crate::back::spread(runs.len(), threads, |k| {
+            let _holding = holding.then(crate::host::holding_too);
             // Counted as the submitting thread's work (diagnostics).
             let _syncing = crate::contend::syncing();
             self.make_run(&runs[k], start, step);
