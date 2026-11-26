@@ -292,6 +292,19 @@ pub(crate) enum C {
     /// them: the askings, and the pages they answered for.
     PoolAsks,
     PoolPages,
+    /// Threads recording or releasing a view: waits for the views' index
+    /// and for the entries to write one ([`C::ViewsWaitUs`] is the readers'
+    /// waits for the entries).
+    ViewIndexWaitUs,
+    ViewIndexContended,
+    /// Heap syncs, every eighth slot made, nanoseconds by step: finding the
+    /// record's view; the stride, mark and address tables; the host view;
+    /// what the slot views (`crate::bindless`); what it holds.
+    SlotLookNs,
+    SlotTablesNs,
+    SlotHostNs,
+    SlotViewedNs,
+    SlotKeepNs,
     /// Not a counter: how many there are.
     Count,
 }
@@ -662,7 +675,7 @@ pub(crate) fn log(frames: f64) {
         c[C::SyncLeft as usize],
     );
     tracing::info!(
-        "  lock waits per frame (time, times a thread found the lock taken): title threads writing views for the heaps' lock {:.1} ms, {:.0} (held alone by passes over the slots {:.1} ms); for what a heap's slots hold {:.1} ms, {:.0}; for the views table {:.1} ms, {:.0} ({:.0} views recorded were held already, {:.0} new); for what a heap's slots view {:.1} ms, {:.0}; for the copies' registries {:.1} ms, {:.0}",
+        "  lock waits per frame (time, times a thread found the lock taken): title threads writing views for the heaps' lock {:.1} ms, {:.0} (held alone by passes over the slots {:.1} ms); for what a heap's slots hold {:.1} ms, {:.0}; for the views' entries, their readers {:.1} ms, {:.0}, and for the views' index, threads recording a view {:.1} ms, {:.0} ({:.0} views recorded were held already, {:.0} new); for what a heap's slots view {:.1} ms, {:.0}; for the copies' registries {:.1} ms, {:.0}",
         ms(c[C::MirrorWaitUs as usize]),
         c[C::HeapsContended as usize],
         ms(c[C::HeapsAloneUs as usize]),
@@ -670,6 +683,8 @@ pub(crate) fn log(frames: f64) {
         c[C::KeptContended as usize],
         ms(c[C::ViewsWaitUs as usize]),
         c[C::ViewsContended as usize],
+        ms(c[C::ViewIndexWaitUs as usize]),
+        c[C::ViewIndexContended as usize],
         c[C::RecordFound as usize],
         c[C::RecordNew as usize],
         ms(c[C::ViewedWaitUs as usize]),
@@ -727,6 +742,15 @@ pub(crate) fn log(frames: f64) {
         c[C::ViewedSyncContended as usize],
         ms(c[C::ViewsSyncWaitUs as usize]),
         c[C::ViewsSyncContended as usize],
+    );
+    let step = |first: C| c[first as usize] * 8.0 / 1e6;
+    tracing::info!(
+        "    of making slots under their runs' locks, by step (every eighth slot timed, ms a frame): finding the record's view {:.1}, the stride, mark and address tables {:.1}, the host view {:.1}, what the slot views {:.1}, what it holds {:.1}",
+        step(C::SlotLookNs),
+        step(C::SlotTablesNs),
+        step(C::SlotHostNs),
+        step(C::SlotViewedNs),
+        step(C::SlotKeepNs),
     );
     tracing::info!(
         "  records that are neither ours nor zeros per frame: at slots heap syncs made null {:.0} render target or depth records, {:.0} a current view's entry under another tag, {:.0} with a title address first, {:.0} others; table entries draws read that name no view: {:.0} views of released resources, {:.0} zeros, {:.0} other bytes",

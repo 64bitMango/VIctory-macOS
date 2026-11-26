@@ -191,9 +191,11 @@ pub(crate) type Run = Vec<(u32, [u32; 3])>;
 const SPREAD: usize = 192;
 
 /// How many threads make a heap sync's runs of slots, the submitting
-/// thread among them: those the copy-back has (`crate::back::threads`: a
-/// quarter of the CPUs, four at most), or `VICTORY_SYNC_THREADS` (1: all on
-/// the submitting thread, as before).
+/// thread among them: `VICTORY_SYNC_THREADS`, 1 without it (all on the
+/// submitting thread). On four the helpers waited for each other and for
+/// the title's threads, at what the slots view and hold: 457 ms of threads'
+/// time for what one thread did in 67, and 119 ms of the submitting
+/// thread's against 72 (run ab-all-on3).
 fn sync_threads() -> usize {
     // Tests: as the thread running the sync says, for any number of slots;
     // on one thread unless it says.
@@ -204,7 +206,7 @@ fn sync_threads() -> usize {
     #[cfg(not(test))]
     *THREADS.get_or_init(|| {
         let asked = std::env::var("VICTORY_SYNC_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok());
-        asked.map_or_else(crate::back::threads, |n| n.clamp(1, 16))
+        asked.map_or(1, |n| n.clamp(1, 16))
     })
 }
 
@@ -276,6 +278,40 @@ impl Who {
             Who::Title
         }
     }
+}
+
+/// Times the steps of every eighth slot a heap sync makes (diagnostics;
+/// nothing without them).
+struct Laps(#[cfg(feature = "diagnostics")] Option<std::time::Instant>);
+
+impl Laps {
+    fn start(_index: u32) -> Self {
+        Laps(
+            #[cfg(feature = "diagnostics")]
+            (_index.is_multiple_of(8) && crate::contend::in_sync()).then(std::time::Instant::now),
+        )
+    }
+
+    /// The time since the last lap (or the start) was `_step`'s.
+    fn lap(&mut self, #[cfg(feature = "diagnostics")] _step: crate::copystat::C) {
+        #[cfg(feature = "diagnostics")]
+        if let Some(at) = &mut self.0 {
+            let now = std::time::Instant::now();
+            crate::copystat::add(_step, (now - *at).as_nanos() as u64);
+            *at = now;
+        }
+    }
+}
+
+/// [`Laps::lap`] of a step named by its counter; nothing without
+/// diagnostics.
+macro_rules! lap {
+    ($laps:expr, $step:ident) => {
+        $laps.lap(
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::C::$step,
+        )
+    };
 }
 
 /// What [`HostHeap::make_locked`] found or did.
@@ -716,24 +752,28 @@ impl HostHeap {
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
-        self.make_null_view(index, true);
+        self.make_null_view(index, true, &mut Laps::start(1));
     }
 
     /// [`HostHeap::make_null`]; the host slot itself is written only if
     /// `write` (not: it holds a null view already, [`null_once`]).
-    fn make_null_view(&self, index: u32, write: bool) {
+    fn make_null_view(&self, index: u32, write: bool, laps: &mut Laps) {
         if !write {
         } else if self.sampler {
             self.null_sampler(index);
         } else {
             null_view(self.cpu(index));
         }
+        lap!(laps, SlotHostNs);
         self.keep(index, None);
+        lap!(laps, SlotKeepNs);
         self.set_stride(index, None);
         self.set_mark(index, None);
+        lap!(laps, SlotTablesNs);
         if index < self.count {
             self.viewed.set(index, None, false);
         }
+        lap!(laps, SlotViewedNs);
     }
 
     /// Enters the byte stride of `view` (0 for none or not a buffer view)
@@ -1269,6 +1309,7 @@ impl HostHeap {
     /// ([`Made::Needs`]).
     fn make_locked(&self, index: u32, handle: u64, for_draw: bool, prepared: Option<[u32; 3]>) -> Made {
         let entry = &self.made[index as usize];
+        let mut laps = Laps::start(index);
         // Before the record is read: a thread that finds the entry its
         // record's key meanwhile does not take the slot for made
         // ([`HostHeap::made`]). `was`: what the slot is made from.
@@ -1284,6 +1325,7 @@ impl HostHeap {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        lap!(laps, SlotLookNs);
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
@@ -1294,8 +1336,9 @@ impl HostHeap {
                 if !shows && null_once() {
                     crate::copystat::add(crate::copystat::C::NullKept, 1);
                 }
-                self.make_null_view(index, shows || !null_once());
+                self.make_null_view(index, shows || !null_once(), &mut laps);
                 self.note_address(index, None);
+                lap!(laps, SlotTablesNs);
             }
             // Last: the slot is whole for whoever finds this.
             entry.store(0, SeqCst);
@@ -1326,19 +1369,24 @@ impl HostHeap {
             // Made once a shader reads it (`crate::shadow::take_reads`).
             crate::shadow::forget_read(index);
         }
+        lap!(laps, SlotTablesNs);
         let (kept, mark) = if later {
             (None, None)
         } else {
             make_marked(&view, self.cpu(index))
         };
-        self.set_mark(index, mark);
         if kept.is_none() && !self.sampler {
             null_for(&view, self.cpu(index));
         }
+        lap!(laps, SlotHostNs);
+        self.set_mark(index, mark);
+        lap!(laps, SlotTablesNs);
         if !self.sampler {
             self.viewed.set(index, Some(&view), kept.is_some());
         }
+        lap!(laps, SlotViewedNs);
         self.keep(index, kept.flatten());
+        lap!(laps, SlotKeepNs);
         // Last: the slot is whole for whoever finds this (`made`).
         entry.store(key, SeqCst);
         Made::Is(Some(view))

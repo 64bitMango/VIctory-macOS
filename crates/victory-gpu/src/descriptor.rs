@@ -757,7 +757,7 @@ fn record(handle: u64, view: View) {
     // held, as below: its generation is the entry's own then (`forget`
     // holds the index alone).
     if record_shared() {
-        let index = crate::contend::read(&VIEW_INDEX, crate::contend::Lock::Views);
+        let index = crate::contend::read(&VIEW_INDEX, crate::contend::Lock::ViewIndex);
         if let Some(&i) = index.index.get(&view) {
             let generation = VIEWS.read().unwrap_or_else(|e| e.into_inner()).generations[i as usize];
             write_record(handle, i, generation);
@@ -769,7 +769,7 @@ fn record(handle: u64, view: View) {
             return;
         }
     }
-    let mut index = crate::contend::write(&VIEW_INDEX, crate::contend::Lock::Views);
+    let mut index = crate::contend::write(&VIEW_INDEX, crate::contend::Lock::ViewIndex);
     // Looked up again: another thread may have entered it meanwhile.
     let i = match index.index.get(&view) {
         Some(&i) => {
@@ -781,7 +781,7 @@ fn record(handle: u64, view: View) {
             let free = index.free.pop();
             let i = {
                 // The entries held alone for the one entry written.
-                let mut views = crate::contend::write(&VIEWS, crate::contend::Lock::Views);
+                let mut views = crate::contend::write(&VIEWS, crate::contend::Lock::ViewIndex);
                 match free {
                     Some(i) => {
                         views.list[i as usize].0 = view.clone();
