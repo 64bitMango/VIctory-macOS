@@ -121,12 +121,20 @@ fn a_frame_recorded_through_the_host_layer_is_replayed() {
         assert_eq!(results(&mut player), made.results, "{what}");
         if o.detail != Detail::Off {
             let kinds: Vec<&str> = report.categories.iter().map(|c| c.0.as_str()).collect();
-            for kind in ["draws", "dispatches", "clears"] {
+            for kind in ["draws", "indirect draws", "dispatches", "clears"] {
                 assert!(kinds.contains(&kind), "{what}: {kinds:?}");
             }
+            // One plain and one with indices; the third by its arguments.
             let draws = report.categories.iter().find(|c| c.0 == "draws").unwrap();
-            assert_eq!(draws.2, 3, "{what}");
+            assert_eq!(draws.2, 2, "{what}");
             assert!(report.shaders.iter().any(|s| s.2.contains("replay test: draw")), "{what}: {:?}", report.shaders);
+            if o.detail == Detail::Pieces {
+                // The frame's own time is shared out among the pieces: the
+                // shares of a loop add up to its submissions' times.
+                let shared: f64 = report.categories.iter().map(|c| c.3.unwrap()).sum();
+                let (least, most) = report.frame_ms.iter().fold((f64::MAX, 0f64), |m, &f| (m.0.min(f), m.1.max(f)));
+                assert!(shared > least * 0.5 && shared < most * 1.5, "{shared} of {least}..{most}");
+            }
         }
     }
 

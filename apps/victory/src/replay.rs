@@ -100,12 +100,13 @@ pub(crate) fn run(r: Replay) -> Result<()> {
             println!("not translated: {line}");
         }
         println!(
-            "{} of the capture's {} pipelines of the title's had their containers; {} shaders written to {} in {:.1} s",
+            "{} of the capture's {} pipelines of the title's had their containers; {} shaders written to {} in {:.1} s, {} of them the capture's own bit for bit",
             done.found,
             done.pipelines,
             done.written,
             into.display(),
-            done.seconds
+            done.seconds,
+            done.same
         );
         if done.found < done.pipelines {
             println!(

@@ -155,10 +155,14 @@ pub struct Report {
     pub submits: Vec<(usize, Option<f64>, Option<f64>)>,
     /// With detailed timing: how it was found.
     pub detail: Option<&'static str>,
-    /// With detailed timing: ms (median of the loops) and count by kind.
-    pub categories: Vec<(String, f64, u32)>,
-    /// With detailed timing: ms, count and name of the costliest pipelines.
-    pub shaders: Vec<(f64, u32, String)>,
+    /// With detailed timing, by kind of command: its name, ms (median of
+    /// the loops), commands, and (timed in pieces) its share of the frame's
+    /// own time in ms: each submission's pieces scaled to add up to what
+    /// the submission took whole.
+    pub categories: Vec<(String, f64, u32, Option<f64>)>,
+    /// With detailed timing, the costliest pipelines: ms, commands, name,
+    /// and the share of the frame's own time.
+    pub shaders: Vec<(f64, u32, String, Option<f64>)>,
     /// Against the presented picture: dB (infinite: the same), and whether
     /// its bytes are the same.
     pub picture: Option<(f64, bool)>,
@@ -239,16 +243,23 @@ impl Report {
         if let Some(how) = self.detail {
             let _ = writeln!(t, "  commands timed {how}");
         }
+        let share = |v: &Option<f64>| v.map_or(String::new(), |v| format!("{v:8.2}  "));
+        let shared = self.categories.iter().any(|c| c.3.is_some());
+        let heads = if shared {
+            "ms of the frame's own time, ms sent alone (commands)"
+        } else {
+            "ms (commands)"
+        };
         if !self.categories.is_empty() {
-            let _ = writeln!(t, "  by kind of command, ms (commands):");
-            for (name, ms, n) in &self.categories {
-                let _ = writeln!(t, "    {ms:8.2}  {n:6}  {name}");
+            let _ = writeln!(t, "  by kind of command, {heads}:");
+            for (name, ms, n, of_frame) in &self.categories {
+                let _ = writeln!(t, "    {}{ms:8.2}  {n:6}  {name}", share(of_frame));
             }
         }
         if !self.shaders.is_empty() {
-            let _ = writeln!(t, "  costliest pipelines, ms (commands):");
-            for (ms, n, name) in &self.shaders {
-                let _ = writeln!(t, "    {ms:8.2}  {n:6}  {name}");
+            let _ = writeln!(t, "  costliest pipelines, {heads}:");
+            for (ms, n, name, of_frame) in &self.shaders {
+                let _ = writeln!(t, "    {}{ms:8.2}  {n:6}  {name}", share(of_frame));
             }
         }
         match self.picture {
@@ -618,14 +629,17 @@ struct Ran {
     between: f64,
 }
 
+/// The time of pieces: ms sent alone, ms of the frame's own time (scaled so
+/// that each submission's pieces add up to what it took whole), commands.
+type Timed = (f64, f64, u32);
+
 /// A frame made ready to run, and what its runs gave so far.
 pub struct Prepared {
     sends: Sends,
     report: Report,
     runs: Vec<Ran>,
-    /// Per loop of timing in pieces: by kind and by pipeline, ms and
-    /// commands.
-    pieces: Vec<(BTreeMap<&'static str, (f64, u32)>, HashMap<u32, (f64, u32)>)>,
+    /// Per loop of timing in pieces: by kind and by pipeline.
+    pieces: Vec<(BTreeMap<&'static str, Timed>, HashMap<u32, Timed>)>,
     /// The picture its last run left ([`Player::picture_now`]).
     picture: Option<(f64, bool, String, Vec<u8>)>,
 }
@@ -3222,33 +3236,36 @@ impl Player {
         if let Some((db, _, hash, _)) = &p.picture {
             p.report.pictures.push((*db, hash.clone()));
         }
-        p.runs.push(ran);
         if self.detail(o) == Detail::Pieces {
             self.restore(o.restore)?;
             self.fresh = false;
-            let timed = self.in_pieces(&p.sends)?;
+            let timed = self.in_pieces(&p.sends, &ran)?;
             p.pieces.push(timed);
         }
+        p.runs.push(ran);
         Ok(())
     }
 
     /// Runs the frame cut into pieces, each sent alone and waited for: the
-    /// time of each by kind and by pipeline (ms, commands), less what a
-    /// submission that does nothing takes.
+    /// time of each by kind and by pipeline, less what a submission that
+    /// does nothing takes. `whole` is the run of the frame whose time the
+    /// pieces share out.
     #[allow(clippy::type_complexity)]
     fn in_pieces(
         &mut self,
         s: &Sends,
-    ) -> Result<(BTreeMap<&'static str, (f64, u32)>, HashMap<u32, (f64, u32)>)> {
+        whole: &Ran,
+    ) -> Result<(BTreeMap<&'static str, Timed>, HashMap<u32, Timed>)> {
         let (mesh, dispatches) = self.kinds();
-        let mut kinds: BTreeMap<&'static str, (f64, u32)> = BTreeMap::new();
-        let mut shaders: HashMap<u32, (f64, u32)> = HashMap::new();
+        // By submission: each piece's kind, pipeline, commands and ms.
+        let mut all: Vec<Vec<(&'static str, u32, u32, f64)>> = Vec::new();
         let (allocator, list) = self.plain_list()?;
         // SAFETY: a list just made, with nothing recorded.
         unsafe { list.Close()? };
         for (i, lists) in s.submits.iter().enumerate() {
             self.live_views(self.version_of.get(i).copied().unwrap_or(0));
             self.write_deltas(i);
+            let mut timed = Vec::new();
             for cmds in lists {
                 for piece in edit::pieces(cmds, &dispatches, &mesh) {
                     // SAFETY: a closed list of ours whose last run has
@@ -3270,12 +3287,29 @@ impl Player {
                         began.elapsed().as_secs_f64() * 1e3
                     };
                     let ms = (took - self.empty_ms).max(0.0);
-                    let k = kinds.entry(piece.kind).or_default();
-                    *k = (k.0 + ms, k.1 + piece.works);
-                    if piece.pso != NONE {
-                        let p = shaders.entry(piece.pso).or_default();
-                        *p = (p.0 + ms, p.1 + piece.works);
-                    }
+                    timed.push((piece.kind, piece.pso, piece.works, ms));
+                }
+            }
+            all.push(timed);
+        }
+        // The frame's own time shared out: by submission where each was
+        // waited for, else the whole frame's.
+        let alone: f64 = all.iter().flatten().map(|p| p.3).sum();
+        let mut kinds: BTreeMap<&'static str, Timed> = BTreeMap::new();
+        let mut shaders: HashMap<u32, Timed> = HashMap::new();
+        for (i, timed) in all.iter().enumerate() {
+            let of_these: f64 = timed.iter().map(|p| p.3).sum();
+            let scale = match whole.walls.get(i) {
+                Some(wall) if of_these > 0.0 => wall / of_these,
+                None if alone > 0.0 => whole.frame / alone,
+                _ => 0.0,
+            };
+            for &(kind, pso, works, ms) in timed {
+                let k = kinds.entry(kind).or_default();
+                *k = (k.0 + ms, k.1 + ms * scale, k.2 + works);
+                if pso != NONE {
+                    let p = shaders.entry(pso).or_default();
+                    *p = (p.0 + ms, p.1 + ms * scale, p.2 + works);
                 }
             }
         }
@@ -3360,7 +3394,7 @@ impl Player {
             }
             Detail::Pieces => {
                 report.detail = Some(
-                    "in pieces: each run of commands of one kind with one pipeline was sent as a submission of its own and waited for (less what a submission that does nothing takes)",
+                    "in pieces: each run of commands of one kind with one pipeline was sent as a submission of its own and waited for (less what a submission that does nothing takes); the frame's own time is shared out by those times, submission by submission",
                 );
                 self.by_pieces(&pieces, o, &mut report);
             }
@@ -3430,8 +3464,14 @@ impl Player {
             }
         }
         self.detailed(
-            kinds.into_iter().map(|(k, (ms, n))| (k, median(&ms), n)).collect(),
-            shaders.into_iter().map(|(k, (ms, n))| (k, median(&ms), n)).collect(),
+            kinds
+                .into_iter()
+                .map(|(k, (ms, n))| (k, median(&ms), n, None))
+                .collect(),
+            shaders
+                .into_iter()
+                .map(|(k, (ms, n))| (k, median(&ms), n, None))
+                .collect(),
             o,
             report,
         );
@@ -3442,28 +3482,36 @@ impl Player {
     #[allow(clippy::type_complexity)]
     fn by_pieces(
         &self,
-        pieces: &[(BTreeMap<&'static str, (f64, u32)>, HashMap<u32, (f64, u32)>)],
+        pieces: &[(BTreeMap<&'static str, Timed>, HashMap<u32, Timed>)],
         o: &Options,
         report: &mut Report,
     ) {
         let loops = if pieces.len() > 2 { &pieces[1..] } else { pieces };
-        let mut kinds: BTreeMap<&str, (Vec<f64>, u32)> = BTreeMap::new();
-        let mut shaders: HashMap<u32, (Vec<f64>, u32)> = HashMap::new();
+        let mut kinds: BTreeMap<&str, (Vec<f64>, Vec<f64>, u32)> = BTreeMap::new();
+        let mut shaders: HashMap<u32, (Vec<f64>, Vec<f64>, u32)> = HashMap::new();
         for (of_kind, of_shader) in loops {
-            for (k, (ms, n)) in of_kind {
+            for (k, (ms, of_frame, n)) in of_kind {
                 let all = kinds.entry(k).or_default();
                 all.0.push(*ms);
-                all.1 = *n;
+                all.1.push(*of_frame);
+                all.2 = *n;
             }
-            for (k, (ms, n)) in of_shader {
+            for (k, (ms, of_frame, n)) in of_shader {
                 let all = shaders.entry(*k).or_default();
                 all.0.push(*ms);
-                all.1 = *n;
+                all.1.push(*of_frame);
+                all.2 = *n;
             }
         }
         self.detailed(
-            kinds.into_iter().map(|(k, (ms, n))| (k, median(&ms), n)).collect(),
-            shaders.into_iter().map(|(k, (ms, n))| (k, median(&ms), n)).collect(),
+            kinds
+                .into_iter()
+                .map(|(k, (ms, of_frame, n))| (k, median(&ms), n, Some(median(&of_frame))))
+                .collect(),
+            shaders
+                .into_iter()
+                .map(|(k, (ms, of_frame, n))| (k, median(&ms), n, Some(median(&of_frame))))
+                .collect(),
             o,
             report,
         );
@@ -3471,21 +3519,25 @@ impl Player {
 
     fn detailed(
         &self,
-        kinds: Vec<(&str, f64, u32)>,
-        mut shaders: Vec<(u32, f64, u32)>,
+        kinds: Vec<(&str, f64, u32, Option<f64>)>,
+        mut shaders: Vec<(u32, f64, u32, Option<f64>)>,
         o: &Options,
         report: &mut Report,
     ) {
+        // By the share of the frame's own time where there is one.
+        let key = |ms: f64, of_frame: Option<f64>| of_frame.unwrap_or(ms);
         report.categories = kinds
             .into_iter()
-            .map(|(k, ms, n)| (k.to_owned(), ms, n))
+            .map(|(k, ms, n, of_frame)| (k.to_owned(), ms, n, of_frame))
             .collect();
-        report.categories.sort_by(|a, b| b.1.total_cmp(&a.1));
-        shaders.sort_by(|a, b| b.1.total_cmp(&a.1));
+        report
+            .categories
+            .sort_by(|a, b| key(b.1, b.3).total_cmp(&key(a.1, a.3)));
+        shaders.sort_by(|a, b| key(b.1, b.3).total_cmp(&key(a.1, a.3)));
         shaders.truncate(o.top);
         report.shaders = shaders
             .into_iter()
-            .map(|(pso, ms, n)| (ms, n, self.name_of(pso)))
+            .map(|(pso, ms, n, of_frame)| (ms, n, self.name_of(pso), of_frame))
             .collect();
     }
 
@@ -3625,8 +3677,11 @@ pub struct Retranslated {
     /// were all found.
     pub pipelines: usize,
     pub found: usize,
-    /// Files written.
+    /// Files written, and those of them that are the capture's own shaders
+    /// bit for bit (all of them, with the build and switches of the run
+    /// that was recorded).
     pub written: usize,
+    pub same: usize,
     /// Stages that did not translate: stage, hash and why.
     pub refused: Vec<String>,
     pub seconds: f64,
@@ -3680,6 +3735,8 @@ pub fn retranslate(folder: &Path, into: &Path) -> Result<Retranslated> {
             match made {
                 Ok(dxil) => {
                     if written.insert(name.clone()) {
+                        let recorded = frame.codes.get(*blob as usize).map(|c| c.hash);
+                        out.same += usize::from(recorded == Some(*blake3::hash(&dxil).as_bytes()));
                         std::fs::write(into.join(name), dxil)?;
                         out.written += 1;
                     }

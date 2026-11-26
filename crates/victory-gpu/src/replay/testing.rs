@@ -8,7 +8,8 @@
 //!   made with other formats to view it in, one placed in a heap, with a
 //!   second level);
 //! - a colour and a depth target, cleared and drawn to in three submissions
-//!   of four lists, each draw behind or in front of the others;
+//!   of four lists, each draw behind or in front of the others: one plain,
+//!   one with indices, one with its arguments read from a buffer;
 //! - a buffer the CPU writes anew before every submission, read by a
 //!   compute pass that writes another, which the draws read;
 //! - a view slot whose view is replaced between two submissions, and one
@@ -175,9 +176,24 @@ struct Program {
     draw: ID3D12PipelineState,
     compute_root: ID3D12RootSignature,
     compute: ID3D12PipelineState,
+    signature: ID3D12CommandSignature,
     lists: Vec<HostList>,
     extras: Vec<Extra>,
 }
+
+/// How a rectangle is drawn.
+#[derive(Clone, Copy)]
+enum How {
+    Plain,
+    /// With indices from the inputs' buffer.
+    Indexed,
+    /// With its arguments from the inputs' buffer.
+    Indirect,
+}
+
+/// Where the inputs' buffer holds a draw's arguments, and six indices.
+const ARGUMENTS: usize = 1024;
+const INDICES: usize = 2048;
 
 fn compile(source: &str, entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
     let mut code: Option<ID3DBlob> = None;
@@ -404,6 +420,25 @@ impl Program {
             ],
         )?;
         crate::host::name(&compute, || "replay test: compute".into());
+        let arguments = [D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+            ..Default::default()
+        }];
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: a description of one argument that lives through the call.
+        unsafe {
+            device.CreateCommandSignature(
+                &D3D12_COMMAND_SIGNATURE_DESC {
+                    ByteStride: 16,
+                    NumArgumentDescs: 1,
+                    pArgumentDescs: arguments.as_ptr(),
+                    NodeMask: 0,
+                },
+                None::<&ID3D12RootSignature>,
+                &mut signature,
+            )?;
+        }
+        let signature = signature.ok_or_else(windows::core::Error::empty)?;
         let lists = (0..4)
             .map(|_| {
                 let list = host.new_list()?;
@@ -438,16 +473,26 @@ impl Program {
                         held: Vec::new(),
                     });
                 }
-                Err(e) => eprintln!("replay test: no texture \"{name}\" on this host: {e}"),
+                Err(e) => eprintln!("no texture \"{name}\" on this host: {e}"),
             }
         };
         for format in COLOURS {
-            let mut desc = texture(64, 3, DXGI_FORMAT(format), D3D12_RESOURCE_FLAG_NONE);
-            // Compressed levels are whole blocks.
-            if (70..=99).contains(&format) {
-                desc.MipLevels = 2;
-            }
+            // Every level down to one texel: the last ones of a compressed
+            // format are less than a block.
+            let desc = texture(64, 7, DXGI_FORMAT(format), D3D12_RESOURCE_FLAG_NONE);
             extra(format!("replay test: format {format}"), desc, false);
+        }
+        // Sizes that are no powers of two, nor whole blocks.
+        for (name, format, width, height) in [
+            ("odd blocks", DXGI_FORMAT_BC1_UNORM, 62, 30),
+            ("odd blocks of 16 bytes", DXGI_FORMAT_BC7_UNORM, 150, 90),
+            ("odd", rgba, 100, 50),
+            ("one texel", rgba, 1, 1),
+        ] {
+            let mut desc = texture(width, 0, format, D3D12_RESOURCE_FLAG_NONE);
+            desc.Height = height;
+            desc.MipLevels = (u32::BITS - width.max(height).leading_zeros()) as u16;
+            extra(format!("replay test: {name}"), desc, false);
         }
         for format in DEPTHS {
             let desc = texture(
@@ -458,6 +503,14 @@ impl Program {
             );
             extra(format!("replay test: depth format {format}"), desc, true);
         }
+        let mut shadows = texture(
+            64,
+            1,
+            DXGI_FORMAT_D32_FLOAT,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+        );
+        shadows.DepthOrArraySize = 4;
+        extra("replay test: depth layers".into(), shadows, true);
         let mut layers = texture(32, 2, rgba, D3D12_RESOURCE_FLAG_NONE);
         layers.DepthOrArraySize = 6;
         extra("replay test: six layers".into(), layers, false);
@@ -480,6 +533,7 @@ impl Program {
             draw,
             compute_root,
             compute,
+            signature,
             lists,
             extras,
         };
@@ -773,7 +827,7 @@ impl Program {
             if !e.depth && !packed {
                 assert!(bytes == given, "{} does not hold the bytes it was given", e.name);
             } else if !e.depth && bytes != given {
-                eprintln!("replay test: {} holds other bits than it was given", e.name);
+                eprintln!("{} holds other bits than it was given", e.name);
             }
             e.held.push(Rows {
                 pitch,
@@ -792,6 +846,20 @@ impl Program {
             // SAFETY: inside the buffer's mapping; no list in flight reads
             // it (every submission was waited for).
             unsafe { self.inputs.1.cast::<u32>().add(i).write(v) };
+        }
+        // A draw's arguments (six vertices, one instance) and six indices.
+        // SAFETY: as above.
+        unsafe {
+            self.inputs
+                .1
+                .add(ARGUMENTS)
+                .cast::<[u32; 4]>()
+                .write([6, 1, 0, 0]);
+            self.inputs
+                .1
+                .add(INDICES)
+                .cast::<[u16; 6]>()
+                .write([0, 1, 2, 3, 4, 5]);
         }
     }
 
@@ -817,8 +885,8 @@ impl Program {
         }
     }
 
-    /// Records a rectangle: where, its tint and depth, and the view slot
-    /// its texture is in.
+    /// Records a rectangle: where, its tint and depth, the view slot its
+    /// texture is in, and how it is drawn.
     fn rectangle(
         &self,
         l: &ID3D12GraphicsCommandList,
@@ -826,6 +894,7 @@ impl Program {
         tint: [f32; 4],
         depth: f32,
         slot: usize,
+        how: How,
     ) {
         let Some(host) = host() else { return };
         let (rtv, dsv) = (host.rtv(&self.target, None), host.dsv(&self.depth, None));
@@ -854,7 +923,25 @@ impl Program {
             l.SetGraphicsRootDescriptorTable(1, self.table(slot));
             l.SetGraphicsRootShaderResourceView(2, self.results.0.GetGPUVirtualAddress());
             l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            l.DrawInstanced(6, 1, 0, 0);
+            match how {
+                How::Plain => l.DrawInstanced(6, 1, 0, 0),
+                How::Indexed => {
+                    l.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
+                        BufferLocation: self.inputs.0.GetGPUVirtualAddress() + INDICES as u64,
+                        SizeInBytes: 12,
+                        Format: DXGI_FORMAT_R16_UINT,
+                    }));
+                    l.DrawIndexedInstanced(6, 1, 0, 0, 0);
+                }
+                How::Indirect => l.ExecuteIndirect(
+                    &self.signature,
+                    1,
+                    &self.inputs.0,
+                    ARGUMENTS as u64,
+                    None::<&ID3D12Resource>,
+                    0,
+                ),
+            }
         }
     }
 
@@ -884,7 +971,8 @@ impl Program {
             );
         }
         self.pass(&a.list, 5);
-        self.rectangle(&a.list, [-0.9, -0.9, 1.2, 1.2], [1.0, 1.0, 1.0, 1.0], 0.6, 2);
+        let white = [1.0, 1.0, 1.0, 1.0];
+        self.rectangle(&a.list, [-0.9, -0.9, 1.2, 1.2], white, 0.6, 2, How::Plain);
         a.close();
         host.execute(&[a]);
         // The second: other inputs, a view where there was none; two lists.
@@ -894,7 +982,8 @@ impl Program {
         self.pass(&b.list, 9);
         b.close();
         c.reset();
-        self.rectangle(&c.list, [-0.3, -0.5, 1.1, 1.0], [1.0, 0.6, 0.8, 1.0], 0.4, 3);
+        let pink = [1.0, 0.6, 0.8, 1.0];
+        self.rectangle(&c.list, [-0.3, -0.5, 1.1, 1.0], pink, 0.4, 3, How::Indexed);
         c.close();
         host.execute(&[b, c]);
         // The third: the view the first one drew with replaced, a
@@ -903,7 +992,8 @@ impl Program {
         self.view(2, &self.second);
         d.reset();
         self.pass(&d.list, 1);
-        self.rectangle(&d.list, [-0.6, -0.2, 1.5, 0.9], [0.7, 1.0, 0.5, 1.0], 0.5, 2);
+        let green = [0.7, 1.0, 0.5, 1.0];
+        self.rectangle(&d.list, [-0.6, -0.2, 1.5, 0.9], green, 0.5, 2, How::Indirect);
         // SAFETY: an open list; live objects.
         unsafe {
             let l = &d.list;

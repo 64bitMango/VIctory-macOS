@@ -124,12 +124,14 @@ times are the wall clock's:
 - **`--timing detailed`** runs each loop a second time *in pieces*: every
   run of commands of one kind with one pipeline bound becomes a submission
   of its own (with what was bound before it bound again), sent alone and
-  waited for; its time, less a submission's that does nothing, is counted
-  for its kind and its pipeline. The sums are larger than the frame's own
-  time, and a share more than a cost: on a GPU that renders in tiles, a
-  pass cut in pieces loads and stores its targets for each piece, and
-  nothing overlaps. Use it to rank; measure a pipeline's cost with
-  `--skip-shader ... --compare`.
+  waited for. Two numbers come of it for each kind of command and each
+  pipeline. *Sent alone* is the pieces' own time, less a submission's that
+  does nothing: more than the work costs inside the frame, since on a GPU
+  that renders in tiles a pass cut in pieces loads and stores its targets
+  for each piece, and nothing overlaps. *Of the frame's own time* shares
+  out what each submission took whole among its pieces by those times: the
+  shares add up to the frame. Use them to rank; measure what a pipeline
+  costs with `--skip-shader ... --compare`.
 - Use the median of several loops; the first is slower (pipelines are
   compiled on first use). The report lists every loop.
 
