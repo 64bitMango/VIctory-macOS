@@ -60,9 +60,20 @@ pub(crate) struct Map {
     /// Ranges that go back byte for byte instead (root UAVs, see
     /// [`Map::precise`]).
     precise: Arc<Mutex<Vec<(u64, u64)>>>,
+    /// Whether a program of the list was given the bitmap: it writes title
+    /// memory at addresses it computes ([`Map::written`]).
+    writes: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Map {
+    /// A program of the list writes title memory through the table (it
+    /// marks pages in the bitmap): any page of any copy may come back
+    /// changed, so the submission's refreshes take every changed page for
+    /// good (`crate::host`'s batch; `crate::watch::Tracked::take_resting`).
+    pub(crate) fn written(&self) {
+        self.writes.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Shaders write `[address, address + len)` through a root UAV, which
     /// goes back by its bytes before and after the run
     /// ([`Shadow::gpu_writes`]): the marked pages it touches are left to
@@ -481,7 +492,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     // SAFETY: a live buffer.
     let dirty = unsafe { bitmap.GetGPUVirtualAddress() };
     list.keep(&bitmap);
-    list.defer_memory(key);
+    let writes: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+    list.defer_memory(key, writes.clone());
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
     let data = data as usize;
@@ -593,6 +605,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         table,
         dirty,
         precise,
+        writes,
     })
 }
 

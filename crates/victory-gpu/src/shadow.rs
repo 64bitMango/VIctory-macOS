@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
-use crate::watch::PAGE;
+use crate::watch::{PAGE, Take};
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
@@ -357,6 +357,10 @@ impl Shadow {
     /// a title write there before the copy-back keeps the page's bytes from
     /// before it ([`crate::watch::Tracked::arm`]).
     pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
+        // From here to the copy-back, "changed" must mean "the title wrote it
+        // since the copy took it": pages a refresh left open while they
+        // rested are taken for good first.
+        self.settle(address, len);
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -607,7 +611,34 @@ impl Shadow {
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
+    #[cfg(test)]
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        self.update_as(address, len, Take::All)
+    }
+
+    /// The pages of `[address, address + len)` (whole pages) that a refresh
+    /// left open and marked while they rested (`crate::watch::rest_ms`) are
+    /// guarded and copied once more, as [`Shadow::update`] would have done:
+    /// before shaders write the range, whose bytes are told from the title's
+    /// by which pages the title wrote since the copy took them
+    /// ([`Shadow::copy_back_marked`]).
+    fn settle(&self, address: usize, len: usize) {
+        let Some(t) = &self.tracked else {
+            return;
+        };
+        let (from, to) = (address / PAGE * PAGE, address.saturating_add(len).div_ceil(PAGE) * PAGE);
+        if t.rested(from, to) {
+            self.update_as(from, to - from, Take::Rested);
+        }
+    }
+
+    /// [`Shadow::update`], taking the changed pages as `how` says: all of
+    /// them guarded (`Take::All`); those the title has just written left
+    /// open, to be copied again at the next refresh (`Take::Resting`, for a
+    /// submission none of whose shaders write title memory at addresses
+    /// they compute: see [`Shadow::copy_back_page`]); or only the ones left
+    /// so before, guarded now (`Take::Rested`).
+    pub(crate) fn update_as(&self, address: usize, len: usize, how: Take) -> usize {
         if self.clean() {
             return 0;
         }
@@ -634,19 +665,19 @@ impl Shadow {
             for (a, e) in busy {
                 let (a, e) = (a.max(from), e.min(to));
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    bytes += self.update_free(at, a, how);
                 }
                 if e > a.max(at) {
-                    bytes += self.update_busy(a.max(at), e);
+                    bytes += self.update_busy(a.max(at), e, how);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += self.update_free(at, to, how);
             }
             return bytes;
         }
-        self.update_free(from, to)
+        self.update_free(from, to, how)
     }
 
     /// [`Shadow::update`] of `[from, to)` where a list submitted earlier
@@ -659,9 +690,13 @@ impl Shadow {
     /// copy-back neither takes them for the GPU's nor puts them back over a
     /// later title write. Untracked memory (not the runtime's, or any under
     /// Rosetta) is copied whole, as [`Shadow::update_free`] copies it.
-    fn update_busy(&self, from: usize, to: usize) -> usize {
+    ///
+    /// Never left resting: shaders are about to write here.
+    fn update_busy(&self, from: usize, to: usize, how: Take) -> usize {
         let runs = match &self.tracked {
+            Some(t) if how == Take::Rested => t.take_as(from, to, Take::Rested),
             Some(t) => t.take(from, to),
+            None if how == Take::Rested => Vec::new(),
             None => vec![(from, to)],
         };
         if runs.is_empty() {
@@ -688,11 +723,24 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes: the pages changed since taken, or all of it where the
     /// memory is not tracked.
-    fn update_free(&self, from: usize, to: usize) -> usize {
+    fn update_free(&self, from: usize, to: usize, how: Take) -> usize {
+        if how == Take::Rested {
+            // Only what was left resting: no refresh of the rest.
+            let Some(t) = &self.tracked else {
+                return 0;
+            };
+            let (runs, unmapped) = t.settle(from, to);
+            let copied = runs.into_iter().map(|(a, b)| self.copy(a, b)).sum();
+            for (a, b) in unmapped {
+                // SAFETY: inside the mapping (`settle` cuts to the buffer).
+                unsafe { self.data.add(a - self.start as usize).write_bytes(0, b - a) };
+            }
+            return copied;
+        }
         if let Some(t) = &self.tracked {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
-            let (runs, unmapped) = t.take_split(from, to);
+            let (runs, unmapped) = t.take_split_as(from, to, how);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
             // Cut to the range: next to it shaders may be writing the copy.
@@ -2280,6 +2328,55 @@ pub(crate) mod tests {
         let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
         assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
+        unregister(p, p as u64);
+    }
+
+    /// A refresh leaves a block the title has just written open
+    /// (`crate::watch::rest_ms`) and copies it again when asked again; a
+    /// range shaders are about to write is settled first, so that their
+    /// bytes are still told from what the title writes meanwhile.
+    #[test]
+    fn a_resting_block_is_copied_again_and_settled_before_shaders_write_it() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        let title = |at: usize| (p + at) as *mut u8;
+        let host = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
+        let tracked = copy.tracked.as_ref().expect("pool memory is tracked");
+        assert_eq!(copy.update(p, len), len);
+        crate::watch::tests::rest(60_000);
+        // SAFETY: (title writes and reads below) bytes of our pool.
+        unsafe { title(40).write_volatile(0x11) };
+        assert_eq!(copy.update_as(p, len, Take::Resting), PAGE, "the page written");
+        assert_eq!(host(40), 0x11);
+        assert!(tracked.rested(p, p + len) && !copy.clean(), "left open and marked");
+        // Written again while it rests: no fault, and the next refresh has it.
+        unsafe { title(41).write_volatile(0x22) };
+        assert_eq!(copy.update_as(p, len, Take::Resting), PAGE, "copied again while it rests");
+        assert_eq!(host(41), 0x22);
+        unsafe { title(42).write_volatile(0x33) };
+        // Shaders are to write the range: taken for good, with that write.
+        copy.writing(p, len, true);
+        assert!(!tracked.rested(p, p + len) && copy.clean(), "settled");
+        assert_eq!(host(42), 0x33);
+        // The shaders write a byte of page 0; the title another meanwhile.
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        unsafe { title(50).write_volatile(0x44) };
+        let bits = b.data as *mut u32;
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *bits.add(base / 32) |= 1 << (base % 32) };
+        copy_back_marks(&[], false);
+        // SAFETY: bytes of our pool.
+        let read = |at: usize| unsafe { title(at).read_volatile() };
+        assert_eq!(read(10), 0xaa, "the shader's byte goes back");
+        assert_eq!((read(40), read(41), read(42), read(50)), (0x11, 0x22, 0x33, 0x44), "the title's bytes stay");
+        assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
+        crate::watch::tests::rest(0);
         unregister(p, p as u64);
     }
 

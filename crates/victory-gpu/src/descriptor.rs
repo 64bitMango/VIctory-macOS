@@ -341,7 +341,11 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
-        for (from, to) in written.take(start as usize, usize::MAX) {
+        // (Pages the title has just written are left open and looked at
+        // again at the next sync: `crate::watch::rest_ms`. A slot is made
+        // again only if its record changed, so a page told twice costs the
+        // look.)
+        for (from, to) in written.take_resting(start as usize, usize::MAX) {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
             let page_size = crate::watch::PAGE;

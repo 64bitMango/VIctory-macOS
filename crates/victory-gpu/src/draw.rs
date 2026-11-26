@@ -1093,6 +1093,9 @@ impl State {
                         l.SetGraphicsRootShaderResourceView(param, table);
                     }
                     if let Some(param) = stage.memory_dirty {
+                        if let Some((_, map)) = &self.memory {
+                            map.written();
+                        }
                         if compute {
                             l.SetComputeRootUnorderedAccessView(param, dirty);
                         } else {

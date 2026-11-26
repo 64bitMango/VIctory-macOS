@@ -92,7 +92,7 @@ mod twin;
 mod watch;
 
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use copystat::CountingAlloc;
+pub use copystat::{CountingAlloc, also_log as also_log_per_frame};
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]

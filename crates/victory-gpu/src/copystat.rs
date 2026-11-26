@@ -191,6 +191,15 @@ pub(crate) enum C {
     SyncStaleNothing,
     NullKept,
     SyncTabled,
+    /// Write faults that found their block open already (another thread's
+    /// fault opened it) and took no lock; blocks an asking left open and
+    /// told written because they rested (`crate::watch::rest_ms`); the
+    /// submissions whose refreshes could leave blocks so, and those that
+    /// could not (their shaders write title memory at addresses they compute).
+    GuardFaultsOpen,
+    RestedPages,
+    RestingSubmissions,
+    ExactSubmissions,
     /// Not a counter: how many there are.
     Count,
 }
@@ -298,6 +307,17 @@ pub(crate) fn page_faults() -> u64 {
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
     u64::from(c.PageFaultCount)
+}
+
+/// What else logs a line with the counters: called with the frames they are
+/// over ([`also_log`]).
+static MORE: std::sync::OnceLock<fn(f64)> = std::sync::OnceLock::new();
+
+/// Has `more` log its own per-frame line whenever the copy statistics are
+/// logged, given the frames since it was last called: for counters kept
+/// where this crate cannot see them (the loader's emulated instructions).
+pub fn also_log(more: fn(f64)) {
+    let _ = MORE.set(more);
 }
 
 /// Logs the counters per frame over `frames` frames, and the ranges that
@@ -459,6 +479,21 @@ pub(crate) fn log(frames: f64) {
         c[C::NullKept as usize],
         c[C::SyncTabled as usize],
     );
+    tracing::info!(
+        "  write faults per frame: {:.0} opened a block, {:.0} found it open (no lock taken), {:.2} ms in the handler in all (waits for the guard lock included); rest of {} ms: {:.0} blocks left open at an asking (each copied once more, not made read-only), {:.0} protect calls for {:.0} blocks; submissions that rested {:.1}, that could not {:.1} (their shaders write title memory at computed addresses)",
+        c[C::GuardFaults as usize],
+        c[C::GuardFaultsOpen as usize],
+        ms(c[C::HandlerUs as usize]),
+        crate::watch::rest_ms(),
+        c[C::RestedPages as usize],
+        c[C::ProtectCalls as usize],
+        c[C::ProtectPages as usize],
+        c[C::RestingSubmissions as usize],
+        c[C::ExactSubmissions as usize],
+    );
+    if let Some(more) = MORE.get() {
+        more(frames);
+    }
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
     snapshots.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));

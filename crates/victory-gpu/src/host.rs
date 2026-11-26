@@ -1058,8 +1058,9 @@ enum Step {
     Heap(std::sync::Arc<crate::bindless::Viewed>),
     /// Shaders read title memory through a view heap's page table (the
     /// heap's key, `crate::memory`): the table names every copy, each
-    /// brought up to date.
-    Memory(usize),
+    /// brought up to date. And whether a program of the list writes title
+    /// memory that way too (set while the list is recorded).
+    Memory(usize, std::sync::Arc<std::sync::atomic::AtomicBool>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1369,6 +1370,20 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        // Blocks the title has just written are left open by this
+        // submission's refreshes and copied again by the next one's
+        // (`crate::watch::rest_ms`), unless its shaders write title memory at
+        // addresses they compute: what they wrote is then told from the
+        // title's bytes page by page, by whether the title wrote the page
+        // since its copy took it (`Shadow::copy_back_page`), which a page
+        // left open cannot say. Ranges shaders write through views settle
+        // their own pages (`Shadow::writing`).
+        batch.rest = crate::watch::rest_ms() != 0 && !runs.iter().any(|list| list.writes_memory());
+        #[cfg(feature = "diagnostics")]
+        if crate::watch::rest_ms() != 0 {
+            use crate::copystat::{C, add};
+            add(if batch.rest { C::RestingSubmissions } else { C::ExactSubmissions }, 1);
+        }
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -2317,8 +2332,16 @@ impl HostList {
 
     /// Shaders of the list read title memory through the page table of
     /// view heap `heap` (`crate::memory::prepare` at submission).
-    pub(crate) fn defer_memory(&self, heap: usize) {
-        self.deferred().copies.push(Step::Memory(heap));
+    /// `writes`: set if a program of the list writes title memory through
+    /// the table as well.
+    pub(crate) fn defer_memory(&self, heap: usize, writes: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.deferred().copies.push(Step::Memory(heap, writes));
+    }
+
+    /// Whether shaders of the list write title memory at addresses they
+    /// compute: any page of any host copy, known only once they have run.
+    fn writes_memory(&self) -> bool {
+        self.deferred().copies.iter().any(|step| matches!(step, Step::Memory(_, writes) if writes.load(Ordering::Relaxed)))
     }
 
     /// After the list has run, before its writes go back: `check` says
@@ -2618,7 +2641,7 @@ impl HostList {
                     Step::GpuWrite(..) => C::StepGpuWriteUs,
                     Step::Texture(..) => C::StepTextureUs,
                     Step::Heap(_) => C::StepHeapUs,
-                    Step::Memory(_) => C::StepMemoryUs,
+                    Step::Memory(..) => C::StepMemoryUs,
                 },
             );
             let copied = match step {
@@ -2679,7 +2702,7 @@ impl HostList {
                     crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
                     continue;
                 }
-                &Step::Memory(heap) => {
+                &Step::Memory(heap, _) => {
                     crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
                     continue;
                 }
@@ -2716,6 +2739,10 @@ struct Batch {
         usize,
         (std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges),
     >,
+    /// Whether the refreshes leave blocks the title has just written open
+    /// (`crate::watch::Tracked::take_resting`); not unless the submission
+    /// says so.
+    rest: bool,
 }
 
 /// How far apart a copy's pending ranges may be and still be done as one,
@@ -2789,7 +2816,8 @@ impl Batch {
             let (start, len) = shadow.range();
             for (from, to) in ranges.iter() {
                 let started = std::time::Instant::now();
-                let copied = shadow.update(from, to - from);
+                let how = if self.rest { crate::watch::Take::Resting } else { crate::watch::Take::All };
+                let copied = shadow.update_as(from, to - from, how);
                 let us = started.elapsed().as_micros() as u64;
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::range(from, to - from, us, 0);
@@ -4159,6 +4187,46 @@ mod batch {
     use crate::watch::PAGE;
     use std::sync::Arc;
 
+
+    /// A submission that may leave blocks resting copies a block the title
+    /// has just written and leaves it marked, so the next submission copies
+    /// it again; one that may not (its shaders write title memory at
+    /// addresses they compute) takes it for good.
+    #[test]
+    fn a_resting_submission_leaves_a_written_block_to_the_next() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), len, "all of it at first");
+        crate::watch::tests::rest(60_000);
+        // SAFETY: (both writes) our pool; the first faults, the second
+        // finds the block open.
+        unsafe { ((p + 8) as *mut u8).write_volatile(7) };
+        for value in [7, 8] {
+            let mut batch = Batch { rest: true, ..Batch::default() };
+            batch.add(&copy, p, len);
+            assert_eq!(batch.flush(), PAGE, "the block written, at each submission while it rests");
+            assert_eq!(copy.read_host((p + 8) as u64, 1)[0] & 0xff, value);
+            assert!(!copy.clean());
+            batch.add(&copy, p, len);
+            assert_eq!(batch.flush(), 0, "once per submission");
+            unsafe { ((p + 8) as *mut u8).write_volatile(8) };
+        }
+        let mut batch = Batch::default();
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), PAGE, "taken for good");
+        assert!(copy.clean());
+        crate::watch::tests::rest(0);
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
 
     /// A host copy of tracked title memory: a submission whose lists all ask
     /// for it whole copies the one page the title wrote, once, and again

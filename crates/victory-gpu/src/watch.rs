@@ -36,6 +36,15 @@
 //!
 //! Under Rosetta (Wine on macOS) nothing is tracked: see
 //! [`fault_tracking`].
+//!
+//! A write fault is dear under Wine and Rosetta (tens of microseconds to
+//! reach the handler, before its own work), so two things keep them few. A
+//! block a fault has just opened rests ([`rest_ms`]): an asking that only
+//! copies what it is told ([`Tracked::take_resting`]) leaves it open and is
+//! told "written" again, where guarding it at once had the title's next
+//! write fault again. And a fault that finds its block open already (another
+//! thread's fault opened it meanwhile) goes back to its write without the
+//! guard lock ([`OPENED`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -99,6 +108,109 @@ fn rosetta() -> bool {
 /// they saved.
 pub(crate) const PAGE: usize = 64 << 10;
 
+/// How long a block stays open after a title write fault opened it, in
+/// milliseconds; 0: not at all (it is guarded again by the next asking, as
+/// before). `VICTORY_GUARD_REST=0` turns the rest off,
+/// `VICTORY_GUARD_REST_MS=<n>` sets its length ([`REST_MS`] unless given).
+///
+/// The title's recording threads write a block again and again through a
+/// frame, and a submission's refresh used to make it read-only each time, so
+/// that the very next write faulted: in the world 1,100-1,300 faults a frame.
+/// While a block rests, the askings that can stand it ([`Tracked::take_resting`])
+/// are told it is written, copy it, and leave it open and marked; the first
+/// such asking after the rest guards it, and takes it for good.
+pub(crate) fn rest_ms() -> u32 {
+    #[cfg(test)]
+    {
+        tests::REST_IN_TEST.with(|r| r.get())
+    }
+    #[cfg(not(test))]
+    {
+        static MS: LazyLock<u32> = LazyLock::new(|| {
+            rest_from(
+                std::env::var("VICTORY_GUARD_REST").ok().as_deref(),
+                std::env::var("VICTORY_GUARD_REST_MS").ok().as_deref(),
+            )
+        });
+        *MS
+    }
+}
+
+/// The rest unless `VICTORY_GUARD_REST_MS` says another: longer than the
+/// ~35 ms between two submissions' askings about a block in the world (so a
+/// block the title wrote since the last asking is left open by the next one,
+/// and by no more than that one or two: each asking of a resting block copies
+/// its 64 KiB again whether it was written or not), and a tenth of that
+/// world's frame. Windows builds elsewhere use 3 ms, with askings under a
+/// millisecond apart; at 3 ms here no asking would fall inside a rest.
+pub(crate) const REST_MS: u32 = 50;
+
+/// [`rest_ms`] from `VICTORY_GUARD_REST` and `VICTORY_GUARD_REST_MS`.
+fn rest_from(switch: Option<&str>, ms: Option<&str>) -> u32 {
+    if switch.map(str::trim) == Some("0") {
+        return 0;
+    }
+    // (Capped: stamps are milliseconds in 32 bits, compared by difference.)
+    ms.and_then(|v| v.trim().parse::<u32>().ok()).map_or(REST_MS, |ms| ms.min(60_000))
+}
+
+/// The blocks title write faults opened that nothing has guarded since, and
+/// when: a block's number in a word's high half, the milliseconds since
+/// [`START`] in its low half; 0 for none. Written under the guard lock (by
+/// the fault that opened the block, after every tracker holding it is marked;
+/// cleared by whoever guards it, before it does), read without it: by a fault
+/// on a block another thread's fault has opened meanwhile, which then has
+/// nothing to do and waits for no lock; and by askings, for [`rest_ms`].
+///
+/// A block's slot is found by its number alone, and one block's entry may
+/// push out another's: that block is then guarded by the next asking and a
+/// fault on it takes the lock, both as before. Fixed and never allocated:
+/// the fault handler writes it.
+static OPENED: [AtomicU64; OPENED_SLOTS] = [const { AtomicU64::new(0) }; OPENED_SLOTS];
+const OPENED_SLOTS: usize = 1 << 12;
+
+/// What [`OPENED`]'s stamps count from.
+static START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+
+/// Milliseconds since [`START`] (wrapping after 49 days; stamps are compared
+/// by difference).
+fn now_ms() -> u32 {
+    START.elapsed().as_millis() as u32
+}
+
+fn opened_slot(page: usize) -> &'static AtomicU64 {
+    &OPENED[((page as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52) as usize % OPENED_SLOTS]
+}
+
+/// A title write fault opened `page` (a page number), under the guard lock.
+fn note_opened(page: usize) {
+    if let Ok(high) = u32::try_from(page) {
+        opened_slot(page).store(u64::from(high) << 32 | u64::from(now_ms()), Ordering::Release);
+    }
+}
+
+/// `page` is about to be guarded: no fault opened it any more.
+fn forget_opened(page: usize) {
+    let slot = opened_slot(page);
+    let entry = slot.load(Ordering::Acquire);
+    if entry != 0 && (entry >> 32) as usize == page {
+        // (Another block's entry stored meanwhile stays.)
+        let _ = slot.compare_exchange(entry, 0, Ordering::AcqRel, Ordering::Relaxed);
+    }
+}
+
+/// When a title write fault opened `page`, if nothing guarded it since (and
+/// no other block took its slot): [`now_ms`] then.
+fn opened(page: usize) -> Option<u32> {
+    let entry = opened_slot(page).load(Ordering::Acquire);
+    (entry != 0 && (entry >> 32) as usize == page).then_some(entry as u32)
+}
+
+/// Whether a fault opened `page` less than `rest` milliseconds before `now`.
+fn rests(page: usize, now: u32, rest: u32) -> bool {
+    rest != 0 && opened(page).is_some_and(|at| now.wrapping_sub(at) < rest)
+}
+
 /// The pages a tracker has not taken since they changed, what it saves of
 /// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty), and
 /// whether it is a host buffer copy's (the only trackers [`retake`] marks).
@@ -160,12 +272,18 @@ impl Drop for Changed {
 struct Saved {
     armed: BTreeSet<usize>,
     bytes: std::collections::HashMap<usize, Box<[u8]>>,
+    /// Pages the tracker was told written while they rested
+    /// ([`Tracked::take_resting`]): still marked changed, though it copied
+    /// them and nobody knows of a write since ([`Tracked::settle`]).
+    rested: BTreeSet<usize>,
 }
 
 impl Changed {
     /// Page `page` was taken: what it saved of it is stale.
     fn taken(&self, page: usize) {
-        self.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page);
+        let mut saved = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        saved.bytes.remove(&page);
+        saved.rested.remove(&page);
     }
 
     /// Page `page` is about to change for the first time since it was
@@ -186,6 +304,33 @@ impl Changed {
 
 /// Byte runs `[start, end)` in order.
 pub(crate) type Runs = Vec<(usize, usize)>;
+
+/// Which changed pages an asking takes ([`Tracked::take_split_as`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Take {
+    /// All of them, each guarded.
+    All,
+    /// All of them, the resting ones left open and changed
+    /// ([`Tracked::take_resting`]).
+    Resting,
+    /// Only the ones an asking left resting, guarded now
+    /// ([`Tracked::settle`]).
+    Rested,
+}
+
+/// The parts of `pages` (page numbers, in order) inside `[from, to)`, as
+/// byte runs.
+fn runs_of(pages: &[usize], from: usize, to: usize) -> Runs {
+    let mut runs: Runs = Vec::new();
+    for &p in pages {
+        let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
+        match runs.last_mut() {
+            Some((_, end)) if *end == a => *end = b,
+            _ => runs.push((a, b)),
+        }
+    }
+    runs
+}
 
 /// Title memory a host copy or texture staging takes: bytes `[start, end)`.
 pub(crate) struct Tracked {
@@ -215,6 +360,18 @@ struct Guards {
     written: BTreeSet<usize>,
     #[cfg(feature = "diagnostics")]
     written_before: BTreeSet<usize>,
+}
+
+impl Guards {
+    /// Whether `page` is left open for now: a title write fault opened it,
+    /// or another address showing its memory, less than `rest` milliseconds
+    /// before `now`. (One view open is the memory open: no tracker may take
+    /// it for unwritten.)
+    fn rests(&self, page: usize, now: u32, rest: u32) -> bool {
+        rest != 0
+            && (rests(page, now, rest)
+                || self.alias_of.get(&page).is_some_and(|others| others.iter().any(|&o| rests(o, now, rest))))
+    }
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -491,6 +648,8 @@ impl Drop for Tracked {
             let watched_elsewhere = g.alias_of.get(&page).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
             if !watched_elsewhere {
                 open(&mut g, page);
+                // Nobody's any more: what is there next is not known open.
+                forget_opened(page);
             }
         }
     }
@@ -538,7 +697,31 @@ impl Tracked {
     /// `[from, to)`, in order. A page whose part in the tracked memory lies
     /// only partly in `[from, to)` is copied in part and stays changed.
     pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
-        let (copy, zero) = self.take_split(from, to);
+        self.take_as(from, to, Take::All)
+    }
+
+    /// [`Tracked::take`] that leaves resting blocks open ([`rest_ms`]): for
+    /// an asker that only copies what it is told changed, to whom a block
+    /// told once more costs that copy and nothing else. A resting block is
+    /// among the ranges returned and stays changed, so it is returned again
+    /// by every asking until one finds its rest over, guards it and takes it.
+    ///
+    /// No write is lost by it. A page leaves a tracker's changed pages only
+    /// here and in [`Tracked::taken`], and only once it is read-only (under
+    /// the guard lock, before the caller copies); the next write to it then
+    /// faults and marks it in every tracker holding it. A resting page is
+    /// not made read-only and so is not removed: this tracker and every
+    /// other one holding it keep it marked, whatever is written to it
+    /// meanwhile, until their own asking guards it. What the rest changes is
+    /// that "changed" may be said of a page nobody wrote since its last copy,
+    /// which is why only askers that can stand that use it.
+    pub(crate) fn take_resting(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        self.take_as(from, to, Take::Resting)
+    }
+
+    /// [`Tracked::take_split_as`], the runs of both kinds as one list.
+    pub(crate) fn take_as(&self, from: usize, to: usize, how: Take) -> Vec<(usize, usize)> {
+        let (copy, zero) = self.take_split_as(from, to, how);
         let mut runs: Vec<(usize, usize)> = copy.into_iter().chain(zero).collect();
         runs.sort_unstable();
         let mut merged: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
@@ -554,12 +737,20 @@ impl Tracked {
     /// [`Tracked::take`], the runs on pages with nothing mapped apart: they
     /// read as zeros, with no copy to try (each such page cost a dozen
     /// failing kernel reads, 7-30 ms a frame in run perf4).
+    #[cfg(test)]
     pub(crate) fn take_split(&self, from: usize, to: usize) -> (Runs, Runs) {
+        self.take_split_as(from, to, Take::All)
+    }
+
+    /// [`Tracked::take_split`], as `how` says: every changed page, or
+    /// leaving resting ones open ([`Tracked::take_resting`]), or only the
+    /// pages left so before ([`Tracked::settle`]).
+    pub(crate) fn take_split_as(&self, from: usize, to: usize, how: Take) -> (Runs, Runs) {
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from >= to {
             return (Vec::new(), Vec::new());
         }
-        let pages: Vec<usize> = {
+        let mut pages: Vec<usize> = {
             #[cfg(feature = "diagnostics")]
             let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
             let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -567,14 +758,46 @@ impl Tracked {
             drop(waited);
             changed.range(from / PAGE..to.div_ceil(PAGE)).copied().collect()
         };
+        if how == Take::Rested {
+            let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+            // (One taken for good meanwhile is changed no more: forgotten.)
+            let noted: Vec<usize> = saved.rested.range(from / PAGE..to.div_ceil(PAGE)).copied().collect();
+            for page in noted {
+                if pages.binary_search(&page).is_err() {
+                    saved.rested.remove(&page);
+                }
+            }
+            pages.retain(|p| saved.rested.contains(p));
+        }
         if pages.is_empty() {
             return (Vec::new(), Vec::new());
         }
-        let whole: Vec<usize> = pages
+        let mut whole: Vec<usize> = pages
             .iter()
             .copied()
             .filter(|&p| (p * PAGE).max(self.start) >= from && ((p + 1) * PAGE).min(self.end) <= to)
             .collect();
+        let rest = if how == Take::Resting { rest_ms() } else { 0 };
+        let now = if rest != 0 { now_ms() } else { 0 };
+        // Pages armed for shaders' writes are taken as always: what is kept
+        // of them hangs on the fault of the title's first write after this.
+        let free = |saved: &Saved, p: usize| saved.armed.is_empty() || !saved.armed.contains(&p);
+        if rest != 0 && !whole.is_empty() {
+            // Every one rests by a fault at its own address (the common
+            // case, a few blocks the title keeps writing): nothing to guard,
+            // and so no guard lock, which the title's faults wait for.
+            let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+            if whole.iter().all(|&p| free(&saved, p) && rests(p, now, rest)) {
+                for &page in &whole {
+                    saved.bytes.remove(&page);
+                    saved.rested.insert(page);
+                }
+                drop(saved);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::RestedPages, whole.len() as u64);
+                return (runs_of(&pages, from, to), Vec::new());
+            }
+        }
         // Every address showing the same pages is guarded too. A write in
         // between marks them changed again; the copy, made after, has it.
         #[cfg(feature = "diagnostics")]
@@ -583,6 +806,24 @@ impl Tracked {
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(feature = "diagnostics")]
         drop(waited);
+        if rest != 0 {
+            // The resting ones (by a fault at any address showing them) are
+            // left as they are: open, and changed here.
+            let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+            let all = whole.len();
+            whole.retain(|&p| {
+                let resting = free(&saved, p) && g.rests(p, now, rest);
+                if resting {
+                    saved.bytes.remove(&p);
+                    saved.rested.insert(p);
+                }
+                !resting
+            });
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::RestedPages, (all - whole.len()) as u64);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = all;
+        }
         #[cfg(feature = "diagnostics")]
         let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
         let others = aliases(&g, &whole);
@@ -607,6 +848,24 @@ impl Tracked {
             }
         }
         (copy, zero)
+    }
+
+    /// Whether an asking left a page of `[from, to)` open and marked while
+    /// it rested ([`Tracked::take_resting`]), and none has taken it since.
+    pub(crate) fn rested(&self, from: usize, to: usize) -> bool {
+        let saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        !saved.rested.is_empty() && saved.rested.range(from / PAGE..to.div_ceil(PAGE)).next().is_some()
+    }
+
+    /// Ends the rest of the pages of `[from, to)` this tracker was told
+    /// written while they rested: they are guarded and taken now, and the
+    /// byte ranges returned are to be copied once more (a write since the
+    /// last copy went unseen while they were open). For a caller about to
+    /// rely on "changed" meaning "written since the copy": shaders' writes
+    /// are told from the title's by it (`crate::shadow`). Pages changed that
+    /// never rested are left as they are.
+    pub(crate) fn settle(&self, from: usize, to: usize) -> (Runs, Runs) {
+        self.take_split_as(from, to, Take::Rested)
     }
 
     /// Whether page `page` (a page number) changed since it was taken.
@@ -710,6 +969,9 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
         counted(1, (to - from) as u64);
         #[cfg(test)]
         tests::PROTECTS.with(|n| n.set(n.get() + 1));
+        // Before they are read-only: a fault that still finds one of them
+        // in [`OPENED`] writes while it is open, ahead of the caller's copy.
+        (from..to).for_each(forget_opened);
         let mut old = 0;
         // SAFETY: title memory; only its protection changes.
         unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }
@@ -830,7 +1092,6 @@ impl RuntimeRegions {
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
 fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
-    let guarded = changed_here(g, first, last, save);
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
     {
@@ -839,17 +1100,24 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     }
     // Marked, not opened: nothing writes through them now, and opening
     // them only made the next take guard them again, one Wine call each
-    // (two thirds of all protection changes in #50's world).
+    // (two thirds of all protection changes in #50's world). Before the
+    // pages themselves are opened, as their own trackers are marked
+    // ([`changed_here`]).
     for page in others {
         mark(g, page, page + 1, save);
     }
-    guarded
+    changed_here(g, first, last, save)
 }
 
 /// [`changed`] of `[first, last)` alone. With `save`, before the write
 /// lands: trackers armed for a page they had taken keep its bytes.
 fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
+    // Marked while still read-only, so that a block is never open without
+    // its trackers knowing: a fault on a block found open ([`OPENED`]) goes
+    // straight back to its write, and what trackers keep of a page before
+    // its first write (`save`) is read before any thread can write it.
+    mark(g, first, last, save);
     // In runs: one protection change for consecutive pages (a run across
     // two views fails, and goes page by page).
     let mut i = 0;
@@ -861,7 +1129,6 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
         open_run(g, guarded[i], guarded[j - 1] + 1);
         i = j;
     }
-    mark(g, first, last, save);
     !guarded.is_empty()
 }
 
@@ -1015,51 +1282,92 @@ pub(crate) fn aliased(at: usize, len: usize) -> bool {
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
-    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
-    use windows_sys::Win32::System::Diagnostics::Debug::{
-        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
-        EXCEPTION_POINTERS,
-    };
-    unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
-        // SAFETY: the system passes the exception being dispatched.
-        let r = unsafe { &*(*info).ExceptionRecord };
-        const WRITE: usize = 1;
-        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-            || r.NumberParameters < 2
-            || r.ExceptionInformation[0] != WRITE
-        {
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
-        let at = r.ExceptionInformation[1];
-        #[cfg(feature = "diagnostics")]
-        let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
-        // Held across both checks: another thread may have opened the block
-        // since this one faulted, and a copy may have guarded it again since
-        // (then it is ours again, not read-only for some other reason).
-        if HOLDING.with(|h| h.get()) {
-            if read_only(at) {
-                open_under_lock(at / PAGE);
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
-        let mut g = guards();
-        if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        if writable(at) {
-            EXCEPTION_CONTINUE_EXECUTION
-        } else {
-            EXCEPTION_CONTINUE_SEARCH
-        }
-    }
+    use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
     static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
+        // (Read by the handler, which must not be the one to start it.)
+        LazyLock::force(&START);
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+thread_local! {
+    /// The address of this thread's last fault that found its block open
+    /// and went back to its write with nothing done, and how many such
+    /// faults in a row it has had there ([`MAY_RETRY`]).
+    static FOUND_OPEN: std::cell::Cell<(usize, u8)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// How often in a row a thread's fault at one address is answered "the block
+/// is open, write again" before the guard lock is taken and the block looked
+/// at: once is the rule (another thread's fault opened it), and a block
+/// guarded again in between clears its entry first; this bounds whatever is
+/// left (memory unmapped and mapped anew read-only under a stale entry).
+const MAY_RETRY: u8 = 3;
+
+/// The vectored handler for write faults: a write to a block we guard gets
+/// write access back and marks the block changed.
+///
+/// # Safety
+/// `info` is the exception being dispatched, as the system passes it.
+unsafe extern "system" fn on_write(info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
+    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+    use windows_sys::Win32::System::Diagnostics::Debug::{EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH};
+    // SAFETY: the system passes the exception being dispatched.
+    let r = unsafe { &*(*info).ExceptionRecord };
+    const WRITE: usize = 1;
+    if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+        || r.NumberParameters < 2
+        || r.ExceptionInformation[0] != WRITE
+    {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let at = r.ExceptionInformation[1];
+    #[cfg(feature = "diagnostics")]
+    let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
+    // Another thread's fault opened the block while this one was on its way
+    // here (several of the title's threads write one block): every tracker
+    // is marked already and write access is back, so there is nothing to do
+    // and no lock to wait for behind the other faults.
+    if opened(at / PAGE).is_some() {
+        let again = FOUND_OPEN.with(|f| {
+            let (last, n) = f.get();
+            let n = if last == at { n.saturating_add(1) } else { 1 };
+            f.set((at, n));
+            n
+        });
+        if again <= MAY_RETRY {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::GuardFaultsOpen, 1);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    FOUND_OPEN.with(|f| f.set((0, 0)));
+    // Held across both checks: another thread may have opened the block
+    // since this one faulted, and a copy may have guarded it again since
+    // (then it is ours again, not read-only for some other reason).
+    if HOLDING.with(|h| h.get()) {
+        if read_only(at) {
+            open_under_lock(at / PAGE);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let mut g = guards();
+    if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
+        // Every tracker holding it is marked: it rests from now, and
+        // other threads' faults on it need no lock.
+        note_opened(at / PAGE);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if writable(at) {
+        EXCEPTION_CONTINUE_EXECUTION
+    } else {
+        EXCEPTION_CONTINUE_SEARCH
+    }
 }
 
 /// Whether `at` is committed memory that is read-only, as our guards make
@@ -1643,6 +1951,211 @@ pub(crate) mod tests {
         // SAFETY: a page of our pool, guarded: the handler opens it.
         unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(1) };
         assert!(copy.changed(p / PAGE + 1) && texture.changed(p / PAGE + 1), "a title write marks both");
+    }
+
+    thread_local! {
+        /// [`rest_ms`] for what this thread asks: none unless a test sets it.
+        pub(crate) static REST_IN_TEST: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Sets [`rest_ms`] for this thread.
+    pub(crate) fn rest(ms: u32) {
+        REST_IN_TEST.with(|r| r.set(ms));
+    }
+
+    #[test]
+    fn the_rest_follows_its_variables() {
+        assert_eq!(rest_from(None, None), REST_MS);
+        assert_eq!(rest_from(Some("1"), None), REST_MS);
+        assert_eq!(rest_from(Some("0"), Some("80")), 0, "the switch turns it off whatever its length");
+        assert_eq!(rest_from(Some("1"), Some("80")), 80);
+        assert_eq!(rest_from(None, Some(" 20 ")), 20);
+        assert_eq!(rest_from(None, Some("0")), 0);
+        assert_eq!(rest_from(None, Some("soon")), REST_MS);
+        assert_eq!(rest_from(None, Some("4000000000")), 60_000);
+    }
+
+    /// A block a write fault opened rests: an asking that can stand it is
+    /// told the block is written and leaves it open; a write during the rest
+    /// needs no fault and is told by the next asking; the first asking after
+    /// the rest guards the block again, and a write after that faults.
+    #[test]
+    fn a_resting_block_is_told_written_at_each_asking_and_guarded_after_its_rest() {
+        let calls = || PROTECTS.with(std::cell::Cell::get);
+        let p = pool(2);
+        let all = (p, p + 2 * PAGE);
+        let t = track(p, 2 * PAGE, true).expect("pool memory is tracked");
+        // (Another test's block at this address may have ended open.)
+        (p / PAGE..p / PAGE + 2).for_each(forget_opened);
+        // Long enough that it cannot end under a slow test run.
+        rest(60_000);
+        // No fault yet, nothing rests: taken and guarded as by `take`.
+        assert_eq!(t.take_resting(all.0, all.1), [all]);
+        assert!(t.clean() && read_only(p) && read_only(p + PAGE));
+        // SAFETY: (all writes below) bytes of our pool; a read-only block is
+        // opened by the handler.
+        unsafe { ((p + 8) as *mut u8).write_volatile(1) };
+        assert!(writable(p) && opened(p / PAGE).is_some() && !t.clean());
+        let before = calls();
+        assert_eq!(t.take_resting(all.0, all.1), [(p, p + PAGE)], "told written");
+        assert!(writable(p), "and left open");
+        assert!(!t.clean() && t.changed(p / PAGE) && t.rested(p, p + PAGE), "still marked");
+        assert_eq!(calls(), before, "no protection changed");
+        // A write during the rest: no fault to say so, and it is told all
+        // the same, as often as asked.
+        unsafe { ((p + 9) as *mut u8).write_volatile(2) };
+        for _ in 0..3 {
+            assert_eq!(t.take_resting(all.0, all.1), [(p, p + PAGE)], "a write during the rest is told");
+        }
+        assert!(writable(p) && read_only(p + PAGE), "the other block stays guarded");
+        // The rest over: the next asking is told once more (it copies after
+        // the block is read-only), and takes the block for good.
+        rest(20);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(t.take_resting(all.0, all.1), [(p, p + PAGE)], "told at the asking that guards it");
+        assert!(read_only(p) && t.clean() && !t.rested(p, p + PAGE), "guarded again after the rest");
+        assert!(opened(p / PAGE).is_none());
+        assert!(t.take_resting(all.0, all.1).is_empty(), "and not told again");
+        // A write now faults, and is told.
+        unsafe { ((p + 10) as *mut u8).write_volatile(3) };
+        assert!(t.changed(p / PAGE) && writable(p));
+        // A rest of nothing: guarded at once, as before.
+        rest(0);
+        assert_eq!(t.take_resting(all.0, all.1), [(p, p + PAGE)]);
+        assert!(read_only(p) && t.clean());
+        drop(t);
+        free(p);
+    }
+
+    /// Every tracker of a resting block keeps it marked until its own asking
+    /// guards it: one that takes it for good (`take`) ends the rest for all,
+    /// and the others are still told.
+    #[test]
+    fn a_resting_block_stays_marked_in_every_tracker() {
+        let p = pool(1);
+        let all = (p, p + PAGE);
+        let (a, b) = (track(p, PAGE, true).expect("tracked"), track_copy(p, PAGE, true).expect("tracked"));
+        assert_eq!((a.take(all.0, all.1), b.take(all.0, all.1)), (vec![all], vec![all]));
+        rest(60_000);
+        // SAFETY: (both writes) bytes of our pool.
+        unsafe { (p as *mut u8).write_volatile(1) };
+        assert_eq!(a.take_resting(all.0, all.1), [all]);
+        assert!(writable(p) && !a.clean() && !b.clean());
+        // `b` takes it for good: read-only from here, and `a` is told what
+        // was written while it was open.
+        unsafe { ((p + 1) as *mut u8).write_volatile(2) };
+        assert_eq!(b.take(all.0, all.1), [all]);
+        assert!(read_only(p) && b.clean() && !a.clean());
+        assert_eq!(a.take_resting(all.0, all.1), [all], "the write during the rest is told to the other tracker");
+        assert!(a.clean() && read_only(p));
+        // A page armed for shaders' writes never rests: what is kept of it
+        // hangs on the fault of the title's first write after the take.
+        b.arm(p, p + PAGE);
+        // SAFETY: as above; the handler opens the block.
+        unsafe { ((p + 2) as *mut u8).write_volatile(3) };
+        assert!(writable(p) && b.changed(p / PAGE));
+        assert_eq!(b.take_resting(all.0, all.1), [all]);
+        assert!(read_only(p) && b.clean() && !b.rested(p, p + PAGE), "armed: taken for good");
+        b.disarm();
+        rest(0);
+        drop((a, b));
+        free(p);
+    }
+
+    /// Settling takes for good the pages an asking left resting, and leaves
+    /// alone the pages that changed without being asked about.
+    #[test]
+    fn settling_guards_what_rested_and_nothing_else() {
+        let p = pool(3);
+        let all = (p, p + 3 * PAGE);
+        let t = track_copy(p, 3 * PAGE, true).expect("tracked");
+        assert_eq!(t.take(all.0, all.1), [all]);
+        rest(60_000);
+        // SAFETY: bytes of our pool; the handler opens the two blocks.
+        unsafe {
+            (p as *mut u8).write_volatile(1);
+            ((p + PAGE) as *mut u8).write_volatile(1);
+        }
+        assert_eq!(t.take_resting(p, p + PAGE), [(p, p + PAGE)]);
+        assert!(t.rested(all.0, all.1) && !t.rested(p + PAGE, all.1));
+        assert_eq!(t.settle(all.0, all.1), (vec![(p, p + PAGE)], vec![]), "to be copied once more");
+        assert!(read_only(p) && !t.changed(p / PAGE) && !t.rested(all.0, all.1));
+        assert!(writable(p + PAGE) && t.changed(p / PAGE + 1), "never asked about: as it was");
+        assert_eq!(t.settle(all.0, all.1), (vec![], vec![]));
+        rest(0);
+        drop(t);
+        free(p);
+    }
+
+    /// A write through another view of a page opens that view, and the page
+    /// rests by it: the tracker of the first view is told at each asking and
+    /// guards neither view until the rest is over.
+    #[test]
+    fn a_block_rests_by_a_write_through_another_view() {
+        let (a, b) = twin_views(1);
+        let t = track(a, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(read_only(a) && read_only(b));
+        rest(60_000);
+        // SAFETY: (both writes) the second view of our page.
+        unsafe { (b as *mut u8).write_volatile(1) };
+        assert!(writable(b) && read_only(a) && t.changed(a / PAGE));
+        assert_eq!(t.take_resting(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(writable(b) && t.changed(a / PAGE), "the written view left open, the page still marked");
+        unsafe { ((b + 1) as *mut u8).write_volatile(2) };
+        assert_eq!(t.take_resting(a, a + PAGE), [(a, a + PAGE)], "a write during the rest is told");
+        rest(20);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(t.take_resting(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(read_only(a) && read_only(b) && t.clean(), "both views guarded after the rest");
+        rest(0);
+    }
+
+    /// A fault on a block that another thread's fault opened meanwhile goes
+    /// back to its write without the guard lock; once the block is guarded
+    /// again a fault takes the lock as ever.
+    #[test]
+    fn a_fault_on_a_block_found_open_takes_no_lock() {
+        use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_POINTERS, EXCEPTION_RECORD,
+        };
+        let p = pool(1);
+        let t = track(p, PAGE, true).expect("tracked");
+        assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+        // SAFETY: a byte of our pool; the handler opens the block.
+        unsafe { (p as *mut u8).write_volatile(1) };
+        assert!(opened(p / PAGE).is_some() && t.changed(p / PAGE), "open, and marked");
+        // The fault of a thread that wrote while the block was read-only and
+        // reaches the handler now, with the lock taken by someone else.
+        let fault = move || {
+            // SAFETY: a zeroed record is valid; the handler reads it alone.
+            unsafe {
+                let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+                record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+                record.NumberParameters = 2;
+                record.ExceptionInformation[0] = 1;
+                record.ExceptionInformation[1] = p + 8;
+                let mut info = EXCEPTION_POINTERS { ExceptionRecord: &mut record, ContextRecord: std::ptr::null_mut() };
+                on_write(&mut info)
+            }
+        };
+        let held = guards();
+        let (said, heard) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || said.send(fault()));
+        let answer = heard.recv_timeout(std::time::Duration::from_secs(20));
+        drop(held);
+        other.join().unwrap().unwrap();
+        assert_eq!(answer, Ok(EXCEPTION_CONTINUE_EXECUTION), "answered while the guard lock was held");
+        // Guarded again: no longer known as open, and a write faults and is
+        // marked under the lock.
+        assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+        assert!(opened(p / PAGE).is_none() && read_only(p) && t.clean());
+        // SAFETY: as above.
+        unsafe { ((p + 1) as *mut u8).write_volatile(2) };
+        assert!(t.changed(p / PAGE) && writable(p));
+        drop(t);
+        free(p);
     }
 
     /// A write or mapping that runs past the end of the address space (a

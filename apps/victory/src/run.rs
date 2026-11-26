@@ -95,6 +95,28 @@ pub fn run(
         "clwb loops     {} made NOPs",
         victory_loader::nop_clwb_loops(image.base() as u64, image.info())
     );
+    // The other AMD-only instructions the title runs in loops: each one
+    // emulated is an exception, tens of microseconds under Wine and Rosetta.
+    #[cfg(windows)]
+    {
+        let (made, left) = victory_loader::patch_clzero_loops(image.base() as u64, image.info());
+        println!(
+            "clzero loops   {made} made plain stores, {left} left to the handler{}",
+            match std::env::var("VICTORY_PATCH_CLZERO").as_deref() {
+                Ok("0") => " (VICTORY_PATCH_CLZERO=0: none replaced)",
+                _ if left > 0 => " (bytes nearby read as a jump into them; VICTORY_PATCH_CLZERO=all replaces them too)",
+                _ => "",
+            }
+        );
+        println!(
+            "wait hints     monitorx and mwaitx {}",
+            if victory_loader::patches_waits() {
+                "replaced at their first exception (VICTORY_PATCH_WAITS=0: emulated each time)"
+            } else {
+                "emulated each time (VICTORY_PATCH_WAITS=0)"
+            }
+        );
+    }
     // Masked stores redone as plain stores Rosetta can resume, so fault
     // tracking (`VICTORY_FAULT_TRACKING=1`) can run under Rosetta (#50).
     if let (Some(which), Some(original)) = (patching, original) {
@@ -264,6 +286,8 @@ fn nested_package(path: &Path) -> Option<std::path::PathBuf> {
 #[cfg(all(windows, feature = "diagnostics"))]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::dump_stacks_on_schedule();
+    // The exceptions emulated instructions cost, with the frame statistics.
+    victory_gpu::also_log_per_frame(victory_loader::log_emulated);
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
     poke(image.base(), image.info().size_of_image as usize);

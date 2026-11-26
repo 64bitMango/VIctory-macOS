@@ -14,6 +14,8 @@
 
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::amd_only::{Kind, compare_registers, count};
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
     EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_PRIV_INSTRUCTION, EXCEPTION_STACK_OVERFLOW, HMODULE,
@@ -242,7 +244,9 @@ const FATAL: [i32; 6] = [
 /// lack. Does their job instead: `clzero` (`0f 01 fc`) zeroes the 64-byte
 /// line at `rax` (see [`clzero`] for the loops around it);
 /// `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait hints, so a spin loop
-/// around them works with mwaitx as a yield; `rdpru` (`0f 01 fd`) reads
+/// around them works with mwaitx as a yield (and both are replaced in a
+/// title's code at their first exception, [`crate::amd_only::replace_wait`]);
+/// `rdpru` (`0f 01 fd`) reads
 /// MPERF (`ecx` 0) or APERF (1), cycles at the nominal and the actual
 /// frequency, and gets the time-stamp counter for both: a core that never
 /// changes frequency.
@@ -255,12 +259,31 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         if record.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION {
             return false;
         }
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::amd_only::Timed(std::time::Instant::now());
         let code = context.Rip as *const u8;
         match code.cast::<[u8; 3]>().read_unaligned() {
             [0x0f, 0x01, 0xfc] => return clzero(context),
-            [0x0f, 0x01, 0xfa] => {}
-            [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
+            // The two wait hints: stepped over, and made to raise no
+            // exception the next time (`amd_only::replace_wait`).
+            [0x0f, 0x01, 0xfa] => {
+                count(Kind::Monitorx);
+                crate::amd_only::replace_wait(context.Rip as usize);
+            }
+            [0x0f, 0x01, 0xfb] => {
+                count(Kind::Mwaitx);
+                crate::amd_only::replace_wait(context.Rip as usize);
+                std::thread::yield_now();
+            }
+            // One of them, replaced by another thread after this thread's
+            // exception was raised (a jump raises none): as it was.
+            [0xeb, 0x01, 0xfa] => count(Kind::Replaced),
+            [0xeb, 0x01, 0xfb] => {
+                count(Kind::Replaced);
+                std::thread::yield_now();
+            }
             [0x0f, 0x01, 0xfd] => {
+                count(Kind::Rdpru);
                 // Flags are left as they are: a Zen 3 changes none, for
                 // known counters or not (measured in user mode).
                 let known = context.Rcx as u32 <= 1;
@@ -280,6 +303,7 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                         clwb_loop_end(*gpr(context, pass.base), *gpr(context, pass.limit))
                 {
                     // A whole write-back loop in one exception (see `clwb_loop`).
+                    count(Kind::ClwbLoop);
                     let limit = *gpr(context, pass.limit);
                     *gpr(context, pass.base) = end;
                     let flags = cmp_flags(end, limit);
@@ -289,12 +313,14 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                 }
                 if let Some(len) = clwb_len(&bytes[..n]) {
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
+                    count(Kind::Clwb);
                     context.Rip += len as u64;
                     return true;
                 }
                 let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
                     return false;
                 };
+                count(Kind::Sse4a);
                 context.Rip += len as u64;
                 return true;
             }
@@ -487,6 +513,7 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
             && let Some((0, limit)) = compare_registers(cmp)
             && limit != 0
         {
+            count(Kind::ClzeroLoop);
             let limit = *gpr(context, limit);
             loop {
                 zero(context.Rax);
@@ -514,6 +541,7 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
             && a != 0
             && b != 0
         {
+            count(Kind::ClzeroLoop);
             let limit = *gpr(context, b);
             loop {
                 zero(context.Rax);
@@ -530,17 +558,10 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
             return true;
         }
     }
+    count(Kind::Clzero);
     zero(context.Rax);
     context.Rip += 3;
     true
-}
-
-/// `cmp rm, reg` between 64-bit registers (`REX.W 39 /r`): (`rm`, `reg`).
-fn compare_registers(code: &[u8]) -> Option<(u8, u8)> {
-    let &[rex @ 0x48..=0x4f, 0x39, modrm] = code else {
-        return None;
-    };
-    (modrm >> 6 == 3).then_some((modrm & 7 | (rex & 1) << 3, (modrm >> 3) & 7 | (rex & 4) << 1))
 }
 
 /// The general register numbered `n` as instructions encode it.
@@ -1824,6 +1845,262 @@ mod tests {
         assert_eq!(emulate(&[0x0f, 0x01, 0xfa], 0, &mut xmm), Some(3));
         assert_eq!(emulate(&[0x0f, 0x01, 0xfb], 0, &mut xmm), Some(3));
         assert!(xmm.iter().all(|r| r.Low == 1 && r.High == 2));
+    }
+
+    /// `len` bytes of fresh memory holding `code` at `at`, read and execute
+    /// only, as a title's code is.
+    fn code_page(len: usize, parts: &[(usize, &[u8])]) -> usize {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
+        };
+        // SAFETY: memory of our own, written inside its length.
+        unsafe {
+            let page = VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
+            assert!(!page.is_null());
+            page.write_bytes(0xcc, len);
+            for (at, code) in parts {
+                assert!(at + code.len() <= len);
+                std::ptr::copy_nonoverlapping(code.as_ptr(), page.add(*at), code.len());
+            }
+            let mut old = 0;
+            assert_ne!(VirtualProtect(page.cast(), len, PAGE_EXECUTE_READ, &mut old), 0);
+            page as usize
+        }
+    }
+
+    fn protection(at: usize) -> u32 {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: plain data filled in by the query.
+        unsafe {
+            let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            VirtualQuery(at as *const _, &mut m, size_of_val(&m));
+            m.Protect
+        }
+    }
+
+    /// `mov rax, rcx; xor ecx, ecx; xor edx, edx; monitorx; xor eax, eax;
+    /// mwaitx; ret`: a pass of a wait loop, on the address in `rcx`. The
+    /// `monitorx` is at 7 and the `mwaitx` at 12.
+    const WAITS: [u8; 16] =
+        [0x48, 0x89, 0xc8, 0x31, 0xc9, 0x31, 0xd2, 0x0f, 0x01, 0xfa, 0x31, 0xc0, 0x0f, 0x01, 0xfb, 0xc3];
+
+    /// The wait instructions of a title raise one exception each and none
+    /// after: they are replaced by a jump over themselves, and run. Where
+    /// the processor has them (an AMD one), nothing faults or changes.
+    #[test]
+    fn waits_are_replaced_at_their_first_exception() {
+        use crate::amd_only::{Kind, TEST_CODE, counted, patches_waits};
+        use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ;
+        report_crashes();
+        let exceptions = || counted(Kind::Monitorx) + counted(Kind::Mwaitx) + counted(Kind::Replaced);
+        // The first one over the end of its aligned eight bytes (at 0x107),
+        // as a title's busiest is.
+        let page = code_page(4096, &[(0x100, &WAITS), (0x800, &WAITS)]);
+        let bytes = |at: usize| -> [u8; 3] {
+            // SAFETY: inside the page.
+            unsafe { ((page + at) as *const [u8; 3]).read_volatile() }
+        };
+        let watched = 0u64;
+        // SAFETY: (both) code of ours at that offset, of that signature.
+        let first: extern "system" fn(*const u64) = unsafe { std::mem::transmute(page + 0x100) };
+        let second: extern "system" fn(*const u64) = unsafe { std::mem::transmute(page + 0x800) };
+        // Not a title's code: emulated, and left as it is.
+        let before = exceptions();
+        first(&watched);
+        assert_eq!((bytes(0x107), bytes(0x10c)), ([0x0f, 0x01, 0xfa], [0x0f, 0x01, 0xfb]));
+        if exceptions() == before || !patches_waits() {
+            // The processor has both instructions (or the switch is off).
+            return;
+        }
+        TEST_CODE.lock().unwrap().push((page, page + 4096));
+        let before = exceptions();
+        first(&watched);
+        assert!(exceptions() >= before + 2, "an exception each");
+        assert_eq!((bytes(0x107), bytes(0x10c)), ([0xeb, 0x01, 0xfa], [0xeb, 0x01, 0xfb]), "replaced");
+        assert_eq!(protection(page), PAGE_EXECUTE_READ, "the page protected as before");
+        // They run now. (Another test runs the two instructions once each
+        // meanwhile, in code that is not replaced: hence the margin.)
+        let before = exceptions();
+        for _ in 0..10_000 {
+            first(&watched);
+        }
+        let after = exceptions() - before;
+        println!("{after} exceptions in 10,000 passes after the replacement");
+        assert!(after <= 8, "{after} exceptions in 10,000 passes after the replacement");
+        // Several threads at one pair of instructions, from their first
+        // pass on: each sees the old instruction or the jump.
+        let before = exceptions();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    let watched = 0u64;
+                    start.wait();
+                    for _ in 0..5_000 {
+                        second(&watched);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let after = exceptions() - before;
+        println!("{after} exceptions in 4 threads' 5,000 passes each from the first");
+        assert_eq!((bytes(0x807), bytes(0x80c)), ([0xeb, 0x01, 0xfa], [0xeb, 0x01, 0xfb]));
+        assert!((2..=400).contains(&after), "{after} exceptions in 20,000 passes of 4 threads");
+        assert_eq!(protection(page), PAGE_EXECUTE_READ);
+    }
+
+    /// A thread whose exception a wait instruction raised just before
+    /// another thread replaced it finds the jump at its instruction
+    /// pointer: stepped over as the instruction it was. Other jumps are not
+    /// ours to emulate, and memory that is no title's code is not changed.
+    #[test]
+    fn a_wait_replaced_meanwhile_is_stepped_over() {
+        let mut xmm = [reg(1, 2); 16];
+        assert_eq!(emulate(&[0xeb, 0x01, 0xfa], 0, &mut xmm), Some(3));
+        assert_eq!(emulate(&[0xeb, 0x01, 0xfb], 0, &mut xmm), Some(3));
+        assert_eq!(emulate(&[0xeb, 0x01, 0xfc], 0, &mut xmm), None);
+        assert_eq!(emulate(&[0xeb, 0x02, 0xfa], 0, &mut xmm), None);
+        assert!(xmm.iter().all(|r| r.Low == 1 && r.High == 2));
+        let here = [0x0f_u8, 0x01, 0xfa, 0xcc];
+        // SAFETY: bytes of ours; refused before anything is touched.
+        assert!(!unsafe { crate::amd_only::replace_wait(here.as_ptr() as usize) });
+        assert_eq!(here, [0x0f, 0x01, 0xfa, 0xcc]);
+    }
+
+    /// What a `clzero` loop leaves, for the comparison of the handler's
+    /// emulation with the plain stores: the registers the loop changes, a
+    /// register it must not (the stores' scratch), the flags of its last
+    /// compare, and the memory around the lines.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Left {
+        rax: u64,
+        counter: u64,
+        rcx: u64,
+        flags: u32,
+        memory: Vec<u8>,
+    }
+
+    /// `clzero` loops replaced when their code is mapped run as plain
+    /// stores and leave exactly what the handler's emulation of the loop
+    /// leaves: registers, flags and memory, for both forms, for limits
+    /// inside a line, on a line's edge, at and below the start, and with
+    /// the stores' scratch register as the loop's limit.
+    #[test]
+    fn replaced_clzero_loops_leave_what_the_handler_leaves() {
+        use crate::amd_only::{patch_clzero_loops_in, seal};
+        use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ;
+        // Functions of (rcx: start, rdx: limit, r8: out), returning rax;
+        // out gets the flags, the second form's counter, and rcx.
+        // 0x100: mov rax, rcx; mov r10, rdx; [clzero; add rax, 0x40; cmp rax, r10; jb];
+        //        pushfq; pop r9; mov [r8], r9; mov [r8+8], rax; mov [r8+16], rcx; ret
+        let first: Vec<u8> = [
+            &[0x48, 0x89, 0xc8, 0x49, 0x89, 0xd2][..],
+            &[0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4],
+            &[0x9c, 0x41, 0x59, 0x4d, 0x89, 0x08, 0x49, 0x89, 0x40, 0x08, 0x49, 0x89, 0x48, 0x10, 0xc3],
+        ]
+        .concat();
+        // 0x200: the same against rcx, the stores' scratch register:
+        //        mov rax, rcx; mov rcx, rdx; [clzero; add rax, 0x40; cmp rax, rcx; jb]; ...
+        let scratch: Vec<u8> = [
+            &[0x48, 0x89, 0xc8, 0x48, 0x89, 0xd1][..],
+            &[0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x48, 0x39, 0xc8, 0x72, 0xf4],
+            &[0x9c, 0x41, 0x59, 0x4d, 0x89, 0x08, 0x49, 0x89, 0x40, 0x08, 0x49, 0x89, 0x48, 0x10, 0xc3],
+        ]
+        .concat();
+        // 0x300: mov r9, r8; mov r8, rdx; mov rdx, rcx;
+        //        [mov rax, rdx; add rdx, 0x40; clzero; cmp rdx, r8; jb];
+        //        pushfq; pop r10; mov [r9], r10; mov [r9+8], rdx; mov [r9+16], rcx; ret
+        let second: Vec<u8> = [
+            &[0x4d, 0x89, 0xc1, 0x49, 0x89, 0xd0, 0x48, 0x89, 0xca][..],
+            &[0x48, 0x89, 0xd0, 0x48, 0x83, 0xc2, 0x40, 0x0f, 0x01, 0xfc, 0x4c, 0x39, 0xc2, 0x72, 0xf1],
+            &[0x9c, 0x41, 0x5a, 0x4d, 0x89, 0x11, 0x49, 0x89, 0x51, 0x08, 0x49, 0x89, 0x49, 0x10, 0xc3],
+        ]
+        .concat();
+        // 0x400: a jump to the first form's second instruction ahead of it:
+        //        left to the handler unless asked for.
+        let entered: Vec<u8> =
+            [&[0xeb, 0x03][..], &[0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4], &[0xc3]]
+                .concat();
+        let page = code_page(4096, &[(0x100, &first), (0x200, &scratch), (0x300, &second), (0x400, &entered)]);
+        let mut pool = None;
+        // SAFETY: (both) our page, which nothing runs yet.
+        assert_eq!(unsafe { patch_clzero_loops_in(page as u64, 0x400, page as u64, false, &mut pool) }, (3, 0));
+        assert_eq!(
+            unsafe { patch_clzero_loops_in(page as u64 + 0x400, 0x100, page as u64, false, &mut pool) },
+            (0, 1),
+            "a loop bytes nearby jump into is left"
+        );
+        seal(pool);
+        assert_eq!(protection(page), PAGE_EXECUTE_READ, "the code protected as before");
+        // SAFETY: inside the page.
+        let byte = |at: usize| unsafe { ((page + at) as *const u8).read_volatile() };
+        assert_eq!((byte(0x106), byte(0x206), byte(0x309)), (0xe9, 0xe9, 0xe9), "a jump at each loop's top");
+        assert_eq!((byte(0x10d), byte(0x10e), byte(0x110)), (0x4c, 0x39, 0x72), "the compare and the jump back stay");
+        assert_eq!((byte(0x402), byte(0x403)), (0x0f, 0x01), "left as it was");
+
+        #[repr(align(64))]
+        struct Lines([u8; 64 * 8]);
+        let mut lines = Box::new(Lines([0; 64 * 8]));
+        let base = lines.0.as_mut_ptr() as u64 + 64 * 2;
+        type Loop = extern "system" fn(u64, u64, *mut [u64; 3]) -> u64;
+        // SAFETY: (all three) code of ours at that offset, of that signature.
+        let run: [Loop; 3] = unsafe {
+            [std::mem::transmute(page + 0x100), std::mem::transmute(page + 0x200), std::mem::transmute(page + 0x300)]
+        };
+        // (start, limit) from `base`: inside a line, on a line's edge, an
+        // unaligned start, the limit at the start and below it.
+        let cases: [(u64, i64); 7] = [(0, 100), (0, 128), (8, 130), (0, 0), (0, -64), (63, 65), (0, 64 * 5)];
+        for (start, limit) in cases {
+            let (start, limit) = (base + start, base.wrapping_add_signed(limit));
+            for (form, code) in [&first, &scratch, &second].into_iter().enumerate() {
+                let fill = |lines: &mut Lines| lines.0.fill(0xaa);
+                // The handler, as the exception at the loop's clzero finds
+                // the thread.
+                fill(&mut lines);
+                // SAFETY: an all-zero context is valid.
+                let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+                context.EFlags = 0x202 | (CMP_FLAGS & 0x41);
+                let emulated = match form {
+                    0 => {
+                        (context.Rax, context.R10, context.Rcx) = (start, limit, start);
+                        assert!(emulate_in(&code[6..18], 0, &mut context));
+                        assert_eq!(context.Rip, 12);
+                        Left { rax: context.Rax, counter: context.Rax, rcx: context.Rcx, flags: 0, memory: vec![] }
+                    }
+                    1 => {
+                        (context.Rax, context.Rcx) = (start, limit);
+                        assert!(emulate_in(&code[6..18], 0, &mut context));
+                        assert_eq!(context.Rip, 12);
+                        Left { rax: context.Rax, counter: context.Rax, rcx: context.Rcx, flags: 0, memory: vec![] }
+                    }
+                    _ => {
+                        // After the first pass's mov and add.
+                        (context.Rax, context.Rdx, context.R8, context.Rcx) = (start, start + 0x40, limit, start);
+                        assert!(emulate_in(&code[9..24], 7, &mut context));
+                        assert_eq!(context.Rip, 15);
+                        Left { rax: context.Rax, counter: context.Rdx, rcx: context.Rcx, flags: 0, memory: vec![] }
+                    }
+                };
+                let emulated = Left { flags: context.EFlags & CMP_FLAGS, memory: lines.0.to_vec(), ..emulated };
+                // The plain stores, run.
+                fill(&mut lines);
+                let mut out = [0u64; 3];
+                let rax = run[form](start, limit, &mut out);
+                let ran = Left { rax, counter: out[1], rcx: out[2], flags: out[0] as u32 & CMP_FLAGS, memory: lines.0.to_vec() };
+                assert_eq!(ran, emulated, "form {form}, start {start:#x}, limit {limit:#x}");
+                assert!(ran.memory.contains(&0) && ran.memory.contains(&0xaa));
+            }
+        }
+        // Asked for, the loop with a jump into it is replaced too.
+        let mut pool = None;
+        // SAFETY: our page; nothing runs that loop.
+        assert_eq!(unsafe { patch_clzero_loops_in(page as u64 + 0x400, 0x100, page as u64, true, &mut pool) }, (1, 0));
+        seal(pool);
+        assert_eq!(byte(0x402), 0xe9);
     }
 
     #[test]
