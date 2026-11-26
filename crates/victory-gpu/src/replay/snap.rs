@@ -6,9 +6,10 @@
 //! read-back buffers and from the buffers' own mappings straight to the
 //! files, and of the memory both sides see only a number of each 4 KiB page
 //! is kept ([`plain::page_hash`]) to tell what changed by the next
-//! submission. `frame.bin` is written anew after every submission (marked
-//! partial until the frame's present), so what was captured of a frame
-//! outlives a title that ends in the middle of it.
+//! submission. `frame.bin` is written anew after the first submission and
+//! every other second from then on (marked partial until the frame's
+//! present), so what was captured of a frame outlives a title that ends in
+//! the middle of it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -38,6 +39,9 @@ const STAGINGS: usize = 3;
 const PIECE: u64 = 32 << 20;
 /// What the CPU changes is kept in units of.
 const PAGE: usize = 4096;
+/// How long `frame.bin` is left as it is while submissions of the captured
+/// frame go by.
+const CHECKPOINT: std::time::Duration = std::time::Duration::from_secs(2);
 /// What one thread compares at a time.
 const CHUNK: usize = 1 << 20;
 
@@ -112,9 +116,17 @@ pub(super) fn submit(
             .map(|c| c.as_ref().and_then(|c| c.0.clone()))
             .collect();
         let _ours = Ours::new();
-        let done = c
-            .submit(r, queue, &commands)
-            .and_then(|()| c.timed("frame.bin after each submission", |c| c.write(r, true)));
+        // `frame.bin` so far, after the first submission (the long one) and
+        // then every other second: a title of 20,000 resources and a million
+        // views has 60 MB of it.
+        let done = c.submit(r, queue, &commands).and_then(|()| {
+            if c.submits.len() > 1 && c.written.elapsed() < CHECKPOINT {
+                return Ok(());
+            }
+            c.timed("frame.bin between submissions", |c| c.write(r, true))?;
+            c.written = Instant::now();
+            Ok(())
+        });
         if let Err(e) = done {
             stop(r, &mut phase, &*e);
         }
@@ -392,6 +404,8 @@ struct Capture {
     first: std::time::Duration,
     /// Bytes of the read-back buffers the contents went through.
     stagings: u64,
+    /// When `frame.bin` was last written.
+    written: Instant,
 }
 
 impl Capture {
@@ -434,6 +448,7 @@ impl Capture {
             looked: 0,
             first: std::time::Duration::ZERO,
             stagings: 0,
+            written: Instant::now(),
         })
     }
 
@@ -1085,7 +1100,7 @@ impl Capture {
         }
         if partial {
             notes.push(format!(
-                "the frame is not whole: written after {} of its submissions, before its present",
+                "the frame is not whole: written after {} of its submissions, before its present (while a frame is captured, this is written after its first submission and every other second)",
                 self.submits.len()
             ));
         }

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_12_0, D3D_PRIMITIVE_TOPOLOGY};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -25,6 +25,8 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::core::Interface;
 
 use super::edit;
+pub use super::look::{find, listing};
+use super::look::hex;
 use super::gpu::{self, Seen, Worker};
 use super::plain::{self, median};
 use super::snap::read_sub;
@@ -39,6 +41,10 @@ use super::wire::{
 /// An upload buffer contents come back through.
 const STAGING: u64 = 256 << 20;
 
+/// The name of the pipeline of the host layer's argument clamp
+/// (`crate::indirect`, as `crate::compute::pipeline` names it).
+const CLAMP: &str = "victory: clamp";
+
 /// How the frame's submissions are sent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Waits {
@@ -50,6 +56,21 @@ pub enum Waits {
     None,
     /// All in one `ExecuteCommandLists`.
     OneSubmit,
+    /// Each list a submission of its own, waited for (as the runtime's
+    /// `VICTORY_GPU_TIMING` sends them): which lists are the heavy ones.
+    Lists,
+}
+
+/// Which of the frame's barriers are sent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Barriers {
+    #[default]
+    AsRecorded,
+    /// None of buffers (their transitions, and waits for unordered access
+    /// to them): what the host layer's own passes add around each call.
+    NoBufferOnes,
+    /// None at all. No valid D3D12; D3DMetal runs it.
+    NoneAtAll,
 }
 
 /// How the time of single commands is found.
@@ -93,6 +114,22 @@ pub struct Options {
     pub compare: bool,
     /// The debug layer, if there is one.
     pub debug: bool,
+    /// The names of the title's shaders for the reports ([`Names`]).
+    pub names: Option<PathBuf>,
+    /// After the report: for so many of the costliest pipelines, the frame
+    /// with and without each, turn by turn.
+    pub leave_out: usize,
+    pub barriers: Barriers,
+    /// Leave out the host layer's argument clamps: the calls they serve
+    /// read arguments kept from a run that made them.
+    pub keep_clamps: bool,
+    /// Every scissor rectangle one texel: draws without their pixels.
+    pub one_texel: bool,
+    /// Nothing that works: what the lists bind, and their barriers.
+    pub binds_only: bool,
+    /// Every dispatch one thread group: what dispatches cost whatever
+    /// they compute.
+    pub one_group: bool,
 }
 
 impl Default for Options {
@@ -110,13 +147,27 @@ impl Default for Options {
             shaders_b: None,
             compare: false,
             debug: false,
+            names: None,
+            leave_out: 0,
+            barriers: Barriers::AsRecorded,
+            keep_clamps: false,
+            one_texel: false,
+            binds_only: false,
+            one_group: false,
         }
     }
 }
 
 impl Options {
     fn edited(&self) -> bool {
-        self.waits != Waits::Each || self.pace > 0.0 || !self.skip_shaders.is_empty()
+        self.waits != Waits::Each
+            || self.pace > 0.0
+            || !self.skip_shaders.is_empty()
+            || self.barriers != Barriers::AsRecorded
+            || self.keep_clamps
+            || self.one_texel
+            || self.binds_only
+            || self.one_group
     }
 
     /// The same without the experiments.
@@ -125,6 +176,12 @@ impl Options {
             waits: Waits::Each,
             pace: 0.0,
             skip_shaders: Vec::new(),
+            barriers: Barriers::AsRecorded,
+            leave_out: 0,
+            keep_clamps: false,
+            one_texel: false,
+            binds_only: false,
+            one_group: false,
             ..self.clone()
         }
     }
@@ -163,9 +220,34 @@ pub struct Report {
     /// With detailed timing, the costliest pipelines: ms, commands, name,
     /// and the share of the frame's own time.
     pub shaders: Vec<(f64, u32, String, Option<f64>)>,
+    /// For each of `shaders`: its pipelines.
+    pub shader_ids: Vec<Vec<u32>>,
+    /// All pipelines that ran, the ones with the heaviest work first (by
+    /// what their pieces took more than a piece that does next to nothing):
+    /// name and pipelines. What `leave_out` tries.
+    pub heaviest: Vec<(String, Vec<u32>)>,
+    /// Commands left out by `--skip-shader`.
+    pub skipped: u32,
+    /// Timed in pieces, the heaviest pieces: share of the frame's own time,
+    /// ms sent alone, and what it is.
+    pub pieces: Vec<(f64, f64, String)>,
+    /// With each list waited for: lists by their time, as (lists, ms in
+    /// all) of those over 16 ms, of 4 to 16, of 1 to 4 and under 1; and the
+    /// heaviest: ms and what it is.
+    pub list_times: [(usize, f64); 4],
+    pub lists: Vec<(f64, String)>,
+    /// The frame with and without each of the costliest pipelines, turn by
+    /// turn: name, commands left out, ms with, ms without.
+    pub left_out: Vec<(String, u32, f64, f64)>,
     /// Against the presented picture: dB (infinite: the same), and whether
     /// its bytes are the same.
     pub picture: Option<(f64, bool)>,
+    /// Pixels of the last loop's picture that are not the presented one's,
+    /// and the greatest difference of a channel (of 255).
+    pub picture_differs: Option<(usize, u8)>,
+    /// Pixels of each loop's picture (but the first) that are not the loop
+    /// before's.
+    pub loops_differ: Vec<usize>,
     /// Of each loop's picture: dB against the presented one, and its hash.
     pub pictures: Vec<(f64, String)>,
     /// Things to know: from the capture and the replay.
@@ -187,6 +269,7 @@ impl Report {
                 .join(" ")
         };
         let how = match self.waits {
+            Waits::Lists => "sum of the lists, each sent alone and waited for",
             Waits::Each => "sum of the submissions, each waited for",
             Waits::None => "all submissions sent at once, first one sent to last one done",
             Waits::OneSubmit => "one submission, sent to done",
@@ -262,15 +345,60 @@ impl Report {
                 let _ = writeln!(t, "    {}{ms:8.2}  {n:6}  {name}", share(of_frame));
             }
         }
+        if !self.pieces.is_empty() {
+            let _ = writeln!(t, "  heaviest pieces, {heads}:");
+            for (of_frame, ms, what) in &self.pieces {
+                let _ = writeln!(t, "    {of_frame:8.2}  {ms:8.2}  {what}");
+            }
+        }
+        if self.waits == Waits::Lists {
+            let [a, b, c, d] = self.list_times;
+            let _ = writeln!(
+                t,
+                "  lists by their time: {} over 16 ms taking {:.1} ms, {} of 4 to 16 ms taking {:.1} ms, {} of 1 to 4 ms taking {:.1} ms, {} under 1 ms taking {:.1} ms",
+                a.0, a.1, b.0, b.1, c.0, c.1, d.0, d.1
+            );
+            let _ = writeln!(t, "  heaviest lists, ms:");
+            for (ms, what) in &self.lists {
+                let _ = writeln!(t, "    {ms:8.2}  {what}");
+            }
+        }
+        if !self.left_out.is_empty() {
+            let _ = writeln!(
+                t,
+                "  the frame without each, turn by turn with the frame as it is: ms saved (ms with, ms without; commands left out):"
+            );
+            for (name, n, with, without) in &self.left_out {
+                let _ = writeln!(
+                    t,
+                    "    {:8.2}  ({with:.2}, {without:.2}; {n})  {name}",
+                    with - without
+                );
+            }
+        }
         match self.picture {
             Some((_, true)) => _ = writeln!(t, "  picture: the same bytes as presented"),
             Some((db, false)) => {
                 _ = writeln!(
                     t,
-                    "  picture: differs from the presented one, PSNR {db:.1} dB"
+                    "  picture: differs from the presented one, PSNR {db:.1} dB{}",
+                    self.picture_differs.map_or(String::new(), |(n, most)| format!(
+                        ": {n} pixels differ, by {most} of 255 at the most"
+                    ))
                 )
             }
             None => {}
+        }
+        if !self.loops_differ.is_empty() {
+            let _ = writeln!(
+                t,
+                "  pixels that differ from the loop before: {}",
+                self.loops_differ
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
         }
         if self.pictures.len() > 1 {
             let all: Vec<String> = self
@@ -291,34 +419,6 @@ impl Report {
         }
         t
     }
-}
-
-/// Whether file `path` is there (by opening it: `crate::read_file`).
-fn is_there(path: &Path) -> bool {
-    File::open(path).is_ok()
-}
-
-/// The folder of a capture: `folder`, or the last `capture-<n>` in it that
-/// has a `frame.bin`.
-pub fn find(folder: &Path) -> Result<PathBuf> {
-    if is_there(&folder.join("frame.bin")) {
-        return Ok(folder.to_owned());
-    }
-    let mut best: Option<(u32, PathBuf)> = None;
-    for entry in std::fs::read_dir(folder)
-        .with_context(|| format!("{}", folder.display()))?
-        .flatten()
-    {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(n) = name.strip_prefix("capture-").and_then(|n| n.parse().ok()) else {
-            continue;
-        };
-        if is_there(&entry.path().join("frame.bin")) && best.as_ref().is_none_or(|b| b.0 < n) {
-            best = Some((n, entry.path()));
-        }
-    }
-    best.map(|b| b.1)
-        .ok_or_else(|| anyhow!("no capture (frame.bin) in {}", folder.display()))
 }
 
 /// The stages of a pipeline as the runtime names them (`[mesh 0123456789abcdef,
@@ -381,76 +481,16 @@ fn shader_files(frame: &Frame, p: &wire::Pipeline, blob: u32) -> Vec<String> {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Writes, one line each, the frame's resources and the commands of lists
-/// (by their place in the frame).
-pub fn listing(folder: &Path, lists: (u32, u32), line: &mut dyn FnMut(&str)) -> Result<()> {
-    let frame = Frame::read(&find(folder)?.join("frame.bin"))?;
-    let pipelines: HashMap<u32, &str> = frame
-        .pipelines
-        .iter()
-        .map(|p| (p.id, p.name.as_str()))
-        .collect();
-    for r in &frame.resources {
-        if r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 {
-            let place = match &r.place {
-                Place::Committed { props, .. } => format!("{:?}", gpu::seen(props)),
-                other => format!("{other:?}"),
-            };
-            line(&format!(
-                "buffer {} {} bytes, {place}: {}",
-                r.id, r.desc.width, r.name
-            ));
-        } else {
-            let d = &r.desc;
-            line(&format!(
-                "texture {} {}x{}x{} mips {} f{}: {}",
-                r.id, d.width, d.height, d.depth, d.mips, d.format, r.name
-            ));
-        }
-    }
-    let mut place = 0;
-    for (i, s) in frame.submits.iter().enumerate() {
-        line(&format!(
-            "submission {i}: {} lists, {} runs of bytes the CPU wrote ({} bytes), {} views",
-            s.lists.len(),
-            s.deltas.len(),
-            s.deltas.iter().map(|d| d.len).sum::<u64>(),
-            s.views.len()
-        ));
-        for &l in s.lists.iter().filter(|&&l| l != MISSING) {
-            let here = place;
-            place += 1;
-            if here < lists.0 || here > lists.1 {
-                continue;
-            }
-            line(&format!("list {here} of submission {i}"));
-            for (n, c) in Cmd::all(&frame.lists[l as usize].commands.0)?
-                .iter()
-                .enumerate()
-            {
-                match c {
-                    Cmd::Pipeline { pso } => {
-                        line(&format!(
-                            "{n} Pipeline {pso} {}",
-                            pipelines.get(pso).copied().unwrap_or_default()
-                        ));
-                    }
-                    c => line(&format!("{n} {c:?}")),
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Loads a capture and runs it: the whole of `victory replay`. The reports,
 /// with what each is of.
 pub fn replay(folder: &Path, options: &Options) -> Result<Vec<(String, Report)>> {
     let mut player = Player::load(folder, options)?;
+    replay_with(&mut player, options)
+}
+
+/// Runs a loaded capture as `options` say (those that decide how it is
+/// loaded are the ones it was loaded with).
+pub fn replay_with(player: &mut Player, options: &Options) -> Result<Vec<(String, Report)>> {
     let mut out = Vec::new();
     let two_sets = options.shaders_b.is_some();
     if options.compare && (options.edited() || options.shaders.is_some() || two_sets) {
@@ -508,6 +548,29 @@ struct Object {
     /// Where the CPU writes it, for a buffer it saw (0: nowhere).
     mapped: usize,
 }
+
+/// A buffer the CPU maps that the frame changes.
+struct Mapped {
+    at: usize,
+    size: usize,
+    /// Its pages the frame changes, in order: those the recorded run's CPU
+    /// or GPU had changed by a later submission (the recorder looked at
+    /// every page views name before each), and those the frame's copies
+    /// write.
+    touched: Vec<u32>,
+    /// Where the capture has its bytes at the frame's start: runs of whole
+    /// pages (offset in the buffer, bytes, offset in `deltas.bin`), in
+    /// order; what is in none is zero.
+    runs: Vec<(u64, u64, u64)>,
+}
+
+// SAFETY: the mapping is of a buffer the player holds.
+unsafe impl Send for Mapped {}
+// SAFETY: as above; threads write parts of it that do not overlap.
+unsafe impl Sync for Mapped {}
+
+/// What mapped buffers are kept in units of, as the recorder does.
+const PAGE: usize = 4096;
 
 /// A shader-visible descriptor heap.
 struct Version {
@@ -567,8 +630,13 @@ pub struct Player {
     /// Render target and depth views by what they are of.
     targets: HashMap<Slot, D3D12_CPU_DESCRIPTOR_HANDLE>,
     _target_heaps: Vec<ID3D12DescriptorHeap>,
-    /// Copies of what the frame changes, as at its start.
+    /// Copies of what the frame changes of the GPU's own memory, as at its
+    /// start.
     masters: Vec<(u32, ID3D12Resource)>,
+    /// The buffers the CPU maps that the frame changes, with where the
+    /// capture has what they held at the frame's start: put back from the
+    /// capture itself, so no second copy of them is held.
+    mapped: Vec<Mapped>,
     /// What the CPU wrote between submissions: the bytes, for each
     /// submission where in them, and a buffer of the GPU's with the same
     /// bytes (made when submissions are first sent without waits).
@@ -579,8 +647,15 @@ pub struct Player {
     start: HashMap<u32, Vec<u32>>,
     end: HashMap<u32, Vec<u32>>,
     commands: Vec<Vec<Cmd>>,
+    /// The names of the title's shaders.
+    names: super::look::Names,
+    /// The arguments the clamps of a run made ([`edit::RESULTS`]).
+    results: Option<ID3D12Resource>,
     /// Resources in the states of the start (not those of the end).
     fresh: bool,
+    /// What the last restore put back of the buffers the CPU maps: bytes,
+    /// and the seconds it took.
+    restored: (usize, f64),
     notes: Vec<String>,
 }
 
@@ -625,6 +700,8 @@ struct Ran {
     stamps: Vec<u64>,
     /// Each submission's time on the wall clock, when waited for one by one.
     walls: Vec<f64>,
+    /// Each list's, in the frame's order, when each was sent alone.
+    lists: Vec<f64>,
     frame: f64,
     between: f64,
 }
@@ -633,15 +710,49 @@ struct Ran {
 /// that each submission's pieces add up to what it took whole), commands.
 type Timed = (f64, f64, u32);
 
+/// A loop's times in pieces: by kind, by pipeline, each piece (of the
+/// frame's own time, and sent alone), and by pipeline what its pieces took
+/// more than a piece that does next to nothing.
+type Pieces = (
+    BTreeMap<&'static str, Timed>,
+    HashMap<u32, Timed>,
+    Vec<(f64, f64)>,
+    HashMap<u32, f64>,
+);
+
 /// A frame made ready to run, and what its runs gave so far.
 pub struct Prepared {
     sends: Sends,
     report: Report,
     runs: Vec<Ran>,
-    /// Per loop of timing in pieces: by kind and by pipeline.
-    pieces: Vec<(BTreeMap<&'static str, Timed>, HashMap<u32, Timed>)>,
+    /// Per loop of timing in pieces.
+    pieces: Vec<Pieces>,
     /// The picture its last run left ([`Player::picture_now`]).
-    picture: Option<(f64, bool, String, Vec<u8>)>,
+    picture: Option<Picture>,
+}
+
+/// The presented picture after a run.
+struct Picture {
+    /// Against the recorded one: dB, whether its bytes are the same, the
+    /// pixels that differ and the greatest difference of a channel.
+    db: f64,
+    same: bool,
+    differs: (usize, u8),
+    hash: String,
+    rgb: Vec<u8>,
+}
+
+/// The pixels (of three bytes) that differ between two pictures, and the
+/// greatest difference of a channel.
+fn differing(a: &[u8], b: &[u8]) -> (usize, u8) {
+    let (mut n, mut most) = (0, 0);
+    for (x, y) in a.chunks_exact(3).zip(b.chunks_exact(3)) {
+        if x != y {
+            n += 1;
+            most = most.max(x.iter().zip(y).map(|(p, q)| p.abs_diff(*q)).max().unwrap_or(0));
+        }
+    }
+    (n, most)
 }
 
 impl Player {
@@ -689,13 +800,17 @@ impl Player {
             targets: HashMap::new(),
             _target_heaps: Vec::new(),
             masters: Vec::new(),
+            mapped: Vec::new(),
             delta_bytes: Vec::new(),
             delta_parts: Vec::new(),
             deltas: None,
             start: HashMap::new(),
             end: HashMap::new(),
             commands,
+            names: super::look::Names::read(options.names.as_deref())?,
+            results: None,
             fresh: true,
+            restored: (0, 0.0),
             notes: frame
                 .notes
                 .iter()
@@ -893,6 +1008,9 @@ impl Player {
     }
 
     fn resource(&self, id: u32) -> Option<&ID3D12Resource> {
+        if id == edit::RESULTS {
+            return self.results.as_ref();
+        }
         self.objects.get(&id).map(|o| &o.res)
     }
 
@@ -1244,12 +1362,130 @@ impl Player {
         format!(
             "{} (DXIL {})",
             if p.name.is_empty() {
-                "unnamed"
+                "unnamed".to_owned()
             } else {
-                &p.name
+                self.names.of(&p.name)
             },
             code.join(" ")
         )
+    }
+
+    /// What pipelines are counted together by: the shaders the host layer
+    /// named them by (several pipelines of one set of shaders differ in
+    /// their states only).
+    fn group(&self, id: u32) -> String {
+        match self.frame.pipelines.iter().find(|p| p.id == id) {
+            Some(p) if !p.name.is_empty() => p.name.clone(),
+            _ => format!("pipeline {id}"),
+        }
+    }
+
+    /// A resource in a few words.
+    fn resource_name(&self, id: u32) -> String {
+        match self.objects.get(&id) {
+            Some(o) => {
+                let d = &self.frame.resources[o.index].desc;
+                if d.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 {
+                    format!("buffer #{id}")
+                } else if d.depth > 1 {
+                    format!("#{id} {}x{}x{} f{}", d.width, d.height, d.depth, d.format)
+                } else {
+                    format!("#{id} {}x{} f{}", d.width, d.height, d.format)
+                }
+            }
+            None => format!("#{id}"),
+        }
+    }
+
+    /// What commands do, in a line: how many of which kind, with which
+    /// pipelines, into which targets.
+    fn describe(&self, cmds: &[Cmd]) -> String {
+        let (mesh, dispatches) = self.kinds();
+        let mut kinds: BTreeMap<&str, u32> = BTreeMap::new();
+        let mut pipelines: HashMap<String, u32> = HashMap::new();
+        let mut targets: Vec<String> = Vec::new();
+        let (mut groups, mut largest) = (0u64, [0u32; 3]);
+        let mut bound = NONE;
+        let mut now = String::new();
+        for c in cmds {
+            match c {
+                Cmd::Pipeline { pso } => bound = *pso,
+                Cmd::Targets { colors, depth } => {
+                    let mut all: Vec<String> =
+                        colors.iter().map(|s| self.resource_name(s.res)).collect();
+                    all.extend(depth.iter().map(|s| format!("depth {}", self.resource_name(s.res))));
+                    now = match all.len() {
+                        0..=2 => all.join(" + "),
+                        n => format!("{} + {} more", all[0], n - 1),
+                    };
+                }
+                Cmd::Dispatch { groups: g } => {
+                    let n: u64 = g.iter().map(|&g| u64::from(g)).product();
+                    groups += n;
+                    if n > largest.iter().map(|&g| u64::from(g)).product() {
+                        largest = *g;
+                    }
+                }
+                _ => {}
+            }
+            if !c.works() {
+                continue;
+            }
+            *kinds.entry(edit::kind(c, &dispatches, &mesh, bound)).or_default() += 1;
+            if c.runs_shaders() {
+                *pipelines.entry(self.group(bound)).or_default() += 1;
+                let draws = !matches!(c, Cmd::Dispatch { .. })
+                    && !matches!(c, Cmd::Indirect { signature, .. } if dispatches.contains(signature));
+                if draws && !now.is_empty() && !targets.contains(&now) {
+                    targets.push(now.clone());
+                }
+            }
+        }
+        let mut kinds: Vec<(&str, u32)> = kinds.into_iter().collect();
+        kinds.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut text = kinds
+            .iter()
+            .take(4)
+            .map(|(k, n)| format!("{n} {k}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if groups > 0 {
+            let _ = write!(
+                text,
+                " ({groups} thread groups, the largest {}x{}x{})",
+                largest[0], largest[1], largest[2]
+            );
+        }
+        let mut pipelines: Vec<(String, u32)> = pipelines.into_iter().collect();
+        pipelines.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        if !pipelines.is_empty() {
+            let _ = write!(
+                text,
+                "; {}{}",
+                pipelines
+                    .iter()
+                    .take(2)
+                    .map(|(name, n)| format!("{n} with {}", self.names.of(name)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                match pipelines.len() {
+                    0..=2 => String::new(),
+                    n => format!(", {} other pipelines", n - 2),
+                }
+            );
+        }
+        if !targets.is_empty() {
+            let _ = write!(
+                text,
+                "; into {}{}",
+                targets[0],
+                match targets.len() {
+                    1 => String::new(),
+                    n => format!(" and {} other sets of targets", n - 1),
+                }
+            );
+        }
+        text
     }
 
     fn hashes(&self, p: &wire::Pipeline) -> Vec<String> {
@@ -1951,6 +2187,69 @@ impl Player {
             let to = &mut self.delta_bytes[*at as usize..(*at + d.len) as usize];
             read_at(&file, to, d.file).context("what the CPU wrote between submissions")?;
         }
+        // The pages of mapped buffers the frame changes: to be put back
+        // between loops from the capture's bytes of the frame's start.
+        let mut touched: HashMap<u32, Vec<(u64, u64)>> = HashMap::new();
+        for (d, _) in self.delta_parts.iter().flatten() {
+            touched.entry(d.res).or_default().push((d.at, d.at + d.len));
+        }
+        for c in self.commands.iter().flatten() {
+            let (res, from, to) = match c {
+                Cmd::CopyBuffer {
+                    dst, dst_at, len, ..
+                } => (*dst, *dst_at, dst_at + len),
+                Cmd::CopyTexture {
+                    dst:
+                        Loc::Placed {
+                            res,
+                            offset,
+                            size,
+                            pitch,
+                            ..
+                        },
+                    ..
+                } => {
+                    let len = u64::from(*pitch) * u64::from(size[1]) * u64::from(size[2].max(1));
+                    (*res, *offset, offset + len)
+                }
+                Cmd::CopyResource { dst, .. } => (*dst, 0, u64::MAX),
+                Cmd::ResolveQuery {
+                    dst, at, count, ..
+                } => (*dst, *at, at + u64::from(*count) * 8),
+                _ => continue,
+            };
+            touched.entry(res).or_default().push((from, to));
+        }
+        let mut by_buffer: HashMap<u32, Vec<(u64, u64, u64)>> = HashMap::new();
+        for d in &first {
+            by_buffer
+                .entry(d.res)
+                .or_default()
+                .push((d.at, d.len, d.file));
+        }
+        for (id, ranges) in touched {
+            let Some(o) = self.objects.get(&id).filter(|o| o.mapped != 0) else {
+                continue;
+            };
+            let size = self.frame.resources[o.index].desc.width as usize;
+            let mut pages: Vec<u32> = ranges
+                .iter()
+                .flat_map(|&(from, to)| {
+                    let to = to.min(size as u64) as usize;
+                    (from as usize / PAGE..to.div_ceil(PAGE)).map(|p| p as u32)
+                })
+                .collect();
+            pages.sort_unstable();
+            pages.dedup();
+            let mut runs = by_buffer.remove(&id).unwrap_or_default();
+            runs.sort_unstable();
+            self.mapped.push(Mapped {
+                at: o.mapped,
+                size,
+                touched: pages,
+                runs,
+            });
+        }
         Ok(())
     }
 
@@ -2066,11 +2365,13 @@ impl Player {
         // some other way.
         const WRITE: u32 =
             RENDER_TARGET | UNORDERED_ACCESS | DEPTH_WRITE | COPY_DEST | RESOLVE_DEST;
+        // (A texture that was filled long ago and left a copy's destination
+        // is not written in the frame for that.)
         let mut written: HashSet<u32> = self
             .frame
             .resources
             .iter()
-            .filter(|r| r.state.iter().any(|s| s & WRITE != 0))
+            .filter(|r| r.state.iter().any(|s| s & WRITE & !COPY_DEST != 0))
             .map(|r| r.id)
             .collect();
         let mut by_cpu: HashSet<u32> = HashSet::new();
@@ -2161,7 +2462,9 @@ impl Player {
                 self.objects.get(id).is_some_and(|o| {
                     let r = &self.frame.resources[o.index];
                     let back = matches!(&r.place, Place::Committed { props, .. } if gpu::seen(props) == Seen::ReadBack);
-                    !r.idle && !back && !matches!(r.place, Place::BackBuffer {})
+                    // Buffers the CPU maps are put back another way
+                    // ([`Player::restore_mapped`]).
+                    !r.idle && !back && o.mapped == 0 && !matches!(r.place, Place::BackBuffer {})
                 })
             })
             .collect();
@@ -2318,13 +2621,72 @@ impl Player {
                 barriers(list, &back);
             }
         })?;
+        if contents {
+            self.restore_mapped()?;
+        }
         self.fresh = true;
         Ok(())
     }
 
+    /// Puts back what a run changed of the buffers the CPU maps: every
+    /// page the frame changes ([`Mapped::touched`]) is read from the capture
+    /// again, or zeroed. The GPU is idle (the caller waited).
+    fn restore_mapped(&mut self) -> Result<()> {
+        let file = File::open(self.folder.join("deltas.bin"))?;
+        let next = AtomicUsize::new(0);
+        let failed: std::sync::Mutex<Option<std::io::Error>> = std::sync::Mutex::default();
+        let bytes = AtomicUsize::new(0);
+        let began = Instant::now();
+        std::thread::scope(|scope| {
+            let (next, all, file, failed, bytes) = (&next, &self.mapped, &file, &failed, &bytes);
+            for _ in 0..8 {
+                scope.spawn(move || {
+                    while let Some(m) = all.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        for &i in &m.touched {
+                            let page = i as usize * PAGE;
+                            if page >= m.size {
+                                continue;
+                            }
+                            let n = PAGE.min(m.size - page);
+                            // SAFETY: a page of the buffer's mapping, which
+                            // this thread alone has; the GPU is idle.
+                            let now = unsafe {
+                                std::slice::from_raw_parts_mut((m.at + page) as *mut u8, n)
+                            };
+                            bytes.fetch_add(n, Ordering::Relaxed);
+                            // The run of the capture that holds it, if any.
+                            let k = m.runs.partition_point(|r| r.0 <= page as u64);
+                            match k.checked_sub(1).map(|k| m.runs[k]) {
+                                Some((at, len, from)) if (page as u64) < at + len => {
+                                    if let Err(e) = read_at(file, now, from + page as u64 - at) {
+                                        failed
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .get_or_insert(e);
+                                    }
+                                }
+                                _ => now.fill(0),
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(e) = failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            return Err(e).context("putting back the buffers the CPU maps");
+        }
+        self.restored = (bytes.into_inner(), began.elapsed().as_secs_f64());
+        Ok(())
+    }
+
     /// The frame's lists, edited: for each submission, its lists' commands.
-    fn edited(&self, o: &Options, report: &mut Report) -> Vec<Vec<Vec<Cmd>>> {
-        let skip: HashSet<u32> = self
+    fn edited(
+        &self,
+        o: &Options,
+        report: &mut Report,
+        also: &HashSet<u32>,
+    ) -> Vec<Vec<Vec<Cmd>>> {
+        let mut skip: HashSet<u32> = self
             .frame
             .pipelines
             .iter()
@@ -2338,6 +2700,10 @@ impl Player {
             })
             .map(|p| p.id)
             .collect();
+        skip.extend(also);
+        let mut barriers = 0;
+        let clamps = self.clamps();
+        let (mut next, mut clamped) = (0u64, (0, 0));
         if !o.skip_shaders.is_empty() {
             report
                 .notes
@@ -2354,6 +2720,33 @@ impl Player {
                     (cmds, n) = edit::skip_pipelines(cmds, &skip);
                     skipped += n;
                 }
+                if o.barriers != Barriers::AsRecorded {
+                    let n;
+                    (cmds, n) = edit::drop_barriers(cmds, |id| {
+                        o.barriers == Barriers::NoneAtAll || id == NONE || self.is_buffer(id)
+                    });
+                    barriers += n;
+                }
+                if o.keep_clamps {
+                    let (passes, n);
+                    (cmds, passes, n) = edit::skip_clamped(
+                        cmds,
+                        &clamps.0,
+                        &clamps.1,
+                        &|signature, most| self.arguments(signature, most),
+                        &mut next,
+                    );
+                    clamped = (clamped.0 + passes, clamped.1 + n);
+                }
+                if o.one_texel {
+                    cmds = edit::one_texel(cmds);
+                }
+                if o.binds_only {
+                    cmds = edit::binds_only(cmds);
+                }
+                if o.one_group {
+                    cmds = edit::one_group(cmds);
+                }
                 lists.push(cmds);
             }
             out.push(lists);
@@ -2363,7 +2756,105 @@ impl Player {
                 .notes
                 .push(format!("--skip-shader left out {skipped} commands"));
         }
+        if o.barriers != Barriers::AsRecorded {
+            report
+                .notes
+                .push(format!("{barriers} barriers were left out"));
+        }
+        if o.keep_clamps {
+            report.notes.push(format!(
+                "{} argument clamps were left out, with {} barriers of theirs; their calls read {} KB of arguments kept from a run with them",
+                clamped.0,
+                clamped.1,
+                next >> 10
+            ));
+        }
+        if o.one_texel {
+            report
+                .notes
+                .push("every scissor rectangle is one texel: draws without their pixels".into());
+        }
+        if o.binds_only {
+            report
+                .notes
+                .push("nothing that works is sent: what the lists bind, and their barriers".into());
+        }
+        if o.one_group {
+            report
+                .notes
+                .push("every dispatch is of one thread group (those by arguments from a buffer are as they were)".into());
+        }
+        report.skipped = skipped;
         out
+    }
+
+    /// The pipelines of the host layer's argument clamp, and their root
+    /// signatures.
+    fn clamps(&self) -> (HashSet<u32>, HashSet<u32>) {
+        let all: Vec<&wire::Pipeline> = self
+            .frame
+            .pipelines
+            .iter()
+            .filter(|p| p.name == CLAMP)
+            .collect();
+        let roots = all
+            .iter()
+            .flat_map(|p| &p.parts)
+            .filter_map(|part| match part {
+                wire::Part::Root { root } => Some(*root),
+                _ => None,
+            })
+            .collect();
+        (all.iter().map(|p| p.id).collect(), roots)
+    }
+
+    /// The bytes of arguments a call of command signature `signature` reads
+    /// at the most, for `most` commands.
+    fn arguments(&self, signature: u32, most: u32) -> u64 {
+        let stride = self
+            .frame
+            .signatures
+            .iter()
+            .find(|s| s.id == signature)
+            .map_or(0, |s| s.stride);
+        u64::from(stride) * u64::from(most)
+    }
+
+    /// Runs the frame once with every clamp's arguments copied to a buffer
+    /// of ours ([`edit::RESULTS`]), from which the calls of a frame without
+    /// the clamps read them; once for good.
+    fn keep_clamps(&mut self) -> Result<()> {
+        if self.results.is_some() {
+            return Ok(());
+        }
+        let clamps = self.clamps();
+        let mut next = 0u64;
+        let mut submits = Vec::new();
+        for s in &self.frame.submits {
+            let mut lists = Vec::new();
+            for &l in s.lists.iter().filter(|&&l| l != MISSING) {
+                lists.push(edit::keep_clamped(
+                    self.commands[l as usize].clone(),
+                    &clamps.0,
+                    &|signature, most| self.arguments(signature, most),
+                    &mut next,
+                ));
+            }
+            submits.push(lists);
+        }
+        let (results, _) = gpu::buffer(
+            &self.device,
+            D3D12_HEAP_TYPE_DEFAULT,
+            next.max(4),
+            D3D12_RESOURCE_FLAG_NONE,
+        )?;
+        self.results = Some(results);
+        let plain = Options::default();
+        let sends = self.build(submits, &plain, false)?;
+        self.restore(true)?;
+        self.fresh = false;
+        self.send(&sends, &plain)?;
+        Ok(())
     }
 
     /// The pipelines with a mesh shader, and the command signatures that
@@ -2393,7 +2884,7 @@ impl Player {
     /// Makes the lists of all submissions and, for submissions sent without
     /// waits, before each one's the copies of what the CPU wrote.
     fn build(&self, submits: Vec<Vec<Vec<Cmd>>>, o: &Options, stamped: bool) -> Result<Sends> {
-        let waited = o.waits == Waits::Each;
+        let waited = matches!(o.waits, Waits::Each | Waits::Lists);
         // Room for the timestamps of every command that has one.
         let count: usize = submits
             .iter()
@@ -3085,9 +3576,10 @@ impl Player {
         let mut walls = Vec::new();
         let mut between = Duration::ZERO;
         let frame;
-        if o.waits == Waits::Each {
+        let mut list_walls = Vec::new();
+        if matches!(o.waits, Waits::Each | Waits::Lists) {
             // As the runtime does: the CPU's part, then the submission,
-            // waited for.
+            // waited for (or each of its lists).
             let mut sum = Duration::ZERO;
             for (i, (_, lists)) in s.steps.iter().enumerate() {
                 let began = Instant::now();
@@ -3098,15 +3590,29 @@ impl Player {
                 for l in lists {
                     all.push(cast(&l.list)?);
                 }
-                let began = Instant::now();
-                if !all.is_empty() {
-                    // SAFETY: closed lists whose last run has finished.
-                    unsafe { self.worker.queue.ExecuteCommandLists(&all) };
+                let mut took = Duration::ZERO;
+                if o.waits == Waits::Lists {
+                    for l in &all {
+                        let began = Instant::now();
+                        // SAFETY: a closed list whose last run has finished.
+                        unsafe { self.worker.queue.ExecuteCommandLists(std::slice::from_ref(l)) };
+                        self.worker
+                            .idle()
+                            .context("the device was lost running the frame")?;
+                        took += began.elapsed();
+                        list_walls.push(began.elapsed().as_secs_f64() * 1e3);
+                    }
+                } else {
+                    let began = Instant::now();
+                    if !all.is_empty() {
+                        // SAFETY: closed lists whose last run has finished.
+                        unsafe { self.worker.queue.ExecuteCommandLists(&all) };
+                    }
+                    self.worker
+                        .idle()
+                        .context("the device was lost running the frame")?;
+                    took = began.elapsed();
                 }
-                self.worker
-                    .idle()
-                    .context("the device was lost running the frame")?;
-                let took = began.elapsed();
                 sum += took;
                 walls.push(took.as_secs_f64() * 1e3);
                 Self::pace(o.pace);
@@ -3178,6 +3684,7 @@ impl Player {
         Ok(Ran {
             stamps,
             walls,
+            lists: list_walls,
             frame: frame.as_secs_f64() * 1e3,
             between: between.as_secs_f64() * 1e3,
         })
@@ -3189,7 +3696,55 @@ impl Player {
         for _ in 0..o.loops.max(1) {
             self.once(o, &mut made)?;
         }
-        self.finish(o, made)
+        let mut report = self.finish(o, made)?;
+        if o.leave_out > 0 {
+            self.leave_out(o, &mut report)?;
+        }
+        Ok(report)
+    }
+
+    /// For the costliest pipelines of `report`: the frame as it is and
+    /// without what runs them, turn by turn; what leaving each out saves is
+    /// what it costs in the frame (and what it leaves undone for what comes
+    /// after it: a pass that draws less is cheaper too).
+    fn leave_out(&mut self, o: &Options, report: &mut Report) -> Result<()> {
+        let plain = Options {
+            detail: Detail::Off,
+            leave_out: 0,
+            ..o.clone()
+        };
+        let mut with = self.prepare(&plain)?;
+        let groups: Vec<(String, Vec<u32>)> =
+            report.heaviest.iter().take(o.leave_out).cloned().collect();
+        for (name, ids) in groups {
+            let mut without = self.prepare_without(&plain, &ids.iter().copied().collect())?;
+            let from = with.runs.len();
+            for _ in 0..o.loops.max(1) {
+                self.time(&plain, &mut with)?;
+                self.time(&plain, &mut without)?;
+            }
+            let of = |runs: &[Ran]| median(&runs.iter().map(|r| r.frame).collect::<Vec<_>>());
+            report.left_out.push((
+                name,
+                without.report.skipped,
+                of(&with.runs[from..]),
+                of(&without.runs),
+            ));
+        }
+        report
+            .left_out
+            .sort_by(|a, b| (b.2 - b.3).total_cmp(&(a.2 - a.3)));
+        Ok(())
+    }
+
+    /// One run of the frame for its time alone.
+    fn time(&mut self, o: &Options, p: &mut Prepared) -> Result<()> {
+        self.use_shaders(o.shaders.as_deref())?;
+        self.restore(o.restore)?;
+        self.fresh = false;
+        let ran = self.send(&p.sends, o)?;
+        p.runs.push(ran);
+        Ok(())
     }
 
     /// Whether commands are timed by timestamps or in pieces (or not).
@@ -3204,17 +3759,26 @@ impl Player {
 
     /// The lists for a run as the options say.
     pub fn prepare(&mut self, o: &Options) -> Result<Prepared> {
+        self.prepare_without(o, &HashSet::new())
+    }
+
+    /// As [`Player::prepare`], with what runs the pipelines `also` left out
+    /// too.
+    fn prepare_without(&mut self, o: &Options, also: &HashSet<u32>) -> Result<Prepared> {
         let mut report = Report {
             notes: self.notes.clone(),
             waits: o.waits,
             ..Default::default()
         };
         self.use_shaders(o.shaders.as_deref())?;
-        if o.waits != Waits::Each {
+        if !matches!(o.waits, Waits::Each | Waits::Lists) {
             self.make_versions()?;
             self.make_deltas()?;
         }
-        let submits = self.edited(o, &mut report);
+        if o.keep_clamps {
+            self.keep_clamps()?;
+        }
+        let submits = self.edited(o, &mut report, also);
         let stamped = self.detail(o) == Detail::Stamps;
         Ok(Prepared {
             sends: self.build(submits, o, stamped)?,
@@ -3232,9 +3796,13 @@ impl Player {
         self.fresh = false;
         let ran = self.send(&p.sends, o)?;
         // The picture now: another frame may run before the report is made.
+        let before = p.picture.take().map(|p| p.rgb);
         p.picture = self.picture_now()?;
-        if let Some((db, _, hash, _)) = &p.picture {
-            p.report.pictures.push((*db, hash.clone()));
+        if let Some(now) = &p.picture {
+            p.report.pictures.push((now.db, now.hash.clone()));
+            if let Some(before) = &before {
+                p.report.loops_differ.push(differing(&now.rgb, before).0);
+            }
         }
         if self.detail(o) == Detail::Pieces {
             self.restore(o.restore)?;
@@ -3255,10 +3823,12 @@ impl Player {
         &mut self,
         s: &Sends,
         whole: &Ran,
-    ) -> Result<(BTreeMap<&'static str, Timed>, HashMap<u32, Timed>)> {
+    ) -> Result<Pieces> {
         let (mesh, dispatches) = self.kinds();
         // By submission: each piece's kind, pipeline, commands and ms.
         let mut all: Vec<Vec<(&'static str, u32, u32, f64)>> = Vec::new();
+        // Each piece's time: of the frame's own, and sent alone.
+        let mut each = Vec::new();
         let (allocator, list) = self.plain_list()?;
         // SAFETY: a list just made, with nothing recorded.
         unsafe { list.Close()? };
@@ -3305,6 +3875,7 @@ impl Player {
                 _ => 0.0,
             };
             for &(kind, pso, works, ms) in timed {
+                each.push((ms * scale, ms));
                 let k = kinds.entry(kind).or_default();
                 *k = (k.0 + ms, k.1 + ms * scale, k.2 + works);
                 if pso != NONE {
@@ -3313,7 +3884,16 @@ impl Player {
                 }
             }
         }
-        Ok((kinds, shaders))
+        // What of each pipeline's pieces is more than a piece takes that does
+        // next to nothing (the middle one of all): its heavy work.
+        let floor = median(&all.iter().flatten().map(|p| p.3).collect::<Vec<_>>());
+        let mut heavy: HashMap<u32, f64> = HashMap::new();
+        for &(_, pso, _, ms) in all.iter().flatten() {
+            if pso != NONE {
+                *heavy.entry(pso).or_default() += (ms - floor).max(0.0);
+            }
+        }
+        Ok((kinds, shaders, each, heavy))
     }
 
     /// The report after the last run.
@@ -3384,6 +3964,45 @@ impl Player {
             .enumerate()
             .map(|(i, (_, l))| (l.len(), later(&wall_submits[i]), later(&stamp_submits[i])))
             .collect();
+        if o.waits == Waits::Lists {
+            // Each list's time: the median of the loops but the first.
+            let count = runs.iter().map(|r| r.lists.len()).min().unwrap_or(0);
+            let mut all: Vec<(f64, usize, usize)> = Vec::new();
+            let mut n = 0;
+            for (i, lists) in sends.submits.iter().enumerate() {
+                for j in 0..lists.len() {
+                    if n < count {
+                        let of: Vec<f64> = runs.iter().map(|r| r.lists[n]).collect();
+                        all.push((later(&of).unwrap_or(0.0), i, j));
+                    }
+                    n += 1;
+                }
+            }
+            for &(ms, _, _) in &all {
+                let bucket = match ms {
+                    ms if ms > 16.0 => 0,
+                    ms if ms > 4.0 => 1,
+                    ms if ms > 1.0 => 2,
+                    _ => 3,
+                };
+                let b = &mut report.list_times[bucket];
+                *b = (b.0 + 1, b.1 + ms);
+            }
+            all.sort_by(|a, b| b.0.total_cmp(&a.0));
+            report.lists = all
+                .iter()
+                .take(o.top)
+                .map(|&(ms, i, j)| {
+                    (
+                        ms,
+                        format!(
+                            "submission {i} list {j}: {}",
+                            self.describe(&sends.submits[i][j])
+                        ),
+                    )
+                })
+                .collect();
+        }
         match self.detail(o) {
             Detail::Stamps if sends.stamped => {
                 report.detail = Some(
@@ -3396,11 +4015,18 @@ impl Player {
                 report.detail = Some(
                     "in pieces: each run of commands of one kind with one pipeline was sent as a submission of its own and waited for (less what a submission that does nothing takes); the frame's own time is shared out by those times, submission by submission",
                 );
-                self.by_pieces(&pieces, o, &mut report);
+                self.by_pieces(&sends, &pieces, o, &mut report);
             }
             _ => {}
         }
         self.picture(o, picture, &mut report)?;
+        if self.restored.0 > 0 {
+            report.notes.push(format!(
+                "between loops, {} MB of the buffers the CPU maps are put back from the capture ({:.2} s)",
+                self.restored.0 >> 20,
+                self.restored.1
+            ));
+        }
         let missed = gpu::missed();
         if missed > 0 {
             report.notes.push(format!(
@@ -3472,6 +4098,7 @@ impl Player {
                 .into_iter()
                 .map(|(k, (ms, n))| (k, median(&ms), n, None))
                 .collect(),
+            &HashMap::new(),
             o,
             report,
         );
@@ -3482,14 +4109,56 @@ impl Player {
     #[allow(clippy::type_complexity)]
     fn by_pieces(
         &self,
-        pieces: &[(BTreeMap<&'static str, Timed>, HashMap<u32, Timed>)],
+        sends: &Sends,
+        pieces: &[Pieces],
         o: &Options,
         report: &mut Report,
     ) {
         let loops = if pieces.len() > 2 { &pieces[1..] } else { pieces };
+        // The heaviest pieces: the median of each over the loops.
+        let (mesh, dispatches) = self.kinds();
+        let mut each: Vec<(f64, f64, usize, usize, usize)> = Vec::new();
+        let mut n = 0;
+        for (i, lists) in sends.submits.iter().enumerate() {
+            for (j, cmds) in lists.iter().enumerate() {
+                for k in 0..edit::pieces(cmds, &dispatches, &mesh).len() {
+                    let of = |which: fn(&(f64, f64)) -> f64| {
+                        median(&loops.iter().filter_map(|l| l.2.get(n).map(which)).collect::<Vec<_>>())
+                    };
+                    each.push((of(|t| t.0), of(|t| t.1), i, j, k));
+                    n += 1;
+                }
+            }
+        }
+        each.sort_by(|a, b| b.0.total_cmp(&a.0));
+        report.pieces = each
+            .iter()
+            .take(o.top)
+            .map(|&(of_frame, alone, i, j, k)| {
+                let all = edit::pieces(&sends.submits[i][j], &dispatches, &mesh);
+                let piece = &all[k];
+                // What it does, not what it binds again first.
+                (
+                    of_frame,
+                    alone,
+                    format!(
+                        "submission {i} list {j} piece {k} of {}: {}",
+                        all.len(),
+                        self.describe(&piece.cmds)
+                    ),
+                )
+            })
+            .collect();
         let mut kinds: BTreeMap<&str, (Vec<f64>, Vec<f64>, u32)> = BTreeMap::new();
         let mut shaders: HashMap<u32, (Vec<f64>, Vec<f64>, u32)> = HashMap::new();
-        for (of_kind, of_shader) in loops {
+        let mut heavy: HashMap<u32, Vec<f64>> = HashMap::new();
+        for (_, _, _, of_heavy) in loops {
+            for (k, ms) in of_heavy {
+                heavy.entry(*k).or_default().push(*ms);
+            }
+        }
+        let heavy: HashMap<u32, f64> = heavy.into_iter().map(|(k, v)| (k, median(&v))).collect();
+        for (of_kind, of_shader, _, _) in loops {
             for (k, (ms, of_frame, n)) in of_kind {
                 let all = kinds.entry(k).or_default();
                 all.0.push(*ms);
@@ -3512,6 +4181,7 @@ impl Player {
                 .into_iter()
                 .map(|(k, (ms, of_frame, n))| (k, median(&ms), n, Some(median(&of_frame))))
                 .collect(),
+            &heavy,
             o,
             report,
         );
@@ -3520,7 +4190,8 @@ impl Player {
     fn detailed(
         &self,
         kinds: Vec<(&str, f64, u32, Option<f64>)>,
-        mut shaders: Vec<(u32, f64, u32, Option<f64>)>,
+        shaders: Vec<(u32, f64, u32, Option<f64>)>,
+        heavy: &HashMap<u32, f64>,
         o: &Options,
         report: &mut Report,
     ) {
@@ -3533,17 +4204,57 @@ impl Player {
         report
             .categories
             .sort_by(|a, b| key(b.1, b.3).total_cmp(&key(a.1, a.3)));
-        shaders.sort_by(|a, b| key(b.1, b.3).total_cmp(&key(a.1, a.3)));
-        shaders.truncate(o.top);
-        report.shaders = shaders
+        // Pipelines of the same shaders together.
+        let mut groups: Vec<(String, Vec<u32>, f64, u32, Option<f64>)> = Vec::new();
+        let mut at: HashMap<String, usize> = HashMap::new();
+        for (pso, ms, n, of_frame) in shaders {
+            let key = if pso & COPY_TO != 0 {
+                self.name_of(pso)
+            } else {
+                self.group(pso)
+            };
+            let i = *at.entry(key.clone()).or_insert_with(|| {
+                groups.push((key, Vec::new(), 0.0, 0, of_frame.map(|_| 0.0)));
+                groups.len() - 1
+            });
+            let g = &mut groups[i];
+            g.1.push(pso);
+            (g.2, g.3) = (g.2 + ms, g.3 + n);
+            g.4 = g.4.zip(of_frame).map(|(a, b)| a + b);
+        }
+        groups.sort_by(|a, b| key(b.2, b.4).total_cmp(&key(a.2, a.4)));
+        // What to try leaving out: by their heavy work, where that is
+        // known (many small pieces are mostly what a piece costs alone).
+        let weight = |ids: &[u32]| ids.iter().filter_map(|id| heavy.get(id)).sum::<f64>();
+        let mut heaviest: Vec<(f64, String, Vec<u32>)> = groups
+            .iter()
+            .filter(|g| g.1.iter().all(|id| id & COPY_TO == 0))
+            .map(|g| {
+                let name = match g.1.len() {
+                    1 => self.name_of(g.1[0]),
+                    several => format!("{} ({several} pipelines)", self.name_of(g.1[0])),
+                };
+                (if heavy.is_empty() { key(g.2, g.4) } else { weight(&g.1) }, name, g.1.clone())
+            })
+            .collect();
+        heaviest.sort_by(|a, b| b.0.total_cmp(&a.0));
+        report.heaviest = heaviest.into_iter().map(|h| (h.1, h.2)).collect();
+        groups.truncate(o.top);
+        report.shader_ids = groups.iter().map(|g| g.1.clone()).collect();
+        report.shaders = groups
             .into_iter()
-            .map(|(pso, ms, n, of_frame)| (ms, n, self.name_of(pso), of_frame))
+            .map(|(_, ids, ms, n, of_frame)| {
+                let name = match ids.len() {
+                    1 => self.name_of(ids[0]),
+                    several => format!("{} ({several} pipelines)", self.name_of(ids[0])),
+                };
+                (ms, n, name, of_frame)
+            })
             .collect();
     }
 
-    /// The presented picture as it is now: dB against the recorded one,
-    /// whether its bytes are the same, its hash, and its pixels.
-    fn picture_now(&mut self) -> Result<Option<(f64, bool, String, Vec<u8>)>> {
+    /// The presented picture as it is now, against the recorded one.
+    fn picture_now(&mut self) -> Result<Option<Picture>> {
         let Some(p) = self.frame.presents.last().cloned() else {
             return Ok(None);
         };
@@ -3561,12 +4272,13 @@ impl Player {
         )?;
         let was = plain::rgb(p.width, p.height, p.pitch, p.format, &recorded).unwrap_or_default();
         let hash = blake3::hash(&rgb).to_hex().to_string();
-        Ok(Some((
-            plain::psnr(&rgb, &was),
-            rows_equal(&p, &bytes, &recorded),
+        Ok(Some(Picture {
+            db: plain::psnr(&rgb, &was),
+            same: rows_equal(&p, &bytes, &recorded),
+            differs: differing(&rgb, &was),
             hash,
             rgb,
-        )))
+        }))
     }
 
     /// Saves the picture a run left (`picture`) and says how it compares
@@ -3574,14 +4286,14 @@ impl Player {
     fn picture(
         &mut self,
         o: &Options,
-        picture: Option<(f64, bool, String, Vec<u8>)>,
+        picture: Option<Picture>,
         report: &mut Report,
     ) -> Result<()> {
         let Some(p) = self.frame.presents.last() else {
             report.notes.push("no picture was presented".into());
             return Ok(());
         };
-        let Some((db, same, hash, rgb)) = picture else {
+        let Some(now) = picture else {
             report
                 .notes
                 .push("the presented texture is not there, or its format is not shown".into());
@@ -3591,12 +4303,13 @@ impl Player {
             .image
             .clone()
             .unwrap_or_else(|| self.folder.join("replay.png"));
-        std::fs::write(&path, plain::png(p.width, p.height, &rgb))?;
-        report.picture = Some((db, same));
+        std::fs::write(&path, plain::png(p.width, p.height, &now.rgb))?;
+        report.picture = Some((now.db, now.same));
+        report.picture_differs = (!now.same).then_some(now.differs);
         report.notes.push(format!(
             "picture {} (blake3 {})",
             path.display(),
-            &hash[..16],
+            &now.hash[..16],
         ));
         Ok(())
     }
@@ -3904,23 +4617,6 @@ fn debug_messages(q: &ID3D12InfoQueue) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn captures_are_found() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(find(dir.path()).is_err());
-        for n in [1, 3, 2] {
-            let c = dir.path().join(format!("capture-{n}"));
-            std::fs::create_dir(&c).unwrap();
-            if n != 3 {
-                std::fs::write(c.join("frame.bin"), b"").unwrap();
-            }
-        }
-        // The last one that is complete.
-        assert_eq!(find(dir.path()).unwrap(), dir.path().join("capture-2"));
-        let one = dir.path().join("capture-1");
-        assert_eq!(find(&one).unwrap(), one);
-    }
 
     #[test]
     fn shaders_are_looked_up_by_the_title_s_names() {

@@ -7,7 +7,6 @@ mod census;
 mod inspect;
 #[cfg(windows)]
 mod prebuild;
-#[cfg(windows)]
 mod replay;
 mod run;
 mod shader;
@@ -126,7 +125,6 @@ enum Command {
     },
     /// Run a captured frame's GPU work again without the title, with what
     /// it costs and experiments on it (docs/replay.md).
-    #[cfg(windows)]
     Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
@@ -227,7 +225,6 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        #[cfg(windows)]
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
     }

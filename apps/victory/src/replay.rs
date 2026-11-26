@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
+use victory_gpu::replay::look;
+#[cfg(windows)]
 use victory_gpu::replay::play::{self, Detail, Options, Waits};
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -45,6 +47,40 @@ pub(crate) struct Replay {
     /// and a replay without this, wait for each).
     #[arg(long, conflicts_with = "one_submit")]
     no_waits: bool,
+    /// Send each list alone and wait for it, and name the heaviest lists.
+    #[arg(long, conflicts_with_all = ["one_submit", "no_waits"])]
+    wait_lists: bool,
+    /// After the report (with --timing detailed): for so many of the
+    /// costliest pipelines, run the frame with and without each, turn by
+    /// turn, and say what leaving it out saves.
+    #[arg(long, default_value_t = 0)]
+    leave_out: usize,
+    /// Leave out the barriers of buffers (their transitions, and waits for
+    /// unordered access to them).
+    #[arg(long)]
+    no_buffer_barriers: bool,
+    /// Leave out all barriers (no valid D3D12; D3DMetal runs it).
+    #[arg(long, conflicts_with = "no_buffer_barriers")]
+    no_barriers: bool,
+    /// Leave out the host layer's argument clamps (the passes, what binds
+    /// them and their barriers): the calls they serve read arguments kept
+    /// from a first run with them.
+    #[arg(long)]
+    skip_clamps: bool,
+    /// Make every scissor rectangle one texel: draws without their pixels.
+    #[arg(long)]
+    no_pixels: bool,
+    /// Send nothing that works: only what the lists bind, and their barriers.
+    #[arg(long)]
+    binds_only: bool,
+    /// Make every dispatch one of one thread group.
+    #[arg(long)]
+    one_group: bool,
+    /// After this run, another of the same capture (loaded once) with these
+    /// switches instead of this run's experiments, as one text: `--also
+    /// "--pace 5 --loops 7"`. May be given several times.
+    #[arg(long, allow_hyphen_values = true)]
+    also: Vec<String>,
     /// One ExecuteCommandLists for the whole frame.
     #[arg(long)]
     one_submit: bool,
@@ -69,9 +105,18 @@ pub(crate) struct Replay {
     #[arg(long)]
     retranslate: Option<PathBuf>,
     /// Only write the frame's resources and the commands of these lists
-    /// (`3..7`, or `5`).
+    /// (`3..7`, or `5`). Needs no GPU, and runs on any host.
     #[arg(long)]
     listing: Option<String>,
+    /// Only write a summary of the frame: its resources, what each
+    /// submission does, which pipelines run how often and into what, the
+    /// host layer's own passes. Needs no GPU, and runs on any host.
+    #[arg(long)]
+    summary: bool,
+    /// A file of lines `<hash> <name>`: the names of the title's shaders, by
+    /// the hash the runtime logs them by, for the reports.
+    #[arg(long)]
+    names: Option<PathBuf>,
     /// Use the D3D12 debug layer, where there is one (slow).
     #[arg(long)]
     debug_layer: bool,
@@ -88,8 +133,20 @@ fn range(text: &str) -> Option<(u32, u32)> {
 pub(crate) fn run(r: Replay) -> Result<()> {
     if let Some(text) = &r.listing {
         let lists = range(text).with_context(|| format!("--listing {text}"))?;
-        return play::listing(&r.folder, lists, &mut |line| println!("{line}"));
+        return look::listing(&r.folder, lists, &mut |line| println!("{line}"));
     }
+    if r.summary {
+        let names = look::Names::read(r.names.as_deref())?;
+        return look::summary(&r.folder, &names, r.top, &mut |line| println!("{line}"));
+    }
+    #[cfg(not(windows))]
+    anyhow::bail!("a frame is run again on a Windows host (on a Mac: tools/macos/replay.sh); --listing and --summary work here");
+    #[cfg(windows)]
+    replay(r)
+}
+
+#[cfg(windows)]
+fn replay(r: Replay) -> Result<()> {
     // What a replay writes is made of the title's data, as the capture is.
     for out in r.retranslate.iter().chain(&r.image) {
         victory_core::ensure_outside_repo(out)?;
@@ -115,10 +172,89 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         }
         return Ok(());
     }
-    let options = Options {
+    // The capture is loaded once; every run after the first is of the same
+    // one, with its own switches.
+    let mut again = Vec::new();
+    for text in &r.also {
+        let words = std::iter::once("replay".to_owned())
+            .chain(std::iter::once(r.folder.display().to_string()))
+            .chain(words(text));
+        let mut more = <Again as clap::Parser>::try_parse_from(words)
+            .with_context(|| format!("--also {text}"))?
+            .replay;
+        more.names = r.names.clone();
+        again.push((text.clone(), options(more)));
+    }
+    let folder = r.folder.clone();
+    let first = options(r);
+    let mut player = play::Player::load(&folder, &first)?;
+    let mut run = |what: Option<&str>, o: &Options| -> Result<()> {
+        if let Some(what) = what {
+            println!("== {what}");
+        }
+        let reports = play::replay_with(&mut player, o)?;
+        for (what, report) in &reports {
+            println!("{}", report.text(what));
+        }
+        if let [(_, before), (_, after)] = &reports[..] {
+            println!(
+                "{:+.2} ms ({:+.1} %)",
+                after.median_ms() - before.median_ms(),
+                (after.median_ms() / before.median_ms().max(1e-9) - 1.0) * 100.0
+            );
+        }
+        Ok(())
+    };
+    run(None, &first)?;
+    for (what, o) in &again {
+        run(Some(what), o)?;
+    }
+    Ok(())
+}
+
+/// One more run of a capture: the switches of `--also`.
+#[cfg(windows)]
+#[derive(clap::Parser)]
+struct Again {
+    #[command(flatten)]
+    replay: Replay,
+}
+
+/// The words of a text, those in double quotes as one.
+fn words(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut word = String::new();
+    let (mut quoted, mut any) = (false, false);
+    for c in text.chars() {
+        match c {
+            '"' => (quoted, any) = (!quoted, true),
+            c if c.is_whitespace() && !quoted => {
+                if any {
+                    out.push(std::mem::take(&mut word));
+                }
+                any = false;
+            }
+            c => {
+                word.push(c);
+                any = true;
+            }
+        }
+    }
+    if any {
+        out.push(word);
+    }
+    out
+}
+
+/// What a run does, of its switches.
+#[cfg(windows)]
+fn options(r: Replay) -> Options {
+    Options {
         loops: r.loops.max(1),
         restore: !r.no_restore,
         detail: match r.timing {
+            // What is left out is chosen by the detailed times.
+            Timing::Submissions if r.leave_out > 0 => Detail::Auto,
             Timing::Submissions => Detail::Off,
             Timing::Detailed => Detail::Auto,
             Timing::Stamps => Detail::Stamps,
@@ -126,10 +262,22 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         },
         top: r.top,
         image: r.image,
-        waits: match (r.no_waits, r.one_submit) {
-            (_, true) => Waits::OneSubmit,
-            (true, _) => Waits::None,
+        waits: match (r.no_waits, r.one_submit, r.wait_lists) {
+            (_, true, _) => Waits::OneSubmit,
+            (true, _, _) => Waits::None,
+            (_, _, true) => Waits::Lists,
             _ => Waits::Each,
+        },
+        names: r.names,
+        leave_out: r.leave_out,
+        keep_clamps: r.skip_clamps,
+        one_texel: r.no_pixels,
+        binds_only: r.binds_only,
+        one_group: r.one_group,
+        barriers: match (r.no_barriers, r.no_buffer_barriers) {
+            (true, _) => play::Barriers::NoneAtAll,
+            (_, true) => play::Barriers::NoBufferOnes,
+            _ => play::Barriers::AsRecorded,
         },
         pace: r.pace,
         skip_shaders: r.skip_shader,
@@ -137,19 +285,7 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         shaders_b: r.shaders_b,
         compare: r.compare,
         debug: r.debug_layer,
-    };
-    let reports = play::replay(&r.folder, &options)?;
-    for (what, report) in &reports {
-        println!("{}", report.text(what));
     }
-    if let [(_, before), (_, after)] = &reports[..] {
-        println!(
-            "{:+.2} ms ({:+.1} %)",
-            after.median_ms() - before.median_ms(),
-            (after.median_ms() / before.median_ms().max(1e-9) - 1.0) * 100.0
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -160,5 +296,10 @@ mod tests {
         assert_eq!(super::range("5"), Some((5, 5)));
         assert_eq!(super::range("x"), None);
         assert_eq!(super::range("1..x"), None);
+        assert_eq!(
+            super::words(r#" --pace 5  --skip-shader "victory: clamp" --compare"#),
+            ["--pace", "5", "--skip-shader", "victory: clamp", "--compare"]
+        );
+        assert!(super::words("  ").is_empty());
     }
 }

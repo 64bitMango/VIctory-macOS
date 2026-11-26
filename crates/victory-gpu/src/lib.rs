@@ -62,8 +62,7 @@ pub mod queue;
 mod ranges;
 #[cfg(windows)]
 mod readout;
-// The capture format is plain std, so its tests run everywhere.
-#[cfg(any(windows, test))]
+// The capture format is plain std: read, and tested, everywhere.
 pub mod replay;
 pub mod resource;
 pub mod root;

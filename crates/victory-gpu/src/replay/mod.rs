@@ -23,6 +23,7 @@ mod edit;
 mod gpu;
 #[cfg(windows)]
 mod hook;
+pub mod look;
 mod plain;
 #[cfg(windows)]
 pub mod play;

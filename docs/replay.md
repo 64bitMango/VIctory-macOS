@@ -82,8 +82,9 @@ it in the first submission, and leave a capture of 14 GB.
 
 ### A title that ends in the middle
 
-`frame.bin` is written anew after every submission of the frame (its notes
-say "the frame is not whole" until the frame's present), and a title that
+`frame.bin` is written anew after the frame's first submission and then
+every other second while its submissions go by (its notes say "the frame is
+not whole" until the frame's present), and a title that
 ends the process itself (`exit`, `abort`, `TerminateProcess`) waits for
 the submission being written. So a title whose watchdog ends it after the
 long stand-still of the first submission leaves a capture of the
@@ -151,9 +152,19 @@ the BLAKE3 of their DXIL.
 | `--one-submit` | one `ExecuteCommandLists` for the whole frame |
 | `--shaders <folder>` | takes shaders from the folder where it has them: `<hash>.dxil` by the hash the runtime names the title's shader by, or `<hash>@<the pipeline's other hashes>.dxil` for a translation made for one pipeline alone; with `--compare --shaders-b <folder>` a second set, turn by turn with the first |
 | `--retranslate <folder>` | only writes that folder: the capture's shaders translated again by this build with the `VICTORY_*` switches of this run, as the runtime would give them to each pipeline |
-| `--timing detailed` | times commands (above); `--top <n>` pipelines are listed |
+| `--timing detailed` | times commands (above); `--top <n>` pipelines and pieces are listed |
+| `--wait-lists` | each list sent alone and waited for (as `VICTORY_GPU_TIMING` does in a run): the heaviest lists, with what they do |
+| `--leave-out <n>` | after the detailed report, for its `n` costliest pipelines: the frame with and without what runs each, turn by turn. What leaving one out saves is what it costs in the frame. (A pass that makes arguments for later calls cannot be left out this way: the calls then read stale ones.) |
+| `--skip-clamps` | leaves out the host layer's argument clamps (the passes, what binds them, their barriers); the calls they serve read arguments kept from a first run with them |
+| `--no-buffer-barriers`, `--no-barriers` | leaves out the barriers of buffers, or all (no valid D3D12; D3DMetal runs it) |
+| `--no-pixels` | every scissor rectangle one texel: draws without their pixels |
+| `--binds-only` | nothing that works is sent: what the lists bind, and their barriers |
+| `--one-group` | every dispatch is of one thread group: what dispatches cost whatever they compute |
+| `--also "<switches>"` | after this run, another of the same capture, loaded once, with these switches (repeatable): `--also "--pace 5" --also "--compare --skip-clamps"` |
+| `--names <file>` | names for the title's shaders in the reports: lines `<hash> <name>` |
+| `--summary` | only a summary of the capture, read without a GPU, on any host (`cargo run -p victory -- replay <folder> --summary`): resources, what each submission does, which pipelines run how often and into what, the host layer's own passes |
 | `--no-restore` | leaves what a loop changed, and makes no copies to restore from |
-| `--listing 3..7` | only writes the frame's resources and those lists' commands |
+| `--listing 3..7` | only writes the frame's resources and those lists' commands (no GPU needed, any host) |
 | `--image <file>` | where the picture goes |
 
 To measure a change of the translator: record once with the build in use
@@ -161,6 +172,18 @@ To measure a change of the translator: record once with the build in use
 
     tools/macos/replay.sh <folder> --retranslate <shaders>
     tools/macos/replay.sh <folder> --compare --shaders <shaders>
+
+### What a replay takes
+
+A capture of a title's frame (20,000 resources, 5.3 GB of textures, 11.5 GB
+of buffers the CPU maps, 1,263 pipelines, 4.2 million view slots) loads in
+5 to 7 s once D3DMetal has compiled its pipelines (72 s the first time),
+and a loop takes about 0.3 s more than the frame itself. Everything the
+frame's views name is made again at its full size, as in the title's run:
+D3DMetal counted 24 GB of video memory for it, of which the process itself
+has 6 GB resident. Between loops the textures and GPU buffers the frame
+changes are put back from copies (2 GB here); of the buffers the CPU maps,
+only the pages the frame changes are put back, read from the capture again.
 
 ## Limits
 
