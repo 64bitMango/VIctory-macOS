@@ -1383,10 +1383,10 @@ impl HostHeap {
             crate::shadow::forget_read(index);
         }
         lap!(laps, SlotTablesNs);
-        let (kept, mark) = if later {
-            (None, None)
+        let (kept, mark, found) = if later {
+            (None, None, None)
         } else {
-            make_marked(&view, self.cpu(index))
+            make_found(&view, self.cpu(index))
         };
         if kept.is_none() && !self.sampler {
             null_for(&view, self.cpu(index));
@@ -1395,7 +1395,7 @@ impl HostHeap {
         self.set_mark(index, mark);
         lap!(laps, SlotTablesNs);
         if !self.sampler {
-            self.viewed.set(index, Some(&view), kept.is_some());
+            self.viewed.set_found(index, &view, kept.is_some(), found_copy(&view, found));
         }
         lap!(laps, SlotViewedNs);
         self.keep(index, kept.flatten());
@@ -1886,6 +1886,7 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
+    FOUND.with(|f| *f.borrow_mut() = Some((shadow.clone(), start, u64::from(count) * element, element)));
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
 }
 
@@ -1951,6 +1952,7 @@ fn buffer_uav(
         )
     };
     MARK.with(|m| m.set(shadow.mark_entry(start)));
+    FOUND.with(|f| *f.borrow_mut() = Some((shadow.clone(), start, u64::from(count) * element, element)));
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
 }
 
@@ -1958,15 +1960,56 @@ thread_local! {
     /// The view-mark entry of the unordered buffer view [`make`] last made
     /// on this thread ([`make_marked`]).
     static MARK: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
+    /// The copy the buffer view [`make`] last made on this thread reads,
+    /// with the view's title range and element size ([`make_marked`]).
+    static FOUND: std::cell::RefCell<Option<Found>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The copy a buffer view made on the host reads ([`crate::shadow::for_view`]
+/// as `make` asked it), the view's title start and length, and its element
+/// size: what `crate::bindless` would look up again for the slot.
+pub(crate) type Found = (std::sync::Arc<crate::shadow::Shadow>, u64, u64, u64);
+
+/// Whether what a heap's slots view is entered from the copy the slot's
+/// buffer view was just made on ([`found_copy`]) rather than looked up
+/// again: unless `VICTORY_SEEN_FROM_MADE=0`. Each buffer view made asked the
+/// registry of copies twice for the same range (and the table of copies of
+/// views off their copy's elements, under one lock, twice: 21,000 such
+/// views a world frame); the copy `make` found is the one the host view
+/// reads, which the second asking is after (a copy registered in between
+/// is the only way the two differ, and then the first is the right one).
+fn seen_from_made() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_SEEN_FROM_MADE"))
+}
+
+/// Of the copy `found` that [`make`] made `view` on: the copy, the view's
+/// title start and length, as `crate::bindless` finds them for the slot
+/// (`crate::descriptor::host::view_copy`), when they are the same asking:
+/// a buffer view (not a constant buffer's, which it finds otherwise) whose
+/// title range and element size `make` used. None to look them up.
+pub(crate) fn found_copy(view: &View, found: Option<Found>) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    let (shadow, start, len, element) = found?;
+    if !seen_from_made() || matches!(view, View::Constant(..)) {
+        return None;
+    }
+    (buffer_range(view) == Some((start, len)) && u64::from(view_stride(view)) == element).then_some((shadow, start, len))
 }
 
 /// [`make`], and the view-mark entry of the view if it is an unordered
 /// buffer view whose writes shaders mark (`victory_shader::emit`, "Write
 /// marks").
 fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>) {
+    let (kept, mark, _) = make_found(view, at);
+    (kept, mark)
+}
+
+/// [`make_marked`], and the copy a buffer view was made on ([`Found`]).
+fn make_found(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>, Option<Found>) {
     MARK.with(|m| m.set(None));
+    FOUND.with(|f| f.borrow_mut().take());
     let kept = make(view, at);
-    (kept, MARK.with(std::cell::Cell::take))
+    (kept, MARK.with(std::cell::Cell::take), FOUND.with(|f| f.borrow_mut().take()))
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -2468,6 +2511,61 @@ pub(crate) mod tests {
         let srv = View::Shader(0, Some([62, 1, 5768, 0, 0, 0, 64, 0, 0, 0]));
         assert_eq!(view_kind(&srv), VIEW_INTEGER, "R8_UINT");
         assert_eq!(view_stride(&uav(12, 0, 0)) | view_kind(&uav(12, 0, 0)), 8 | VIEW_INTEGER);
+    }
+
+    /// The copy a buffer view is made on is the one what the slot views is
+    /// entered with (`VICTORY_SEEN_FROM_MADE`): for structured views on and
+    /// off their copy's elements (the latter on a copy of their own), raw
+    /// unordered views and typed ones, the same copy and range as asking
+    /// again; constant buffer views, found otherwise, are asked again.
+    #[test]
+    fn a_buffer_slot_views_the_copy_its_view_was_made_on() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let host = crate::descriptor::heap(heap).host().expect("a host view heap");
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * crate::watch::PAGE as u64;
+        crate::shadow::register(p, p as u64, len);
+        // A placed buffer of the whole pool, and views of it at `at`.
+        let mut buffer = [0u32; 14];
+        (buffer[0], buffer[4]) = (1, len as u32);
+        let placed = |unordered: bool, at: u64, words: [u32; 10]| {
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&words);
+            (desc[10], desc[11]) = ((p as u64 + at) as u32, ((p as u64 + at) >> 32) as u32);
+            View::Placed(unordered, buffer, desc)
+        };
+        // Format, dimension, mapping, (pad), first element (2), count, stride, flags.
+        let structured = |first: u32, count: u32, stride: u32| [0, 1, 5768, 0, first, 0, count, stride, 0, 0];
+        // Format, dimension, first element (2), count, stride, counter (2), flags.
+        let raw_uav = [39, 1, 4, 0, 32, 0, 0, 0, 1, 0];
+        let typed_uav = [2, 1, 3, 0, 16, 0, 0, 0, 0, 0];
+        let views = [
+            ("structured", placed(false, 0, structured(2, 64, 16))),
+            ("off its copy's elements", placed(false, 8, structured(1, 32, 24))),
+            ("raw unordered", placed(true, 256, raw_uav)),
+            ("typed unordered", placed(true, 4096, typed_uav)),
+        ];
+        for (k, (what, view)) in views.iter().enumerate() {
+            let (kept, _, found) = make_found(view, host.cpu(k as u32));
+            assert!(matches!(kept, Some(Some(_))), "{what}: made");
+            let (copy, start, bytes) = found_copy(view, found.clone()).expect("from the copy it was made on");
+            let (again, start_again, bytes_again) = view_copy(view).expect("found asking again");
+            assert!(std::sync::Arc::ptr_eq(&copy, &again) && (start, bytes) == (start_again, bytes_again), "{what}: the same copy and range");
+            assert!(crate::bindless::found_as_seen(view, Some((copy, start, bytes))), "{what}: as what the slot views is found");
+        }
+        let constant = View::Constant(p as u64 + 512, 256);
+        let (kept, _, found) = make_found(&constant, host.cpu(7));
+        assert!(matches!(kept, Some(Some(_))) && found.is_some(), "a constant buffer view, made");
+        assert!(found_copy(&constant, found).is_none(), "asked again");
+        crate::shadow::unregister(p, p as u64);
+        crate::watch::tests::free(p);
     }
 
     /// A placed texture's view the title writes into a heap is left null

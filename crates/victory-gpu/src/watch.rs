@@ -110,8 +110,13 @@ pub(crate) const PAGE: usize = 64 << 10;
 
 /// How long a block stays open after a title write fault opened it, in
 /// milliseconds; 0: not at all (it is guarded again by the next asking, as
-/// before). `VICTORY_GUARD_REST=0` turns the rest off,
-/// `VICTORY_GUARD_REST_MS=<n>` sets its length ([`REST_MS`] unless given).
+/// before). Off by default: `VICTORY_GUARD_REST=1` turns it on for
+/// [`REST_MS`], `VICTORY_GUARD_REST_MS=<n>` for that length, and
+/// `VICTORY_GUARD_REST=0` keeps it off whatever the length. In the world
+/// (2026-11-25, same scene and build) frames were 316 ms without it, 322 ms
+/// at 15 ms and 335-356 ms at 50 ms: each asking of a resting block copies
+/// its 64 KiB again (~2,000 blocks, ~130 MB a frame), on the submitting
+/// thread, which cost more than the faults it saved on the title's threads.
 ///
 /// The title's recording threads write a block again and again through a
 /// frame, and a submission's refresh used to make it read-only each time, so
@@ -147,11 +152,13 @@ pub(crate) const REST_MS: u32 = 50;
 
 /// [`rest_ms`] from `VICTORY_GUARD_REST` and `VICTORY_GUARD_REST_MS`.
 fn rest_from(switch: Option<&str>, ms: Option<&str>) -> u32 {
-    if switch.map(str::trim) == Some("0") {
-        return 0;
-    }
     // (Capped: stamps are milliseconds in 32 bits, compared by difference.)
-    ms.and_then(|v| v.trim().parse::<u32>().ok()).map_or(REST_MS, |ms| ms.min(60_000))
+    let ms = ms.and_then(|v| v.trim().parse::<u32>().ok()).map(|ms| ms.min(60_000));
+    match switch.map(str::trim) {
+        Some("0") => 0,
+        Some(on) if !on.is_empty() => ms.unwrap_or(REST_MS),
+        _ => ms.unwrap_or(0),
+    }
 }
 
 /// The blocks title write faults opened that nothing has guarded since, and
@@ -2140,13 +2147,14 @@ pub(crate) mod tests {
 
     #[test]
     fn the_rest_follows_its_variables() {
-        assert_eq!(rest_from(None, None), REST_MS);
+        assert_eq!(rest_from(None, None), 0, "off unless asked for");
         assert_eq!(rest_from(Some("1"), None), REST_MS);
         assert_eq!(rest_from(Some("0"), Some("80")), 0, "the switch turns it off whatever its length");
         assert_eq!(rest_from(Some("1"), Some("80")), 80);
         assert_eq!(rest_from(None, Some(" 20 ")), 20);
         assert_eq!(rest_from(None, Some("0")), 0);
-        assert_eq!(rest_from(None, Some("soon")), REST_MS);
+        assert_eq!(rest_from(None, Some("soon")), 0);
+        assert_eq!(rest_from(Some("1"), Some("soon")), REST_MS);
         assert_eq!(rest_from(None, Some("4000000000")), 60_000);
     }
 

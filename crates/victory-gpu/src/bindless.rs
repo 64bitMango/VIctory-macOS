@@ -278,6 +278,16 @@ impl Viewed {
         self.put(index, view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) }));
     }
 
+    /// [`Viewed::set`] of a slot made from `view` (`made`: on the host),
+    /// with the copy its buffer view was made on if that is what [`seen`]
+    /// would find for it (`crate::descriptor::host::found_copy`).
+    pub(crate) fn set_found(&self, index: u32, view: &View, made: bool, found: Option<(Arc<Shadow>, u64, u64)>) {
+        match found_seen(view, made, found) {
+            Some(seen) => self.put(index, Some(seen)),
+            None => self.set(index, Some(view), made),
+        }
+    }
+
     /// Slot `index` views `seen` now (none: nothing title memory feeds).
     fn put(&self, index: u32, seen: Option<Seen>) {
         // Held until the counts are changed: another change to this slot
@@ -409,6 +419,27 @@ impl Seen {
             (Seen::Texture(a), Seen::Texture(b)) => a == b,
             _ => false,
         }
+    }
+}
+
+/// What [`seen`] finds for buffer view `view`, made on the host (`made`)
+/// on the copy `found`, from that copy; none to ask [`seen`].
+fn found_seen(view: &View, made: bool, found: Option<(Arc<Shadow>, u64, u64)>) -> Option<Seen> {
+    let (shadow, address, len) = found.filter(|_| made)?;
+    if len == 0 {
+        return None;
+    }
+    let uav = matches!(view, View::Unordered(..) | View::Placed(true, ..));
+    let len = len.min(shadow.left(address));
+    Some(Seen::Buffer(shadow, address, len, uav))
+}
+
+/// Whether [`found_seen`] gives what [`seen`] finds for `view` (tests).
+#[cfg(test)]
+pub(crate) fn found_as_seen(view: &View, found: Option<(Arc<Shadow>, u64, u64)>) -> bool {
+    match (found_seen(view, true, found), seen(view)) {
+        (Some(a), Some(b)) => a.same(&b),
+        _ => false,
     }
 }
 
