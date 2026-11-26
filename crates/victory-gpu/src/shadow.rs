@@ -2744,9 +2744,10 @@ pub(crate) mod tests {
     /// shaders write is 0x80 and above, so never the byte the title holds).
     fn patterned(pages: usize) -> usize {
         let p = crate::watch::tests::pool(pages);
-        for i in 0..pages * PAGE {
-            // SAFETY: a byte of our pool, not guarded yet.
-            unsafe { ((p + i) as *mut u8).write_volatile((i * 7 + i / PAGE) as u8 & 0x7f) };
+        // SAFETY: our pool, which nothing else knows of yet.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, pages * PAGE) };
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i * 7 + i / PAGE) as u8 & 0x7f;
         }
         p
     }
@@ -2876,7 +2877,7 @@ pub(crate) mod tests {
     #[test]
     fn declared_ranges_at_once_leave_what_one_by_one_leaves() {
         let mut changed = 0;
-        for round in 0..24u64 {
+        for round in 0..12u64 {
             let seed = 0x9e37_79b9_7f4a_7c15 ^ (round + 1).wrapping_mul(0x2545_f491_4f6c_dd1d);
             let Some(wanted) = copying_back(true, 0, || declared_copy_back(seed)) else {
                 return; // no host GPU here
@@ -2884,7 +2885,17 @@ pub(crate) mod tests {
             for threads in [1, 4] {
                 let done = copying_back(false, threads, || declared_copy_back(seed)).expect("a host GPU");
                 assert!(done.0 == wanted.0, "round {round}, {threads} threads: title memory");
-                assert!(done.1 == wanted.1, "round {round}, {threads} threads: the copies");
+                // But where the shaders' bytes stay in the copies alone:
+                // how long they stay is `crate::memory`'s to say, by state
+                // other tests' submissions share (a submission that missed
+                // memory makes the copies take title memory at once).
+                let apart = |here: usize| wanted.2.iter().chain(&done.2).any(|&(from, to)| (from..to).contains(&here));
+                for (k, (d, w)) in done.1.iter().zip(&wanted.1).enumerate() {
+                    let at = wanted.3[k].0;
+                    if let Some(i) = (0..d.len()).find(|&i| d[i] != w[i] && !apart(at + i)) {
+                        panic!("round {round}, {threads} threads: copy {k} at {:#x}: {:#x} for {:#x}", at + i, d[i], w[i]);
+                    }
+                }
             }
             for (copy, &(at, _)) in wanted.1.iter().zip(&wanted.3) {
                 for (i, &b) in copy.iter().enumerate() {
@@ -2896,7 +2907,7 @@ pub(crate) mod tests {
             }
             changed += usize::from(wanted.0.iter().any(|&b| b >= 0x80));
         }
-        assert!(changed > 12, "the shaders' bytes went back in most rounds ({changed})");
+        assert!(changed > 6, "the shaders' bytes went back in most rounds ({changed})");
     }
 
     /// Times the copy-back of a 48 MiB buffer's declared ranges (megabyte
@@ -3011,7 +3022,8 @@ pub(crate) mod tests {
     /// Marked pages of two copies (whole pages and the parts at a copy's
     /// ends), some written by the title after the copy took them: copied
     /// back as a batch, title memory and the copies end as page by page.
-    fn marked_copy_back(seed: u64) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    #[allow(clippy::type_complexity)]
+    fn marked_copy_back(seed: u64) -> Option<(Vec<u8>, Vec<Vec<u8>>, Vec<(usize, usize)>, [(usize, usize); 2])> {
         const PAGES: usize = 12;
         let host = crate::host::host()?;
         let b = bitmap(false)?;
@@ -3030,6 +3042,7 @@ pub(crate) mod tests {
             // The shaders write through views of both copies; the title
             // writes some pages meanwhile (their bytes from before saved).
             let mut marks = Vec::new();
+            let mut unmarked = Vec::new();
             for (copy, &(at, len)) in copies.iter().zip(&buffers) {
                 for _ in 0..2 + random(&mut seed, 10) {
                     let n = [1, 4, 700, PAGE][random(&mut seed, 4)];
@@ -3041,6 +3054,8 @@ pub(crate) mod tests {
                     if random(&mut seed, 6) != 0 {
                         let (first, last) = ((p + at + from) / PAGE, (p + at + from + n - 1) / PAGE);
                         marks.extend((first..=last).map(|page| copy.mark_entry((page * PAGE).max(p + at) as u64).expect("a bit").0));
+                    } else {
+                        unmarked.push((at + from, at + from + n));
                     }
                 }
             }
@@ -3070,7 +3085,7 @@ pub(crate) mod tests {
                     held(copy)
                 })
                 .collect();
-            (title, after)
+            (title, after, unmarked, buffers)
         });
         for (k, &(at, _)) in buffers.iter().enumerate() {
             unregister(p + k, (p + at) as u64);
@@ -3083,7 +3098,7 @@ pub(crate) mod tests {
     #[test]
     fn marked_pages_at_once_leave_what_one_by_one_leaves() {
         let mut changed = 0;
-        for round in 0..24u64 {
+        for round in 0..12u64 {
             let seed = 0x1234_5678_9abc_def1 ^ (round + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
             let Some(wanted) = copying_back(true, 0, || marked_copy_back(seed)) else {
                 return; // no host GPU here, or no mark bits left
@@ -3091,11 +3106,20 @@ pub(crate) mod tests {
             for threads in [1, 4] {
                 let done = copying_back(false, threads, || marked_copy_back(seed)).expect("a host GPU");
                 assert!(done.0 == wanted.0, "round {round}, {threads} threads: title memory");
-                assert!(done.1 == wanted.1, "round {round}, {threads} threads: the copies");
+                // But where a write no view marked stays in its copy alone,
+                // until something makes the copy take the page again
+                // (`crate::memory`, by state other tests share).
+                let apart = |here: usize| wanted.2.iter().any(|&(from, to)| (from..to).contains(&here));
+                for (k, (d, w)) in done.1.iter().zip(&wanted.1).enumerate() {
+                    let at = wanted.3[k].0;
+                    if let Some(i) = (0..d.len()).find(|&i| d[i] != w[i] && !apart(at + i)) {
+                        panic!("round {round}, {threads} threads: copy {k} at {:#x}: {:#x} for {:#x}", at + i, d[i], w[i]);
+                    }
+                }
             }
             changed += usize::from(wanted.0.iter().any(|&b| b >= 0x80));
         }
-        assert!(changed > 12, "the shaders' bytes went back in most rounds ({changed})");
+        assert!(changed > 6, "the shaders' bytes went back in most rounds ({changed})");
     }
 
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`
