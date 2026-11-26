@@ -207,6 +207,9 @@ pub(crate) enum C {
     SyncProbeUs,
     SyncPrepareUs,
     SyncMakeUs,
+    /// The submitting thread's time making a sync's runs, on it and on
+    /// helper threads (the two above are summed over the threads).
+    SyncRunsUs,
     /// The submitting thread's own waits (heap syncs, slots shaders read)
     /// for what a heap's slots view and for the views table.
     ViewedSyncWaitUs,
@@ -269,6 +272,26 @@ pub(crate) enum C {
     MarkWrites,
     MarkLeft,
     MarkIdle,
+    /// Reading the shaders' write marks back: time in the bitmaps, their
+    /// dwords looked at, the bits found set that go back and those held
+    /// back (their shaders' results are withheld, or the page is in a
+    /// withheld range); time finding the bits' copies and pages, and the
+    /// copies with marked pages; time making the batch's pieces (asking
+    /// each page's tracker what it kept).
+    MarksScanUs,
+    MarksWords,
+    MarksBits,
+    MarksHeld,
+    MarksFindUs,
+    MarksCopies,
+    MarksPrepUs,
+    /// Copying back: time finding the ranges the submission's lists
+    /// declared (every step of every list is looked at).
+    BackGatherUs,
+    /// Asking whether pages are a write-watched pool's before guarding
+    /// them: the askings, and the pages they answered for.
+    PoolAsks,
+    PoolPages,
     /// Not a counter: how many there are.
     Count,
 }
@@ -324,6 +347,40 @@ pub(crate) fn snapshot(start: u64, len: u64, bytes: u64) {
         .get_or_insert_with(HashMap::new)
         .entry((start, len))
         .or_default() += bytes;
+}
+
+/// Pages shaders marked as written, per host copy (its title start and
+/// length).
+static MARKED: Mutex<Option<HashMap<(u64, u64), u64>>> = Mutex::new(None);
+
+/// Shaders marked `pages` pages of the copy of `[start, start + len)`.
+pub(crate) fn marked(start: u64, len: u64, pages: u64) {
+    *MARKED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry((start, len)).or_default() +=
+        pages;
+}
+
+/// Draws and dispatches recorded with the write-marks bitmap bound, per
+/// pipeline.
+static MARKING: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+/// A draw or dispatch of `pipeline` was recorded whose shaders mark the
+/// pages they write through views.
+pub(crate) fn marking(pipeline: &str) {
+    let mut map = MARKING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    match map.get_mut(pipeline) {
+        Some(n) => *n += 1,
+        None => {
+            map.insert(pipeline.to_owned(), 1);
+        }
+    }
+}
+
+/// A counter's value since the last line or call, which starts it again
+/// (tests' benchmarks).
+#[cfg(test)]
+pub(crate) fn take(c: C) -> u64 {
+    COUNT[c as usize].swap(0, Relaxed)
 }
 
 /// Examples for the next line ([`sample`]).
@@ -660,9 +717,10 @@ pub(crate) fn log(frames: f64) {
         more(frames);
     }
     tracing::info!(
-        "  heap sync time per frame: taking the heaps' changed pages {:.1} ms, asking whether pages are mapped {:.1} ms, making what views need {:.1} ms, making slots under their runs' locks {:.1} ms; the submitting thread waited {:.1} ms ({:.0} times) for what a heap's slots view and {:.1} ms ({:.0}) for the views table",
+        "  heap sync time per frame: taking the heaps' changed pages {:.1} ms, asking whether pages are mapped {:.1} ms, making the slots {:.1} ms of the submitting thread's time (summed over the threads that made them: what views need {:.1} ms, slots under their runs' locks {:.1} ms); the submitting thread and its helpers waited {:.1} ms ({:.0} times) for what a heap's slots view and {:.1} ms ({:.0}) for the views table",
         ms(c[C::SyncTakeUs as usize]),
         ms(c[C::SyncProbeUs as usize]),
+        ms(c[C::SyncRunsUs as usize]),
         ms(c[C::SyncPrepareUs as usize]),
         ms(c[C::SyncMakeUs as usize]),
         ms(c[C::ViewedSyncWaitUs as usize]),
@@ -692,6 +750,44 @@ pub(crate) fn log(frames: f64) {
         .map(|((start, len), bytes)| format!("{start:#x}+{len:#x} {:.1} MB", *bytes as f64 / 1e6 / frames))
         .collect();
     tracing::info!("  snapshots per frame by copy: {}", snapshots.join(", "));
+    tracing::info!(
+        "  write marks per frame: bitmaps read in {:.2} ms ({:.0} dwords, {:.0} bits set that go back, {:.0} held back); \
+         their pages found and grouped in {:.2} ms ({:.0} copies); pieces made in {:.2} ms; the submissions' declared \
+         ranges gathered in {:.2} ms; pools asked about {:.0} times for {:.0} pages before guarding",
+        ms(c[C::MarksScanUs as usize]),
+        c[C::MarksWords as usize],
+        c[C::MarksBits as usize],
+        c[C::MarksHeld as usize],
+        ms(c[C::MarksFindUs as usize]),
+        c[C::MarksCopies as usize],
+        ms(c[C::MarksPrepUs as usize]),
+        ms(c[C::BackGatherUs as usize]),
+        c[C::PoolAsks as usize],
+        c[C::PoolPages as usize],
+    );
+    let mut copies: Vec<((u64, u64), u64)> =
+        MARKED.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
+    copies.sort_by_key(|&(at, pages)| (std::cmp::Reverse(pages), at));
+    let total: u64 = copies.iter().map(|c| c.1).sum();
+    let most: Vec<String> = copies
+        .iter()
+        .take(8)
+        .map(|((start, len), pages)| format!("{start:#x}+{len:#x} {:.1}", *pages as f64 / frames))
+        .collect();
+    tracing::info!(
+        "  marked pages per frame by copy ({:.0} of {} copies): {}",
+        total as f64 / frames,
+        copies.len(),
+        most.join(", ")
+    );
+    let mut marking: Vec<(String, u64)> = MARKING.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
+    marking.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let most: Vec<String> = marking.iter().take(8).map(|(name, n)| format!("{name} {:.1}", *n as f64 / frames)).collect();
+    tracing::info!(
+        "  draws and dispatches per frame whose shaders mark the pages they write, by pipeline ({} pipelines): {}",
+        marking.len(),
+        most.join(", ")
+    );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));

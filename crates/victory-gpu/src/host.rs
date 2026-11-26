@@ -43,7 +43,20 @@ thread_local! {
 }
 
 /// The thread holds the submission lock while this lives.
-struct Holding(bool);
+pub(crate) struct Holding(bool);
+
+/// Whether this thread holds the submission lock, or works for one that
+/// does ([`holding_too`]).
+pub(crate) fn holds_submissions() -> bool {
+    HOLDS_SUBMISSIONS.with(std::cell::Cell::get)
+}
+
+/// For a helper thread of a thread that holds the submission lock and
+/// waits for it: marked as holding it too until this is dropped, so that
+/// nothing it does waits for the lock its waiter holds ([`Host::quiet`]).
+pub(crate) fn holding_too() -> Holding {
+    Holding::enter()
+}
 
 impl Holding {
     fn enter() -> Self {
@@ -1581,6 +1594,8 @@ impl Host {
             .collect();
         #[cfg(feature = "diagnostics")]
         drop(asking);
+        #[cfg(feature = "diagnostics")]
+        let gathering = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::BackGatherUs);
         crate::memory::note_submission(missed.contains(&true));
         let withholding = crate::memory::withholding();
         for (list, &missed) in runs.iter().zip(&missed) {
@@ -1620,6 +1635,8 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
+        #[cfg(feature = "diagnostics")]
+        drop(gathering);
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         #[cfg(feature = "diagnostics")]
