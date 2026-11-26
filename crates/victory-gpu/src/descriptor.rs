@@ -350,6 +350,9 @@ pub(crate) fn sync_heaps() {
         let changed = written.take_resting(start as usize, usize::MAX);
         #[cfg(feature = "diagnostics")]
         drop(taking);
+        // The slots to make of every page, then made together: on several
+        // threads where there are enough (`host::HostHeap::make_runs`).
+        let mut runs = Vec::new();
         for (from, to) in changed {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
@@ -369,9 +372,10 @@ pub(crate) fn sync_heaps() {
                     crate::copystat::C::SyncSlots,
                     last.min(u64::from(heap.desc.count)).saturating_sub(first),
                 );
-                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
+                host.due_runs(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step, &mut runs);
             }
         }
+        host.make_runs(&runs, start, step);
     }
 }
 
@@ -1528,6 +1532,10 @@ pub(crate) mod tests {
         ONE_LOCK.with(|one| one.set(one_lock));
         // What the slots view in one part too (as `VICTORY_VIEWED_PARTS=0`).
         crate::bindless::tests::ONE_PART.with(|one| one.set(one_lock));
+        // The syncs' runs on helper threads, or all on the syncing thread
+        // (as `VICTORY_SYNC_THREADS`).
+        let helpers = Some(if one_lock { 1 } else { 4 });
+        host::tests::SYNC_THREADS.with(|threads| threads.set(helpers));
         let page = crate::watch::PAGE;
         let pages = (SLOTS as usize * 32).div_ceil(page);
         // Each heap in pages of its own: samplers, views, and the pair one
@@ -1563,6 +1571,7 @@ pub(crate) mod tests {
                 HEAPS_ALONE.with(|a| a.set(alone));
                 ONE_LOCK.with(|one| one.set(one_lock));
                 crate::bindless::tests::ONE_PART.with(|one| one.set(one_lock));
+                host::tests::SYNC_THREADS.with(|threads| threads.set(helpers));
                 let host = crate::host::host().expect("checked");
                 let mut round = 0u32;
                 while !stop.load(Relaxed) {
@@ -1699,6 +1708,7 @@ pub(crate) mod tests {
         HEAPS_ALONE.with(|a| a.set(false));
         ONE_LOCK.with(|one| one.set(false));
         crate::bindless::tests::ONE_PART.with(|one| one.set(false));
+        host::tests::SYNC_THREADS.with(|threads| threads.set(None));
     }
 
     /// Several threads write the same slots of a heap no sync looks at, at

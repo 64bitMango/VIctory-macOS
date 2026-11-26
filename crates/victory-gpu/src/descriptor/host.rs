@@ -182,6 +182,32 @@ fn sync_runs() -> bool {
     *ON.get_or_init(|| !crate::switch::off("VICTORY_SYNC_RUNS"))
 }
 
+/// Slots of one run a heap sync is to make, with the records read of them
+/// ([`HostHeap::due_runs`]).
+pub(crate) type Run = Vec<(u32, [u32; 3])>;
+
+/// Slots to make below which a heap sync makes them on its own thread:
+/// waking the helpers costs more than making a few slots.
+const SPREAD: usize = 192;
+
+/// How many threads make a heap sync's runs of slots, the submitting
+/// thread among them: those the copy-back has (`crate::back::threads`: a
+/// quarter of the CPUs, four at most), or `VICTORY_SYNC_THREADS` (1: all on
+/// the submitting thread, as before).
+fn sync_threads() -> usize {
+    // Tests: as the thread running the sync says, for any number of slots;
+    // on one thread unless it says.
+    #[cfg(test)]
+    return tests::SYNC_THREADS.with(|threads| threads.get()).unwrap_or(1);
+    #[cfg(not(test))]
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    #[cfg(not(test))]
+    *THREADS.get_or_init(|| {
+        let asked = std::env::var("VICTORY_SYNC_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        asked.map_or_else(crate::back::threads, |n| n.clamp(1, 16))
+    })
+}
+
 /// Whether a slot that shows nothing keeps the null view it has when its
 /// record comes to name no view (`VICTORY_NULL_ONCE=1`). Off: the null
 /// view it has is one of the kind its last view was
@@ -891,43 +917,79 @@ impl HostHeap {
     /// hold of the run's lock, what their views need made before it is
     /// taken: one take per slot was 3,000 waits and 100 ms a frame beside
     /// the title's threads (run ab-locks-on).
+    #[cfg(test)]
     pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
+        let mut runs = Vec::new();
+        self.due_runs(first, last, start, step, &mut runs);
+        self.make_runs(&runs, start, step);
+    }
+
+    /// Of slots `first..last`, whose records are at `start` + index ×
+    /// `step`, those to make ([`due`]), by run, with the records read:
+    /// added to `runs`.
+    pub(crate) fn due_runs(&self, first: u32, last: u32, start: u64, step: u64, runs: &mut Vec<Run>) {
         let at = |i: u32| start + u64::from(i) * step;
         #[cfg(feature = "diagnostics")]
         let looking = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncLookUs);
         // SAFETY: records in title heap memory the caller found mapped.
         let records: Vec<[u32; 3]> =
             (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
-        let record = |i: u32| records[(i - first) as usize];
         let current = views_current(&records);
         // Why each is made (diagnostics).
         let mut why = [0u64; 3];
-        let stale: Vec<u32> = (first..last)
-            .zip(records.iter().zip(current))
-            .filter(|&(i, (&[_tag, view, generation], current))| {
-                let key = u64::from(generation) << 32 | u64::from(view);
-                let made = self.made.get(i as usize).map(|made| made.load(Acquire));
-                let due = due(made, current.then_some(key));
-                if let Some(Some(reason)) = due {
-                    why[reason as usize] += 1;
-                    #[cfg(feature = "diagnostics")]
-                    self.note_due(i, reason, [_tag, view, generation], at(i), step);
-                }
-                due.is_some()
-            })
-            .map(|(i, _)| i)
-            .collect();
+        let mut made = 0u64;
+        for (i, (&record, current)) in (first..last).zip(records.iter().zip(current)) {
+            let [_tag, view, generation] = record;
+            let key = u64::from(generation) << 32 | u64::from(view);
+            let from = self.made.get(i as usize).map(|made| made.load(Acquire));
+            let Some(reason) = due(from, current.then_some(key)) else {
+                continue;
+            };
+            if let Some(reason) = reason {
+                why[reason as usize] += 1;
+                #[cfg(feature = "diagnostics")]
+                self.note_due(i, reason, record, at(i), step);
+            }
+            made += 1;
+            match runs.last_mut() {
+                Some(run) if run.last().is_some_and(|&(last, _)| last / RUN == i / RUN) => run.push((i, record)),
+                _ => runs.push(vec![(i, record)]),
+            }
+        }
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
             drop(looking);
-            add(C::SyncMade, stale.len() as u64);
+            add(C::SyncMade, made);
             add(C::SyncFirst, why[Due::First as usize]);
             add(C::SyncRewrote, why[Due::Rewrote as usize]);
             add(C::SyncStale, why[Due::Stale as usize]);
         }
         #[cfg(not(feature = "diagnostics"))]
-        let _ = why;
+        let _ = (why, made);
+    }
+
+    /// Makes the slots of `runs` ([`HostHeap::due_runs`]): on this thread
+    /// and helper threads at once where there are enough of them
+    /// ([`sync_threads`]). A run is made by one thread, under its lock, as
+    /// a draw's thread or a title thread makes a slot beside others; when
+    /// this returns every run is made.
+    pub(crate) fn make_runs(&self, runs: &[Run], start: u64, step: u64) {
+        #[cfg(feature = "diagnostics")]
+        let _making = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncRunsUs);
+        let slots: usize = runs.iter().map(Vec::len).sum();
+        let threads = if slots >= SPREAD || cfg!(test) { sync_threads() } else { 1 };
+        crate::back::spread(runs.len(), threads, |k| {
+            // Counted as the submitting thread's work (diagnostics).
+            let _syncing = crate::contend::syncing();
+            self.make_run(&runs[k], start, step);
+        });
+    }
+
+    /// Makes the slots of `run`, slots of one run of [`RUN`] with the
+    /// records read of them.
+    fn make_run(&self, run: &Run, start: u64, step: u64) {
+        let at = |i: u32| start + u64::from(i) * step;
         let made = |_view: &Option<View>| {
             #[cfg(feature = "diagnostics")]
             {
@@ -940,50 +1002,44 @@ impl HostHeap {
                 }
             }
         };
+        let Some(&(head, _)) = run.first() else { return };
         if !self.by_run[1] {
-            for i in stale {
+            for &(i, _) in run {
                 made(&self.mirror(i, at(i), false));
             }
             return;
         }
-        let mut rest = &stale[..];
-        while let Some(&head) = rest.first() {
-            let n = rest.iter().take_while(|&&i| i / RUN == head / RUN).count();
-            let (run, after) = rest.split_at(n);
-            rest = after;
-            #[cfg(feature = "diagnostics")]
-            let preparing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncPrepareUs);
-            // What the views need, before the lock (`mirror` makes it
-            // without the lock too): for the records as read above.
-            for &i in run {
-                let [tag, view, generation] = record(i);
-                if let Some(view) = (tag == VIEW_TAG).then(|| view_at(view, generation)).flatten()
-                    && !is_placed_texture(&view)
-                {
-                    prepare(&view);
-                }
-            }
-            #[cfg(feature = "diagnostics")]
-            drop(preparing);
-            #[cfg(feature = "diagnostics")]
-            let _making = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncMakeUs);
-            // One by one where the title wrote another record meanwhile
-            // (what that one needs is not made), and past the host heap.
-            let mut again = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let preparing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncPrepareUs);
+        // What the views need, before the lock (`mirror` makes it
+        // without the lock too): for the records as read.
+        for &(_, [tag, view, generation]) in run {
+            if let Some(view) = (tag == VIEW_TAG).then(|| view_at(view, generation)).flatten()
+                && !is_placed_texture(&view)
             {
-                let _slots = self.lock_slot(head, false);
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::SyncRuns, 1);
-                for &i in run {
-                    match (i < self.count).then(|| self.make_locked(i, at(i), false, Some(record(i)))) {
-                        Some(Made::Is(view)) => made(&view),
-                        Some(Made::Needs(..)) | None => again.push(i),
-                    }
+                prepare(&view);
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        drop(preparing);
+        #[cfg(feature = "diagnostics")]
+        let _making = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncMakeUs);
+        // One by one where the title wrote another record meanwhile
+        // (what that one needs is not made), and past the host heap.
+        let mut again = Vec::new();
+        {
+            let _slots = self.lock_slot(head, false);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::SyncRuns, 1);
+            for &(i, record) in run {
+                match (i < self.count).then(|| self.make_locked(i, at(i), false, Some(record))) {
+                    Some(Made::Is(view)) => made(&view),
+                    Some(Made::Needs(..)) | None => again.push(i),
                 }
             }
-            for i in again {
-                made(&self.mirror(i, at(i), false));
-            }
+        }
+        for i in again {
+            made(&self.mirror(i, at(i), false));
         }
     }
 
@@ -2416,6 +2472,9 @@ pub(crate) mod tests {
         /// for every look and each slot a sync makes (as
         /// `VICTORY_SLOT_LOCKS=0` and `VICTORY_SYNC_RUNS=0`).
         pub(crate) static ONE_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// How many threads make the runs of a heap sync this thread runs
+        /// (as `VICTORY_SYNC_THREADS`).
+        pub(crate) static SYNC_THREADS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
         /// This thread leaves the null view of a slot that shows nothing (as
         /// `VICTORY_NULL_ONCE=1`).
         pub(crate) static NULL_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
