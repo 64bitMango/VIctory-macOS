@@ -21,6 +21,9 @@
 //!    point on a thread with the stack size the image asks for; from then
 //!    on, pass every thread start and end on to the attached images.
 
+// (Used on Windows; its tests of what it finds and builds run anywhere.)
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod amd_only;
 #[cfg(windows)]
 mod crash;
 pub mod masked;
@@ -38,6 +41,10 @@ mod tls;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use amd_only::log_emulated;
+#[cfg(windows)]
+pub use amd_only::{patch_clzero_loops, patches_waits};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use crash::save_on_crash;
 #[cfg(windows)]
