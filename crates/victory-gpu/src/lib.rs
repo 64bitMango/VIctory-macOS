@@ -16,6 +16,9 @@
 //! libraries recording into title lists. Planned:
 //! `present` (swap chain).
 
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod back;
 #[cfg(windows)]
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]

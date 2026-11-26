@@ -1279,6 +1279,24 @@ pub(crate) fn aliased(at: usize, len: usize) -> bool {
     guards().alias_of.range(first..last).next().is_some()
 }
 
+/// Whether a page of `runs` (page numbers `[first, last)`, in order and
+/// apart) is shown at another page of `runs` too, as the runtime told when
+/// it mapped it: a write at one changes the bytes at the other. Asked
+/// before a submission's copy-back is done as a batch, whose pieces must
+/// not share memory. One taking of the guard lock, and nothing allocated
+/// under it.
+pub(crate) fn aliased_among(runs: &[(usize, usize)]) -> bool {
+    let inside = |page: usize| {
+        let i = runs.partition_point(|&(_, last)| last <= page);
+        runs.get(i).is_some_and(|&(first, _)| first <= page)
+    };
+    let g = guards();
+    !g.alias_of.is_empty()
+        && runs
+            .iter()
+            .any(|&(first, last)| g.alias_of.range(first..last).any(|(_, others)| others.iter().any(|&o| inside(o))))
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {

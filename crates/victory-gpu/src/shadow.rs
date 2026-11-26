@@ -429,13 +429,14 @@ impl Shadow {
             && crate::segments::covered(segments, from, to)
         {
             let mut gathered = Vec::new();
-            #[cfg(feature = "diagnostics")]
-            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
+            let mut laps = Laps::new(false);
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
             let mut title = vec![0u8; PIECE];
             let mut synced = Vec::new();
+            // The pages the range holds whole.
+            let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
@@ -454,7 +455,15 @@ impl Shadow {
                 let old = crate::segments::held(segments, at, at + n, &mut gathered);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                laps.count(Stage::Pieces, 1);
+                laps.count(Stage::Bytes, n);
+                let differs = host != old;
+                if differs {
+                    // The comparing since the last changed piece.
+                    laps.lap(Stage::CompareUs);
+                }
+                if differs && crate::host::read_into((start + at) as *const u8, title) {
+                    laps.count(Stage::Changed, 1);
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     let mut changed = false;
@@ -465,10 +474,20 @@ impl Shadow {
                         }
                         *h = *t;
                     }
+                    laps.lap(Stage::ReadUs);
                     if changed {
-                        let _writing = crate::watch::writing(start + at, n);
+                        let writing = crate::watch::writing(start + at, n);
+                        laps.lap(Stage::OpenUs);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        laps.lap(Stage::WriteUs);
+                        drop(writing);
+                        laps.lap(Stage::CloseUs);
                         written += n;
+                        laps.count(Stage::Written, n);
+                        laps.count(Stage::Writes, 1);
+                        if self.tracked.is_some() && !(first..last).contains(&((start + at) / PAGE)) {
+                            laps.count(Stage::Left, 1);
+                        }
                     }
                     synced.push((start + at) / PAGE);
                 }
@@ -477,26 +496,35 @@ impl Shadow {
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
-            let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
+            laps.lap(Stage::CompareUs);
             if let Some(t) = &self.tracked {
                 let whole: Vec<usize> = synced.into_iter().filter(|p| (first..last).contains(p)).collect();
                 t.taken(&whole);
             }
+            laps.lap(Stage::CloseUs);
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
+        self.settled(&mut snapshot, &[(address, len)]);
+        written
+    }
+
+    /// The submission's copy-back is done with `ranges` (address, bytes) as
+    /// declared: every submitted step that declared them is done with them
+    /// (one submission runs at a time), and the snapshot with the last
+    /// range.
+    fn settled(&self, snapshot: &mut Snapshot, ranges: &[(usize, usize)]) {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.remove(&(address, address + len));
+        for &(address, len) in ranges {
+            pending.remove(&(address, address + len));
+        }
         if pending.is_empty() {
-            compared.clear();
-            for (_, bytes) in segments.drain(..) {
+            snapshot.1.clear();
+            for (_, bytes) in snapshot.0.drain(..) {
                 give_back(bytes);
             }
             if let Some(t) = &self.tracked {
                 t.disarm();
             }
         }
-        written
     }
 
     /// After a submission whose shaders marked the 64 KiB title page at
@@ -521,6 +549,7 @@ impl Shadow {
         // ~1,000 pages a frame in #50's world).
         let mut writes: Vec<(usize, Vec<u8>)> = Vec::new();
         let mut taken = Vec::new();
+        let mut laps = Laps::new(true);
         for &page in pages {
             let (from, to) = (page.max(start), (page + PAGE).min(end));
             if from >= to {
@@ -541,6 +570,8 @@ impl Shadow {
             if !crate::host::read_into(from as *const u8, &mut title) {
                 continue;
             }
+            laps.count(Stage::Pieces, 1);
+            laps.count(Stage::Bytes, n);
             let differs = match &saved {
                 // The title's bytes are the copy's from before: what differs
                 // is the shaders'.
@@ -566,12 +597,18 @@ impl Shadow {
             };
             if differs {
                 writes.push((from, title));
+                laps.count(Stage::Changed, 1);
+                laps.count(Stage::Writes, 1);
+                laps.count(Stage::Written, n);
             }
             // Equal to title memory now: taken, unless it holds the page in part.
             if from == page && to == page + PAGE {
                 taken.push(page / PAGE);
+            } else if differs {
+                laps.count(Stage::Left, 1);
             }
         }
+        laps.lap(Stage::CompareUs);
         let mut written = 0;
         {
             // Consecutive writes share one opening.
@@ -582,17 +619,22 @@ impl Shadow {
                     j += 1;
                 }
                 let (from, to) = (writes[i].0, writes[j - 1].0 + writes[j - 1].1.len());
-                let _writing = crate::watch::writing(from, to - from);
+                let writing = crate::watch::writing(from, to - from);
+                laps.lap(Stage::OpenUs);
                 for (at, bytes) in &writes[i..j] {
                     crate::host::write_mapped(*at as *mut u8, bytes.as_ptr(), bytes.len());
                     written += bytes.len();
                 }
+                laps.lap(Stage::WriteUs);
+                drop(writing);
+                laps.lap(Stage::CloseUs);
                 i = j;
             }
         }
         if !taken.is_empty() {
             t.taken(&taken);
         }
+        laps.lap(Stage::CloseUs);
         written
     }
 
@@ -1137,9 +1179,20 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             None => by_copy.push((copy, vec![page])),
         }
     }
-    for (copy, mut list) in by_copy {
+    for (_, list) in by_copy.iter_mut() {
         list.sort_unstable();
         list.dedup();
+    }
+    let at_once = if batched() { marked_at_once(&by_copy) } else { None };
+    #[cfg(feature = "diagnostics")]
+    if let Some(written) = at_once {
+        crate::copystat::add(crate::copystat::C::MarkedPages, by_copy.iter().map(|(_, list)| list.len() as u64).sum());
+        crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
+    }
+    if at_once.is_some() {
+        return;
+    }
+    for (copy, list) in by_copy {
         let written = copy.copy_back_marked(&list);
         #[cfg(feature = "diagnostics")]
         {
@@ -1149,6 +1202,436 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
     }
+}
+
+/// Whether a submission's copy-back is done as a batch of pieces on
+/// several threads ([`pieces_at_once`]): on unless
+/// `VICTORY_COPY_BACK_BATCH=0`, which does it range by range and page by
+/// page on the submitting thread, each changed piece written whole, as
+/// before.
+fn batched() -> bool {
+    #[cfg(test)]
+    if tests::ONE_BY_ONE.with(|one| one.get()) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_COPY_BACK_BATCH"))
+}
+
+/// Whether a batch reads the whole pages its copies took into the copies
+/// once more after they are guarded ([`pieces_at_once`]): on unless
+/// `VICTORY_COPY_BACK_AGAIN=0`.
+fn read_again() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_COPY_BACK_AGAIN"))
+}
+
+/// The threads for a pass over `items` pieces: the helpers too
+/// (`crate::back::threads`) from `least` pieces on. Waking them costs what
+/// a few pieces do.
+fn threads_for(items: usize, least: usize) -> usize {
+    #[cfg(test)]
+    if let threads @ 1.. = tests::THREADS.with(|t| t.get()) {
+        return threads;
+    }
+    if items >= least { crate::back::threads() } else { 1 }
+}
+
+/// Title memory, read and written through the kernel (a page that is not
+/// there fails the copy, or is left alone, instead of faulting).
+struct TitleMemory;
+
+impl crate::back::Title for TitleMemory {
+    fn read(&self, at: usize, to: *mut u8, n: usize) -> bool {
+        // SAFETY: `n` bytes the caller may write (its working memory, or a
+        // piece's bytes of a copy's mapping).
+        crate::host::read_into(at as *const u8, unsafe { std::slice::from_raw_parts_mut(to, n) })
+    }
+
+    fn write(&self, at: usize, from: *const u8, n: usize) {
+        crate::host::write_mapped(at as *mut u8, from, n);
+    }
+}
+
+/// What copy-back counts and times (diagnostics), for the pieces of
+/// declared ranges and of marked pages apart, in the order of
+/// `crate::copystat::C::BackPieces` and what follows it: pieces compared
+/// and their bytes; pieces the shaders changed; time comparing, opening
+/// title memory for our writes (`crate::watch::writing`), on changed pieces
+/// in all (title memory read, merged and written), reading and merging,
+/// writing, giving the pages back to the trackers (and taking those made
+/// equal to title memory), reading taken pages again; bytes and writes put
+/// into title memory; pages written that their copy could not take (it
+/// holds them in part), so that its next refresh copies them again; pieces
+/// opened that needed no write.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+enum Stage {
+    Pieces,
+    Bytes,
+    Changed,
+    CompareUs,
+    OpenUs,
+    PutUs,
+    ReadUs,
+    WriteUs,
+    CloseUs,
+    AgainUs,
+    Written,
+    Writes,
+    Left,
+    Idle,
+}
+
+/// Diagnostics: counts, and time from one [`Laps::lap`] to the next, added
+/// to the frame statistics when dropped (nothing without diagnostics).
+struct Laps {
+    #[cfg(feature = "diagnostics")]
+    last: std::time::Instant,
+    /// Counts, and nanoseconds for the timed stages.
+    #[cfg(feature = "diagnostics")]
+    sums: [u64; Stage::Idle as usize + 1],
+    #[cfg(feature = "diagnostics")]
+    marked: bool,
+}
+
+impl Laps {
+    /// For pieces of marked pages (`marked`) or of declared ranges.
+    fn new(marked: bool) -> Laps {
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = marked;
+        Laps {
+            #[cfg(feature = "diagnostics")]
+            last: std::time::Instant::now(),
+            #[cfg(feature = "diagnostics")]
+            sums: Default::default(),
+            #[cfg(feature = "diagnostics")]
+            marked,
+        }
+    }
+
+    /// The time since the last lap (or since it was made) was spent on
+    /// `stage`.
+    #[inline]
+    fn lap(&mut self, stage: Stage) {
+        #[cfg(feature = "diagnostics")]
+        {
+            let now = std::time::Instant::now();
+            self.sums[stage as usize] += (now - self.last).as_nanos() as u64;
+            self.last = now;
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = stage;
+    }
+
+    #[inline]
+    fn count(&mut self, stage: Stage, n: usize) {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.sums[stage as usize] += n as u64;
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = (stage, n);
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Laps {
+    fn drop(&mut self) {
+        use Stage::*;
+        // One by one, the changed pieces' time is their reading and writing.
+        if self.sums[PutUs as usize] == 0 {
+            self.sums[PutUs as usize] = self.sums[ReadUs as usize] + self.sums[WriteUs as usize];
+        }
+        for stage in [Pieces, Bytes, Changed, CompareUs, OpenUs, PutUs, ReadUs, WriteUs, CloseUs, AgainUs, Written, Writes, Left, Idle] {
+            let timed = matches!(stage, CompareUs | OpenUs | PutUs | ReadUs | WriteUs | CloseUs | AgainUs);
+            let n = self.sums[stage as usize] / if timed { 1000 } else { 1 };
+            crate::copystat::back(self.marked, stage as usize, n);
+        }
+    }
+}
+
+/// After a submission ran: what its shaders wrote in the ranges its lists
+/// declared goes back into title memory (`back`: copy, address, bytes,
+/// whether it goes back; each range once), and what is withheld leaves the
+/// copies (`crate::memory::drop_withheld`). Returns the bytes of the pieces
+/// written.
+///
+/// The ranges that go back are done as one batch ([`declared_at_once`])
+/// and the withheld ones after them, or (`VICTORY_COPY_BACK_BATCH=0`, and
+/// where copies overlap) all in the order declared, as before. Withheld
+/// ranges write neither title memory nor a copy, and they overlap no range
+/// of their copy that goes back, so doing them after changes no byte: at
+/// most a page counts as changed in a copy that would have taken it.
+pub(crate) fn copy_back_declared(back: &[(Arc<Shadow>, usize, usize, bool)]) -> usize {
+    let at_once = if batched() { declared_at_once(back) } else { None };
+    let mut written = at_once.unwrap_or(0);
+    for (shadow, address, len, goes_back) in back {
+        let (address, len) = (*address, *len);
+        if *goes_back {
+            if at_once.is_none() {
+                written += shadow.copy_back(address, len);
+            }
+        } else {
+            shadow.keep_writes(address, len);
+            crate::memory::note_withheld(len as u64);
+            crate::memory::drop_withheld(address, len);
+        }
+    }
+    written
+}
+
+/// Whether pieces of different copies could share memory: `runs` (title
+/// memory from, to, copy; each copy's own apart) overlap, or show the same
+/// memory at two addresses. Such pieces are done one after the other, in
+/// the order declared, as before: the second reads what the first wrote.
+fn sharing(runs: &mut [(usize, usize, usize)]) -> bool {
+    runs.sort_unstable();
+    let mut end = 0;
+    for &(from, to, _) in runs.iter() {
+        if from < end {
+            return true;
+        }
+        end = to;
+    }
+    let mut pages: Vec<(usize, usize)> = runs.iter().map(|&(from, to, _)| (from / PAGE, to.div_ceil(PAGE))).collect();
+    crate::back::union(&mut pages);
+    crate::watch::aliased_among(&pages)
+}
+
+/// [`Shadow::copy_back`] of every range of `back` that goes back, as one
+/// batch of pieces ([`pieces_at_once`]); the ranges leave their copies'
+/// pending sets as there. Returns the bytes of the pieces written; none,
+/// with nothing done, if there is nothing to go back or copies share
+/// memory ([`sharing`]).
+///
+/// The pieces are those of the union of each copy's ranges whose bytes its
+/// snapshot holds, a whole piece compared once per submission. Range by
+/// range, a byte two ranges held was compared again with title memory and
+/// found equal, the first having put it there: the union leaves the same
+/// bytes. (A page two ranges hold only between them is whole here, and
+/// taken by its copy's tracker once all of it is title memory's.)
+fn declared_at_once(back: &[(Arc<Shadow>, usize, usize, bool)]) -> Option<usize> {
+    use crate::back::{Before, PIECE, Piece};
+    // Per copy, in the order first declared: its ranges that go back.
+    let mut copies: Vec<(&Shadow, Vec<(usize, usize)>)> = Vec::new();
+    let mut index: crate::quick::Map<usize, usize> = Default::default();
+    for (shadow, address, len, _) in back.iter().filter(|b| b.3) {
+        let i = *index.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
+            copies.push((shadow, Vec::new()));
+            copies.len() - 1
+        });
+        copies[i].1.push((*address, *len));
+    }
+    if copies.is_empty() {
+        return None;
+    }
+    // The submitting thread alone takes these locks (one submission at a
+    // time), so several at once cannot wait for each other.
+    let mut snapshots: Vec<_> = copies.iter().map(|(copy, _)| copy.before.lock().unwrap_or_else(|e| e.into_inner())).collect();
+    // What each copy's snapshot holds of its ranges, joined (offsets in the
+    // copy), and the same as title memory.
+    let mut kept: Vec<Vec<(usize, usize)>> = Vec::with_capacity(copies.len());
+    let mut runs = Vec::new();
+    for (k, ((copy, ranges), snapshot)) in copies.iter().zip(&snapshots).enumerate() {
+        let mut held: Vec<(usize, usize)> = ranges
+            .iter()
+            .map(|&(address, len)| copy.inside(address, len))
+            .filter(|&(from, to)| from < to && crate::segments::covered(&snapshot.0, from, to))
+            .collect();
+        crate::back::union(&mut held);
+        let start = copy.start as usize;
+        runs.extend(held.iter().map(|&(from, to)| (start + from, start + to, k)));
+        kept.push(held);
+    }
+    if sharing(&mut runs) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BackOneByOne, 1);
+        return None;
+    }
+    let mut written = 0;
+    {
+        let mut pieces: Vec<Piece> = Vec::new();
+        for (k, ((copy, _), snapshot)) in copies.iter().zip(snapshots.iter_mut()).enumerate() {
+            let (segments, compared) = &mut **snapshot;
+            let segments: &[crate::segments::Segment] = segments;
+            let start = copy.start as usize;
+            for &(from, to) in &kept[k] {
+                crate::back::pieces(start, from, to, |at, end| {
+                    let whole = end - at == PIECE;
+                    if whole && !compared.insert(start + at) {
+                        return;
+                    }
+                    // SAFETY: inside the mapping.
+                    let host = unsafe { copy.data.add(at) };
+                    // Only a tracked copy takes pages.
+                    let takes = whole && copy.tracked.is_some();
+                    pieces.push(Piece::new(start + at, host, end - at, Before::Kept(segments, at), takes, k as u32));
+                });
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::CompareBytes, pieces.iter().map(|p| p.n as u64).sum());
+        let copies: Vec<&Shadow> = copies.iter().map(|(copy, _)| *copy).collect();
+        written += pieces_at_once(&pieces, &copies, false);
+    }
+    for ((copy, ranges), mut snapshot) in copies.iter().zip(snapshots) {
+        copy.settled(&mut snapshot, ranges);
+    }
+    Some(written)
+}
+
+/// [`Shadow::copy_back_marked`] of the marked pages of every copy (`marked`:
+/// each copy once, its pages in order), as one batch of pieces
+/// ([`pieces_at_once`]). Returns the bytes of the pieces written; none,
+/// with nothing done, if copies share memory ([`sharing`]).
+fn marked_at_once(marked: &[(Arc<Shadow>, Vec<usize>)]) -> Option<usize> {
+    use crate::back::{Before, Piece};
+    let mut runs = Vec::new();
+    for (k, (copy, pages)) in marked.iter().enumerate() {
+        let (start, end) = (copy.start as usize, (copy.start + copy.len) as usize);
+        runs.extend(pages.iter().map(|&page| (page.max(start), (page + PAGE).min(end), k)).filter(|r| r.0 < r.1));
+    }
+    if sharing(&mut runs) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BackOneByOne, 1);
+        return None;
+    }
+    let mut pieces: Vec<Piece> = Vec::new();
+    for (k, (copy, pages)) in marked.iter().enumerate() {
+        let Some(t) = &copy.tracked else {
+            continue;
+        };
+        let (start, end) = (copy.start as usize, (copy.start + copy.len) as usize);
+        for &page in pages {
+            let (from, to) = (page.max(start), (page + PAGE).min(end));
+            if from >= to {
+                continue;
+            }
+            // Our own write below must not save the page for this copy again.
+            t.unarm(page / PAGE);
+            let before = match t.saved(page / PAGE) {
+                Some(saved) => Before::Saved(saved, from - page),
+                None if t.changed(page / PAGE) => {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::MarkedKept, 1);
+                    continue;
+                }
+                None => Before::Title,
+            };
+            // SAFETY: inside the mapping.
+            let host = unsafe { copy.data.add(from - start) };
+            pieces.push(Piece::new(from, host, to - from, before, to - from == PAGE, k as u32));
+        }
+    }
+    let copies: Vec<&Shadow> = marked.iter().map(|(copy, _)| &**copy).collect();
+    Some(pieces_at_once(&pieces, &copies, true))
+}
+
+/// What shaders wrote in `pieces` goes back into title memory, all pieces
+/// at once and on several threads (`crate::back`); `copies` are the copies
+/// the pieces name. Returns the bytes of the pieces written into.
+///
+/// What it relies on, and what stays as it was done piece by piece:
+/// - The pieces share no byte of a copy or of title memory, and no memory
+///   shown twice (the callers: [`sharing`], and a copy's own pieces apart),
+///   so their order does not matter and one thread does each.
+/// - One submission runs at a time, and this is its copy-back: no shader
+///   writes the copies, nothing refreshes them, and the bytes kept from
+///   before stay as they are (the callers hold the snapshots).
+/// - Title memory is opened for our writes once for all pieces
+///   (`crate::watch::writing`, by runs of pages) before any is written, and
+///   only where the shaders changed a piece: the kernel's write would fail
+///   on a guarded page, and a tracker taking a page meanwhile leaves it
+///   open. Opening marks the pages changed in every tracker holding them,
+///   as before; a page whose piece turns out to hold title memory's bytes
+///   already is marked without need (counted).
+/// - A changed piece is read from title memory, merged and written by one
+///   thread without a pause, as before, so a title write is lost only
+///   where it lands between that read and that write in bytes we write:
+///   runs of bytes the shaders changed (and short gaps between them), not
+///   the whole piece any more.
+/// - Then the pages are given back to the trackers, and each copy takes
+///   the whole pages now equal to title memory, as before (our own write
+///   is not taken for the title's at its next refresh). Those are read
+///   into the copy once more after they are guarded, which the piece by
+///   piece way does not do: there a title write between a piece's read
+///   and its page's guard stays out of the copy until the page is next
+///   written, and with the batch that time would be longer for small
+///   ranges (`VICTORY_COPY_BACK_AGAIN=0` leaves it out).
+fn pieces_at_once(pieces: &[crate::back::Piece], copies: &[&Shadow], marked: bool) -> usize {
+    let mut laps = Laps::new(marked);
+    let title = TitleMemory;
+    let mut spread = 0;
+    let mut threads = |items: usize, least: usize| {
+        let threads = threads_for(items, least);
+        spread += usize::from(threads > 1);
+        threads
+    };
+    // Marked pieces whose title wrote nothing are compared with title
+    // memory itself, read for it: fewer make a pass worth the helpers.
+    crate::back::compare(pieces, &title, threads(pieces.len(), if marked { 8 } else { 32 }));
+    laps.count(Stage::Pieces, pieces.len());
+    laps.count(Stage::Bytes, pieces.iter().map(|p| p.n).sum());
+    laps.lap(Stage::CompareUs);
+    // Title memory opened for the changed pieces, by runs of pages.
+    let mut pages: Vec<(usize, usize)> = pieces.iter().filter(|p| p.opens()).map(|p| (p.at / PAGE, p.at / PAGE + 1)).collect();
+    laps.count(Stage::Changed, pages.len());
+    crate::back::union(&mut pages);
+    let open: Vec<crate::watch::Writing> =
+        pages.iter().map(|&(first, last)| crate::watch::writing(first * PAGE, (last - first) * PAGE)).collect();
+    laps.lap(Stage::OpenUs);
+    #[cfg(feature = "diagnostics")]
+    let spent = crate::back::Spent::default();
+    #[cfg(feature = "diagnostics")]
+    let timed = Some(&spent);
+    #[cfg(not(feature = "diagnostics"))]
+    let timed = None;
+    crate::back::put(pieces, &title, threads(pages.iter().map(|&(first, last)| last - first).sum(), 8), timed);
+    laps.lap(Stage::PutUs);
+    drop(open);
+    // Whole pages made equal to title memory are current in their copies.
+    let mut taken: Vec<Vec<usize>> = vec![Vec::new(); copies.len()];
+    let mut written = 0;
+    for piece in pieces {
+        if piece.whole && piece.synced() {
+            taken[piece.copy as usize].push(piece.at / PAGE);
+        }
+        if piece.wrote() {
+            written += piece.n;
+            let (bytes, writes) = piece.written();
+            laps.count(Stage::Written, bytes as usize);
+            laps.count(Stage::Writes, writes as usize);
+            laps.count(Stage::Left, usize::from(!piece.whole && copies[piece.copy as usize].tracked.is_some()));
+        } else if piece.opens() && piece.synced() {
+            laps.count(Stage::Idle, 1);
+        }
+    }
+    let mut again = 0;
+    for (copy, pages) in copies.iter().zip(&taken) {
+        if let Some(t) = &copy.tracked
+            && !pages.is_empty()
+        {
+            t.taken(pages);
+            again += pages.len();
+        }
+    }
+    laps.lap(Stage::CloseUs);
+    if read_again() {
+        crate::back::again(pieces, &title, threads(again, 16));
+    }
+    laps.lap(Stage::AgainUs);
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        laps.count(Stage::ReadUs, spent.reading_ns.load(Relaxed) as usize);
+        laps.count(Stage::WriteUs, spent.writing_ns.load(Relaxed) as usize);
+        crate::copystat::add(crate::copystat::C::BackBatches, 1);
+        crate::copystat::add(crate::copystat::C::BackSpread, spread as u64);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = spread;
+    written
 }
 
 struct Entry {
@@ -1784,6 +2267,12 @@ pub(crate) mod tests {
         /// This thread takes the copies' registries alone for every lookup
         /// (as `VICTORY_COPIES_SHARED=0`).
         pub(super) static LOOKUPS_ALONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// This thread's submissions copy back range by range (as
+        /// `VICTORY_COPY_BACK_BATCH=0`).
+        pub(crate) static ONE_BY_ONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// The threads this thread's batches use for every pass, however
+        /// few the pieces (0: as outside tests).
+        pub(crate) static THREADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// Threads look up copies of the same buffers and windows at once, none
@@ -2279,6 +2768,406 @@ pub(crate) mod tests {
         assert!(m[20_990..21_010].iter().all(|&b| b == 0xa1) && m[25_996..26_004].iter().all(|&b| b == 0xa2));
         assert_eq!([m[12_000], m[12_001], m[30_000]], [0x77, 0xa3, 0x78]);
         assert_eq!(m[3 * PAGE - 2..3 * PAGE + 2], [0xa4; 4]);
+    }
+
+    fn random(seed: &mut u64, n: usize) -> usize {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        (*seed % n.max(1) as u64) as usize
+    }
+
+    /// Runs `f` with this thread's copy-backs done range by range
+    /// (`one_by_one`) or as batches on `threads` threads.
+    fn copying_back<R>(one_by_one: bool, threads: usize, f: impl FnOnce() -> R) -> R {
+        ONE_BY_ONE.with(|o| o.set(one_by_one));
+        THREADS.with(|t| t.set(threads));
+        let out = f();
+        ONE_BY_ONE.with(|o| o.set(false));
+        THREADS.with(|t| t.set(0));
+        out
+    }
+
+    /// A pool of `pages` pages filled with bytes below 0x80 (what the tests'
+    /// shaders write is 0x80 and above, so never the byte the title holds).
+    fn patterned(pages: usize) -> usize {
+        let p = crate::watch::tests::pool(pages);
+        // SAFETY: our pool, which nothing else knows of yet.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, pages * PAGE) };
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i * 7 + i / PAGE) as u8 & 0x7f;
+        }
+        p
+    }
+
+    fn bytes_at(p: usize, n: usize) -> Vec<u8> {
+        // SAFETY: bytes of the caller's pool.
+        (0..n).map(|i| unsafe { ((p + i) as *const u8).read_volatile() }).collect()
+    }
+
+    /// Three buffers of a pool, the title and its shaders at work in them,
+    /// and the copy-back of the ranges declared: title memory after it,
+    /// each copy after its next refresh, the ranges whose writes stayed out
+    /// of title memory (offsets in the pool), and where the buffers are.
+    /// None without a host GPU.
+    #[allow(clippy::type_complexity)]
+    fn declared_copy_back(seed: u64) -> Option<(Vec<u8>, Vec<Vec<u8>>, Vec<(usize, usize)>, [(usize, usize); 3])> {
+        const PAGES: usize = 14;
+        let mut seed = seed;
+        let p = patterned(PAGES);
+        // Beside a page's start, on one, and ending inside one.
+        let buffers = [(0x30, 3 * PAGE + 0x1234), (4 * PAGE, 4 * PAGE), (8 * PAGE + 100, 5 * PAGE)];
+        for (k, &(at, len)) in buffers.iter().enumerate() {
+            register(p + k, (p + at) as u64, len as u64);
+        }
+        let copies: Vec<Arc<Shadow>> = buffers.iter().filter_map(|&(at, len)| find((p + at) as u64, len as u64)).collect();
+        let finish = |copies: Vec<Arc<Shadow>>| {
+            for (k, &(at, _)) in buffers.iter().enumerate() {
+                unregister(p + k, (p + at) as u64);
+            }
+            drop(copies);
+            crate::watch::tests::free(p);
+        };
+        if copies.len() < buffers.len() {
+            finish(copies);
+            return None; // no host GPU here
+        }
+        for (copy, &(at, len)) in copies.iter().zip(&buffers) {
+            copy.update(p + at, len);
+        }
+        // The ranges declared: empty, short, a page, several; on a page of
+        // title memory or anywhere; overlapping; one in eight marked (no
+        // bytes kept), one in seven withheld.
+        let mut back: Vec<(Arc<Shadow>, usize, usize, bool)> = Vec::new();
+        let mut kept = Vec::new();
+        for (copy, &(at, len)) in copies.iter().zip(&buffers) {
+            for _ in 0..random(&mut seed, 12) {
+                let n = match random(&mut seed, 6) {
+                    0 => 0,
+                    1 => random(&mut seed, 64),
+                    2 => PAGE,
+                    _ => random(&mut seed, 2 * PAGE + PAGE / 2),
+                }
+                .min(len);
+                let mut from = random(&mut seed, len - n + 1);
+                if random(&mut seed, 2) == 0 {
+                    from = ((at + from).next_multiple_of(PAGE) - at).min(len - n);
+                }
+                let address = p + at + from;
+                if back.iter().any(|b| Arc::ptr_eq(&b.0, copy) && (b.1, b.2) == (address, n)) {
+                    continue;
+                }
+                let marked = random(&mut seed, 8) == 0 && copy.marked();
+                copy.writing(address, n, marked);
+                kept.push(!marked);
+                back.push((copy.clone(), address, n, random(&mut seed, 7) != 0));
+            }
+        }
+        // A range overlapping a withheld one of its copy is withheld too
+        // (`crate::host::Host::execute`).
+        let held_back: Vec<(usize, usize, usize)> =
+            back.iter().filter(|b| !b.3).map(|(s, a, n, _)| (Arc::as_ptr(s) as usize, *a, *n)).collect();
+        for b in back.iter_mut().filter(|b| b.3) {
+            let copy = Arc::as_ptr(&b.0) as usize;
+            b.3 = !held_back.iter().any(|&(c, a, n)| c == copy && a < b.1 + b.2 && b.1 < a + n);
+        }
+        // The shaders write inside the ranges whose bytes are kept, at
+        // their ends among others.
+        for ((copy, address, n, _), _) in back.iter().zip(&kept).filter(|(b, kept)| **kept && b.2 > 0) {
+            for _ in 0..random(&mut seed, 5) {
+                let len = [1, 4, 64, 3000, PAGE + 5][random(&mut seed, 5)].min(*n);
+                let at = match random(&mut seed, 4) {
+                    0 => 0,
+                    1 => n - len,
+                    _ => random(&mut seed, n - len + 1),
+                };
+                let bytes: Vec<u8> = (0..len).map(|_| 0x80 | random(&mut seed, 128) as u8).collect();
+                copy.write_host((address + at) as u64, &bytes);
+            }
+        }
+        // The title writes meanwhile, anywhere (guarded pages among them).
+        for _ in 0..random(&mut seed, 12) {
+            let n = [1, 2, 100][random(&mut seed, 3)];
+            let at = random(&mut seed, PAGES * PAGE - n);
+            for i in 0..n {
+                // SAFETY: a byte of our pool.
+                unsafe { ((p + at + i) as *mut u8).write_volatile(random(&mut seed, 128) as u8) };
+            }
+        }
+        copy_back_declared(&back);
+        for copy in &copies {
+            assert!(copy.pending.lock().unwrap().is_empty() && copy.before.lock().unwrap().0.is_empty(), "nothing left kept");
+        }
+        let title = bytes_at(p, PAGES * PAGE);
+        let after: Vec<Vec<u8>> = copies
+            .iter()
+            .zip(&buffers)
+            .map(|(copy, &(at, len))| {
+                copy.update(p + at, len);
+                held(copy)
+            })
+            .collect();
+        // Where shaders' bytes may have stayed in the copies alone.
+        let apart: Vec<(usize, usize)> =
+            back.iter().zip(&kept).filter(|(b, kept)| !b.3 || !**kept).map(|(b, _)| (b.1 - p, b.1 - p + b.2)).collect();
+        drop(back);
+        finish(copies);
+        Some((title, after, apart, buffers))
+    }
+
+    /// Whatever ranges a submission's lists declared (overlapping, empty,
+    /// marked, withheld, their ends on and beside pages) and whatever the
+    /// shaders and the title wrote: copied back as a batch on one thread or
+    /// several, title memory ends byte for byte as copied back range by
+    /// range (`VICTORY_COPY_BACK_BATCH=0`), and so does every copy after
+    /// its next refresh, which holds title memory's bytes wherever the
+    /// shaders' went back: no page counts as current that is not.
+    #[test]
+    fn declared_ranges_at_once_leave_what_one_by_one_leaves() {
+        let mut changed = 0;
+        for round in 0..12u64 {
+            let seed = 0x9e37_79b9_7f4a_7c15 ^ (round + 1).wrapping_mul(0x2545_f491_4f6c_dd1d);
+            let Some(wanted) = copying_back(true, 0, || declared_copy_back(seed)) else {
+                return; // no host GPU here
+            };
+            for threads in [1, 4] {
+                let done = copying_back(false, threads, || declared_copy_back(seed)).expect("a host GPU");
+                assert!(done.0 == wanted.0, "round {round}, {threads} threads: title memory");
+                // But where the shaders' bytes stay in the copies alone:
+                // how long they stay is `crate::memory`'s to say, by state
+                // other tests' submissions share (a submission that missed
+                // memory makes the copies take title memory at once).
+                let apart = |here: usize| wanted.2.iter().chain(&done.2).any(|&(from, to)| (from..to).contains(&here));
+                for (k, (d, w)) in done.1.iter().zip(&wanted.1).enumerate() {
+                    let at = wanted.3[k].0;
+                    if let Some(i) = (0..d.len()).find(|&i| d[i] != w[i] && !apart(at + i)) {
+                        panic!("round {round}, {threads} threads: copy {k} at {:#x}: {:#x} for {:#x}", at + i, d[i], w[i]);
+                    }
+                }
+            }
+            for (copy, &(at, _)) in wanted.1.iter().zip(&wanted.3) {
+                for (i, &b) in copy.iter().enumerate() {
+                    let here = at + i;
+                    if !wanted.2.iter().any(|&(from, to)| (from..to).contains(&here)) {
+                        assert_eq!(b, wanted.0[here], "round {round}: a copy's byte at {here:#x} is title memory's");
+                    }
+                }
+            }
+            changed += usize::from(wanted.0.iter().any(|&b| b >= 0x80));
+        }
+        assert!(changed > 6, "the shaders' bytes went back in most rounds ({changed})");
+    }
+
+    /// Times the copy-back of a 48 MiB buffer's declared ranges (megabyte
+    /// ranges at rising addresses, each half over the last, a third of the
+    /// pages written by shaders: a long run in one, scattered dwords in the
+    /// next) range by range and as a batch on one thread and several.
+    #[test]
+    #[ignore = "synthetic release benchmark; run with --release --ignored --nocapture"]
+    fn benchmark_copy_back_release() {
+        const PAGES: usize = 768;
+        let p = patterned(PAGES);
+        let len = PAGES * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, len);
+        let mut round = 0u8;
+        let mut time = |one_by_one: bool, threads: usize| {
+            let mut best = (f64::MAX, 0);
+            for _ in 0..6 {
+                round = round.wrapping_add(1);
+                copy.update(p, len);
+                let mut back = Vec::new();
+                let mut at = 0x1230;
+                while at + (1 << 20) <= len {
+                    copy.writing(p + at, 1 << 20, false);
+                    back.push((copy.clone(), p + at, 1 << 20, true));
+                    at += 1 << 19;
+                }
+                for page in (1..PAGES - 1).step_by(3) {
+                    copy.write_host((p + page * PAGE + 0x400) as u64, &vec![0x80 | round; 20 << 10]);
+                    for k in 0..30 {
+                        copy.write_host((p + (page + 1) * PAGE + k * 2000 + 16) as u64, &[0x80 | round; 4]);
+                    }
+                }
+                let started = std::time::Instant::now();
+                let written = copying_back(one_by_one, threads, || copy_back_declared(&back));
+                let ms = started.elapsed().as_secs_f64() * 1e3;
+                if ms < best.0 {
+                    best = (ms, written);
+                }
+            }
+            best
+        };
+        let one = time(true, 0);
+        println!("range by range: {:.2} ms ({} KiB of pieces written)", one.0, one.1 >> 10);
+        for threads in [1, 2, 4, 6] {
+            let batch = time(false, threads);
+            println!("as a batch on {threads} threads: {:.2} ms ({} KiB of pieces written)", batch.0, batch.1 >> 10);
+        }
+        // SAFETY: bytes of our pool.
+        assert!(unsafe { ((p + PAGE + 0x400) as *const u8).read_volatile() } >= 0x80, "the shaders' bytes went back");
+        unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// Copies whose ranges overlap in title memory (a buffer inside
+    /// another) are not done as a batch: the second reads what the first
+    /// wrote, in the order declared, as before.
+    #[test]
+    fn copies_sharing_memory_go_back_one_by_one() {
+        let run = |one_by_one: bool| {
+            copying_back(one_by_one, 4, || {
+                let p = patterned(2);
+                register(p, p as u64, 2 * PAGE as u64);
+                register(p + 1, (p + 256) as u64, 4096);
+                let (Some(outer), Some(inner)) = (find(p as u64, 2 * PAGE as u64), find((p + 256) as u64, 4096)) else {
+                    unregister(p, p as u64);
+                    unregister(p + 1, (p + 256) as u64);
+                    return None; // no host GPU here
+                };
+                assert!(!Arc::ptr_eq(&outer, &inner));
+                outer.update(p, 2 * PAGE);
+                inner.update(p + 256, 4096);
+                let back =
+                    vec![(inner.clone(), p + 256, 4096, true), (outer.clone(), p, 2 * PAGE, true), (inner.clone(), p + 300, 8, true)];
+                for (copy, address, len, _) in &back {
+                    copy.writing(*address, *len, false);
+                }
+                // Both write the byte at 300; each one of its own.
+                inner.write_host((p + 300) as u64, &[0x91, 0x92]);
+                outer.write_host((p + 300) as u64, &[0xa1]);
+                outer.write_host((p + PAGE + 5) as u64, &[0xa3]);
+                if !one_by_one {
+                    assert!(declared_at_once(&back).is_none(), "no batch of pieces sharing memory");
+                }
+                copy_back_declared(&back);
+                let title = bytes_at(p, 2 * PAGE);
+                outer.update(p, 2 * PAGE);
+                inner.update(p + 256, 4096);
+                let copies = (held(&outer), held(&inner));
+                unregister(p, p as u64);
+                unregister(p + 1, (p + 256) as u64);
+                drop((outer, inner, back));
+                crate::watch::tests::free(p);
+                Some((title, copies))
+            })
+        };
+        let (Some(wanted), Some(done)) = (run(true), run(false)) else {
+            return; // no host GPU here
+        };
+        // The outer copy's byte went over the inner's, and the inner copy's
+        // second range, declared last, put its own there again.
+        assert_eq!(wanted.0[300..302], [0x91, 0x92], "in the order declared");
+        assert_eq!(wanted.0[PAGE + 5], 0xa3);
+        assert!(done == wanted);
+    }
+
+    /// Marked pages of two copies (whole pages and the parts at a copy's
+    /// ends), some written by the title after the copy took them: copied
+    /// back as a batch, title memory and the copies end as page by page.
+    #[allow(clippy::type_complexity)]
+    fn marked_copy_back(seed: u64) -> Option<(Vec<u8>, Vec<Vec<u8>>, Vec<(usize, usize)>, [(usize, usize); 2])> {
+        const PAGES: usize = 12;
+        let host = crate::host::host()?;
+        let b = bitmap(false)?;
+        let mut seed = seed;
+        let p = patterned(PAGES);
+        let buffers = [(0x500, 5 * PAGE), (6 * PAGE, 5 * PAGE + 0x800)];
+        for (k, &(at, len)) in buffers.iter().enumerate() {
+            register(p + k, (p + at) as u64, len as u64);
+        }
+        let copies: Vec<Arc<Shadow>> = buffers.iter().filter_map(|&(at, len)| find((p + at) as u64, len as u64)).collect();
+        let out = (copies.len() == buffers.len() && copies.iter().all(|c| c.marks.is_some())).then(|| {
+            for (copy, &(at, len)) in copies.iter().zip(&buffers) {
+                copy.update(p + at, len);
+                copy.writing(p + at, len, true);
+            }
+            // The shaders write through views of both copies; the title
+            // writes some pages meanwhile (their bytes from before saved).
+            let mut marks = Vec::new();
+            let mut unmarked = Vec::new();
+            for (copy, &(at, len)) in copies.iter().zip(&buffers) {
+                for _ in 0..2 + random(&mut seed, 10) {
+                    let n = [1, 4, 700, PAGE][random(&mut seed, 4)];
+                    let from = random(&mut seed, len - n + 1);
+                    let bytes: Vec<u8> = (0..n).map(|_| 0x80 | random(&mut seed, 128) as u8).collect();
+                    copy.write_host((p + at + from) as u64, &bytes);
+                    // Marked, but for one write in six (a write no view
+                    // marked stays in the copy).
+                    if random(&mut seed, 6) != 0 {
+                        let (first, last) = ((p + at + from) / PAGE, (p + at + from + n - 1) / PAGE);
+                        marks.extend((first..=last).map(|page| copy.mark_entry((page * PAGE).max(p + at) as u64).expect("a bit").0));
+                    } else {
+                        unmarked.push((at + from, at + from + n));
+                    }
+                }
+            }
+            for _ in 0..random(&mut seed, 8) {
+                let n = [1, 3, 200][random(&mut seed, 3)];
+                let at = random(&mut seed, PAGES * PAGE - n);
+                for i in 0..n {
+                    // SAFETY: a byte of our pool.
+                    unsafe { ((p + at + i) as *mut u8).write_volatile(random(&mut seed, 128) as u8) };
+                }
+            }
+            host.between_submissions(|| {
+                for &n in &marks {
+                    // SAFETY: a dword of the mapped bitmap; no submission runs.
+                    unsafe { *(b.data as *mut u32).add(n as usize / 32) |= 1 << (n % 32) };
+                }
+                copy_back_marks(&[], false);
+            });
+            let title = bytes_at(p, PAGES * PAGE);
+            let after: Vec<Vec<u8>> = copies
+                .iter()
+                .zip(&buffers)
+                .map(|(copy, &(at, len))| {
+                    // Ends what the copies keep for marked pages.
+                    copy.copy_back(p + at, len);
+                    copy.update(p + at, len);
+                    held(copy)
+                })
+                .collect();
+            (title, after, unmarked, buffers)
+        });
+        for (k, &(at, _)) in buffers.iter().enumerate() {
+            unregister(p + k, (p + at) as u64);
+        }
+        drop(copies);
+        crate::watch::tests::free(p);
+        out
+    }
+
+    #[test]
+    fn marked_pages_at_once_leave_what_one_by_one_leaves() {
+        let mut changed = 0;
+        for round in 0..12u64 {
+            let seed = 0x1234_5678_9abc_def1 ^ (round + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let Some(wanted) = copying_back(true, 0, || marked_copy_back(seed)) else {
+                return; // no host GPU here, or no mark bits left
+            };
+            for threads in [1, 4] {
+                let done = copying_back(false, threads, || marked_copy_back(seed)).expect("a host GPU");
+                assert!(done.0 == wanted.0, "round {round}, {threads} threads: title memory");
+                // But where a write no view marked stays in its copy alone,
+                // until something makes the copy take the page again
+                // (`crate::memory`, by state other tests share).
+                let apart = |here: usize| wanted.2.iter().any(|&(from, to)| (from..to).contains(&here));
+                for (k, (d, w)) in done.1.iter().zip(&wanted.1).enumerate() {
+                    let at = wanted.3[k].0;
+                    if let Some(i) = (0..d.len()).find(|&i| d[i] != w[i] && !apart(at + i)) {
+                        panic!("round {round}, {threads} threads: copy {k} at {:#x}: {:#x} for {:#x}", at + i, d[i], w[i]);
+                    }
+                }
+            }
+            changed += usize::from(wanted.0.iter().any(|&b| b >= 0x80));
+        }
+        assert!(changed > 6, "the shaders' bytes went back in most rounds ({changed})");
     }
 
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`
