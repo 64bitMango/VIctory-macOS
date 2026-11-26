@@ -355,6 +355,14 @@ static GPU_TIMES: Mutex<Option<GpuTimes>> = Mutex::new(None);
 /// without counts and addresses.
 #[cfg(feature = "diagnostics")]
 fn gpu_times(wall: Duration, commands: &[(f64, String)]) {
+    {
+        // Lists by their wall time (D3DMetal gives no command timestamps): how many, and their sum.
+        let ms = wall.as_secs_f64() * 1e3;
+        let bucket = LIST_EDGES.iter().position(|&edge| ms < edge).unwrap_or(LIST_EDGES.len());
+        let mut lists = LIST_TIMES.lock().unwrap_or_else(|e| e.into_inner());
+        lists[bucket].0 += 1;
+        lists[bucket].1 += ms;
+    }
     let mut times = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
     let (by, wall_ms, sum) = times.get_or_insert_with(Default::default);
     *wall_ms += wall.as_secs_f64() * 1e3;
@@ -372,9 +380,30 @@ fn gpu_times(wall: Duration, commands: &[(f64, String)]) {
     }
 }
 
+/// Upper edges (ms) of the buckets of [`LIST_TIMES`]; the last bucket is open.
+#[cfg(feature = "diagnostics")]
+const LIST_EDGES: [f64; 7] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0];
+/// Timed lists by wall time: count and summed ms per bucket, since the last line.
+#[cfg(feature = "diagnostics")]
+static LIST_TIMES: Mutex<[(u64, f64); 8]> = Mutex::new([(0, 0.0); 8]);
+
 /// Logs [`GPU_TIMES`] per frame over `frames` frames: the 25 costliest.
 #[cfg(feature = "diagnostics")]
 fn log_gpu_times(frames: f64) {
+    {
+        let lists = std::mem::replace(&mut *LIST_TIMES.lock().unwrap_or_else(|e| e.into_inner()), [(0, 0.0); 8]);
+        if lists.iter().any(|l| l.0 > 0) {
+            let text: Vec<String> = lists
+                .iter()
+                .enumerate()
+                .map(|(i, (n, ms))| {
+                    let edge = LIST_EDGES.get(i).map_or("more".to_owned(), |e| format!("<{e}"));
+                    format!("{edge} ms: {:.1} lists {:.1} ms", *n as f64 / frames, ms / frames)
+                })
+                .collect();
+            tracing::info!("GPU timing: lists per frame by wall time: {}", text.join("; "));
+        }
+    }
     let Some((by, wall, sum)) = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
     };
