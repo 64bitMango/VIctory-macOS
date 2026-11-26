@@ -890,6 +890,8 @@ impl State {
         // The bound view heap's mark table and the bitmap shaders mark
         // their writes through views in (`crate::shadow::copy_back_marks`).
         if let Some((table_param, bitmap_param)) = p.marks {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::marking(&p.name);
             let heap = match self.heaps[0] {
                 0 => crate::memory::heap(),
                 h => crate::descriptor::heap(h as This).host(),

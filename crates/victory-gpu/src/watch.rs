@@ -570,6 +570,28 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     })
 }
 
+/// Whether pages are asked about by runs before they are guarded
+/// ([`RuntimeRegions::region`]): on unless `VICTORY_MARKS_QUICK=0`, which
+/// asks about each page of a pool, as before.
+fn pools_by_run() -> bool {
+    #[cfg(test)]
+    if tests::POOLS_BY_PAGE.with(|by_page| by_page.get()) {
+        return false;
+    }
+    static ON: LazyLock<bool> = LazyLock::new(|| !crate::switch::off("VICTORY_MARKS_QUICK"));
+    *ON
+}
+
+/// Whether all of `[at, at + len)` (whole 4 KiB pages) is in one
+/// write-watched pool (one lookup: the watch answers for a range only if
+/// one watched allocation holds all of it).
+fn watched_range(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
+    // SAFETY: room for one answer; no reset, so nothing changes.
+    unsafe { GetWriteWatch(0, at as *const _, len, (&raw mut found).cast(), &mut count, &mut granularity) == 0 }
+}
+
 /// Whether the page holding `at` is in a write-watched pool (one lookup).
 fn write_watched(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
@@ -670,11 +692,12 @@ fn open(g: &mut Guards, page: usize) -> bool {
 }
 
 /// [`open`] of the guarded pages `[first, last)`, all in `protected`.
-fn open_run(g: &mut Guards, first: usize, last: usize) {
+/// Whether one protection change did for all of them (one view holds them).
+fn open_run(g: &mut Guards, first: usize, last: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     if last - first == 1 {
         open(g, first);
-        return;
+        return true;
     }
     let mut old = 0;
     // SAFETY: blocks we made read-only.
@@ -682,13 +705,14 @@ fn open_run(g: &mut Guards, first: usize, last: usize) {
         for page in first..last {
             open(g, page);
         }
-        return;
+        return false;
     }
     for page in first..last {
         g.protected.remove(&page);
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::OpenPages, (last - first) as u64);
+    true
 }
 
 impl Tracked {
@@ -831,7 +855,7 @@ impl Tracked {
         #[cfg(feature = "diagnostics")]
         drop(asked);
         let mut unmapped = Vec::new();
-        for page in protect_noting(&mut g, &whole, &mut unmapped) {
+        for page in protect_noting(&mut g, &whole, &mut unmapped, &[]) {
             changed.remove(&page);
             self.changed.taken(page);
         }
@@ -880,11 +904,21 @@ impl Tracked {
     /// The caller made pages (page numbers) of its copy equal to title
     /// memory itself (what shaders wrote went back): taken and guarded.
     pub(crate) fn taken(&self, pages: &[usize]) {
+        self.taken_known(pages, &[]);
+    }
+
+    /// [`Tracked::taken`], where the pages in `known` (runs of page numbers
+    /// `[first, last)`, in order: [`Writing::opened`] of writes that have
+    /// just ended) are guarded again without asking what memory they are.
+    /// They were guarded, and so asked about, until our own write opened
+    /// them a moment ago; each asking is a call into Wine under its one
+    /// memory lock, a third of the calls a page written back costs.
+    pub(crate) fn taken_known(&self, pages: &[usize], known: &[(usize, usize)]) {
         let mut g = guards();
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
         let others = aliases(&g, pages);
         guard_aliases(&mut g, &others);
-        for page in protect(&mut g, pages) {
+        for page in protect_noting(&mut g, pages, &mut Vec::new(), known) {
             changed.remove(&page);
             self.changed.taken(page);
         }
@@ -948,12 +982,14 @@ impl Tracked {
 /// now guarded or with nothing mapped (taken either way); a page that is
 /// mapped but cannot be guarded is left out (it stays changed).
 fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
-    protect_noting(g, pages, &mut Vec::new())
+    protect_noting(g, pages, &mut Vec::new(), &[])
 }
 
 /// [`protect`], also listing in `unmapped` the pages taken because nothing
-/// is mapped there.
-fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usize>) -> Vec<usize> {
+/// is mapped there. Pages in `known` (runs `[first, last)` in order, each
+/// in one view) are the runtime's memory without asking
+/// ([`Tracked::taken_known`]).
+fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usize>, known: &[(usize, usize)]) -> Vec<usize> {
     #[cfg(feature = "diagnostics")]
     let counted = |calls: u64, pages: u64| {
         crate::copystat::add(crate::copystat::C::ProtectCalls, calls);
@@ -997,13 +1033,27 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
     // (the runtime's page mappings make one per page) failed and was then
     // guarded page by page, one call more than needed.
     let mut allowed = RuntimeRegions::default();
+    // Where the run of consecutive pages each page starts ends: a pool is
+    // asked about once for the run (a copy-back guards hundreds of pages a
+    // frame again, and each asking is a call into Wine under its one
+    // memory lock).
+    let mut run_ends = vec![0; pages.len()];
+    for i in (0..pages.len()).rev() {
+        let next = pages.get(i + 1).filter(|&&p| p == pages[i] + 1).map(|_| run_ends[i + 1]);
+        run_ends[i] = next.unwrap_or(pages[i] + 1);
+    }
     let (pages, ends): (Vec<usize>, Vec<usize>) = pages
         .into_iter()
-        .filter_map(|p| {
+        .zip(run_ends)
+        .filter_map(|(p, run_end)| {
             if g.protected.contains(&p) {
                 return Some((p, usize::MAX));
             }
-            allowed.region(p).map(|end| (p, end))
+            let i = known.partition_point(|&(_, last)| last <= p);
+            if let Some(&(_, last)) = known.get(i).filter(|&&(first, _)| first <= p) {
+                return Some((p, last));
+            }
+            allowed.region(p, run_end).map(|end| (p, end))
         })
         .unzip();
     let mut i = 0;
@@ -1049,24 +1099,55 @@ struct RuntimeRegions {
     /// The last region asked about: its pages and whether it is runtime
     /// memory.
     last: Option<(usize, usize, bool)>,
+    /// Pages `[first, last)` one write-watched pool holds, as it answered
+    /// for them at once; and the page before which no run is asked about
+    /// any more (a run one pool does not hold was).
+    pool: (usize, usize),
+    by_page_until: usize,
 }
 
 impl RuntimeRegions {
     /// If `page` is the runtime's GPU memory, the page its region is known
     /// to end before (`usize::MAX` for a pool, whose end is not asked).
-    fn region(&mut self, page: usize) -> Option<usize> {
+    /// `run_end`: the caller asks about every page from `page` to there
+    /// next, in order.
+    fn region(&mut self, page: usize, run_end: usize) -> Option<usize> {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
         };
+        if (self.pool.0..self.pool.1).contains(&page) {
+            return Some(usize::MAX);
+        }
         if let Some((a, b, yes)) = self.last
             && (a..b).contains(&page)
         {
             return yes.then_some(b);
         }
+        let asked = || {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::PoolAsks, 1);
+            #[cfg(test)]
+            tests::POOL_ASKS.with(|n| n.set(n.get() + 1));
+        };
+        asked();
+        // One pool holding the whole run answers for it at once; a run it
+        // does not hold is asked about page by page, as below.
+        if run_end > page + 1 && page >= self.by_page_until && pools_by_run() {
+            if watched_range(page * PAGE, (run_end - page) * PAGE) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::PoolPages, (run_end - page) as u64);
+                self.pool = (page, run_end);
+                return Some(usize::MAX);
+            }
+            self.by_page_until = run_end;
+            asked();
+        }
         // A pool's write watch answers with one lookup. `VirtualQuery` walks
         // Wine's page table to the region's end, under the guard lock that
         // every fault waits for.
         if write_watched(page * PAGE) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::PoolPages, 1);
             return Some(usize::MAX);
         }
         // SAFETY: plain data filled in by the query.
@@ -1092,6 +1173,12 @@ impl RuntimeRegions {
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
 fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+    changed_noting(g, first, last, save, None)
+}
+
+/// [`changed`], adding to `opened` the runs of pages `[first, last)` it
+/// gave write access back to, each with one protection change.
+fn changed_noting(g: &mut Guards, first: usize, last: usize, save: bool, opened: Option<&mut Vec<(usize, usize)>>) -> bool {
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
     {
@@ -1106,12 +1193,12 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     for page in others {
         mark(g, page, page + 1, save);
     }
-    changed_here(g, first, last, save)
+    changed_here(g, first, last, save, opened)
 }
 
 /// [`changed`] of `[first, last)` alone. With `save`, before the write
 /// lands: trackers armed for a page they had taken keep its bytes.
-fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool, mut opened: Option<&mut Vec<(usize, usize)>>) -> bool {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
     // Marked while still read-only, so that a block is never open without
     // its trackers knowing: a fault on a block found open ([`OPENED`]) goes
@@ -1126,7 +1213,14 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
         while j < guarded.len() && guarded[j] == guarded[j - 1] + 1 {
             j += 1;
         }
-        open_run(g, guarded[i], guarded[j - 1] + 1);
+        let at_once = open_run(g, guarded[i], guarded[j - 1] + 1);
+        if let Some(opened) = opened.as_deref_mut() {
+            if at_once {
+                opened.push((guarded[i], guarded[j - 1] + 1));
+            } else {
+                opened.extend(guarded[i..j].iter().map(|&page| (page, page + 1)));
+            }
+        }
         i = j;
     }
     !guarded.is_empty()
@@ -1171,6 +1265,17 @@ pub(crate) fn frame_done() {
 pub struct Writing {
     first: usize,
     last: usize,
+    /// The runs of pages it opened: guarded until then ([`Writing::opened`]).
+    opened: Vec<(usize, usize)>,
+}
+
+impl Writing {
+    /// The runs of pages (page numbers `[first, last)`, in order) that were
+    /// guarded until this write opened them, each opened with one
+    /// protection change: for [`Tracked::taken_known`] once it has ended.
+    pub(crate) fn opened(&self) -> &[(usize, usize)] {
+        &self.opened
+    }
 }
 
 impl Drop for Writing {
@@ -1194,8 +1299,9 @@ pub fn writing(at: usize, len: usize) -> Writing {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     g.busy.push((first, last));
-    changed(&mut g, first, last, true);
-    Writing { first, last }
+    let mut opened = Vec::new();
+    changed_noting(&mut g, first, last, true, Some(&mut opened));
+    Writing { first, last, opened }
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -1759,6 +1865,51 @@ pub(crate) mod tests {
     thread_local! {
         /// `VirtualProtect` calls this thread made in `protect`.
         pub(super) static PROTECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Askings of this thread whether pages are a pool's, in `protect`.
+        pub(super) static POOL_ASKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// This thread asks about each page of a pool (as
+        /// `VICTORY_MARKS_QUICK=0`).
+        pub(crate) static POOLS_BY_PAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// A pool's pages are asked about once for a run of them before they
+    /// are guarded, and page by page with the switch off; a run that leaves
+    /// the pool (plain memory after it, never guarded) is asked about page
+    /// by page after one asking for all of it. The same pages are guarded
+    /// either way.
+    #[test]
+    fn a_run_of_a_pools_pages_is_asked_about_once() {
+        let asks = || POOL_ASKS.with(std::cell::Cell::get);
+        for by_page in [false, true] {
+            POOLS_BY_PAGE.with(|b| b.set(by_page));
+            let p = pool(6);
+            let t = track(p, 6 * PAGE, false).expect("a pool is tracked");
+            let before = asks();
+            assert_eq!(t.take(p, p + 6 * PAGE), [(p, p + 6 * PAGE)]);
+            assert_eq!(asks() - before, if by_page { 6 } else { 1 });
+            assert!((0..6).all(|k| read_only(p + k * PAGE)));
+            // Written and taken again: pages 1, 2 and 4.
+            for k in [1, 2, 4] {
+                // SAFETY: a page of our pool; the handler opens it.
+                unsafe { ((p + k * PAGE + 8) as *mut u8).write_volatile(1) };
+            }
+            let before = asks();
+            assert_eq!(t.take(p, p + 6 * PAGE), [(p + PAGE, p + 3 * PAGE), (p + 4 * PAGE, p + 5 * PAGE)]);
+            assert_eq!(asks() - before, if by_page { 3 } else { 2 });
+            assert!((0..6).all(|k| read_only(p + k * PAGE)));
+            drop(t);
+            free(p);
+        }
+        POOLS_BY_PAGE.with(|b| b.set(false));
+        // A run of four pages of which a pool holds the first two.
+        let mut regions = RuntimeRegions::default();
+        let p = pool(2);
+        let before = asks();
+        assert_eq!(regions.region(p / PAGE, p / PAGE + 4), Some(usize::MAX));
+        assert_eq!(regions.region(p / PAGE + 1, p / PAGE + 4), Some(usize::MAX));
+        assert_eq!(asks() - before, 3, "once for the run, then page by page");
+        assert_eq!(regions.pool, (0, 0));
+        free(p);
     }
 
     /// `single` views of one page each side by side, as the runtime's page

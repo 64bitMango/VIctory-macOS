@@ -339,9 +339,17 @@ std::thread_local! {
 }
 
 /// The first pass: finds the pieces the shaders changed, by comparing the
-/// copy with what it held before (title memory itself for [`Before::Title`]
-/// pieces, which are read for it). Nothing is written.
-pub(crate) fn compare(pieces: &[Piece], title: &impl Title, threads: usize) {
+/// copy with what it held before. Nothing is written. For [`Before::Title`]
+/// pieces what was before is title memory itself: they are read for it, or
+/// (`unread`) taken for changed without a look, since [`put`] reads them
+/// anyway and a page a shader marked as written is nearly always changed
+/// (the read here was a fifth of a marked page's time).
+pub(crate) fn compare(pieces: &[Piece], title: &impl Title, threads: usize, unread: bool) {
+    // Nothing to look at: no pass.
+    if unread && pieces.iter().all(|p| matches!(p.before, Before::Title)) {
+        pieces.iter().for_each(|p| p.state.store(PUT, Relaxed));
+        return;
+    }
     spread(pieces.len(), threads, |i| {
         let piece = &pieces[i];
         // SAFETY: this thread does the piece.
@@ -355,6 +363,7 @@ pub(crate) fn compare(pieces: &[Piece], title: &impl Title, threads: usize) {
                 Before::Saved(bytes, from) => {
                     if *host != bytes[*from..from + piece.n] { PUT } else { SYNC }
                 }
+                Before::Title if unread => PUT,
                 Before::Title => {
                     read.resize(PIECE, 0);
                     if !title.read(piece.at, read.as_mut_ptr(), piece.n) {
@@ -437,51 +446,65 @@ pub(crate) fn again(pieces: &[Piece], title: &impl Title, threads: usize) {
 }
 
 /// Merges a piece: `host` is the copy's bytes, `old` what they were before
-/// the shaders ran, `title` title memory's now. The copy takes title
+/// the shaders ran, `title` title memory's now (the same slice as `old`
+/// where title memory is what the copy held before). The copy takes title
 /// memory's bytes where the shaders wrote nothing, and `runs` lists (offset,
 /// bytes) what title memory is to take from the copy after this: every byte
 /// the shaders wrote that title memory does not hold, runs at most [`JOIN`]
 /// bytes apart as one (the bytes between are title memory's own).
+///
+/// The copy is written only where it changes: its memory is the GPU's
+/// buffer, and writing all of a piece into it cost more than reading the
+/// piece from title memory did (8 of 11 us a page, Wine on an M5 Pro).
 pub(crate) fn merge(host: &mut [u8], old: &[u8], title: &[u8], runs: &mut Vec<(u32, u32)>) {
-    /// Bytes compared at once for the common case that nothing changed.
-    const BLOCK: usize = 128;
-    /// 0xff in each byte of `x` that is not 0.
-    fn nonzero(x: u64) -> u64 {
-        const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
-        ((((x & LOW) + LOW) | x) & !LOW) / 0x80 * 0xff
-    }
+    /// Bytes compared at once where nothing changed, and where something
+    /// did.
+    const MANY: usize = 1024;
+    const FEW: usize = 64;
     let n = host.len();
     assert!(old.len() == n && title.len() == n);
+    // Title memory is what the copy held before: it wrote nothing.
+    let before = std::ptr::eq(old, title);
     let mut note = |from: usize, to: usize| match runs.last_mut() {
         Some((at, len)) if (*at + *len) as usize + JOIN >= from => *len = to as u32 - *at,
         _ => runs.push((from as u32, (to - from) as u32)),
     };
-    let word = |bytes: &[u8], i: usize| u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap_or_default());
     let mut i = 0;
     while i < n {
-        let end = (i + BLOCK).min(n);
-        if host[i..end] == old[i..end] {
-            host[i..end].copy_from_slice(&title[i..end]);
-            i = end;
+        let many = (i + MANY).min(n);
+        if host[i..many] == old[i..many] {
+            // The shaders wrote nothing here: title memory's bytes.
+            if !before && host[i..many] != title[i..many] {
+                host[i..many].copy_from_slice(&title[i..many]);
+            }
+            i = many;
             continue;
         }
-        while i + 8 <= end {
-            let (h, t) = (word(host, i), word(title, i));
-            let wrote = nonzero(h ^ word(old, i));
-            let puts = wrote & nonzero(h ^ t);
-            if puts != 0 {
-                note(i + puts.trailing_zeros() as usize / 8, i + 8 - puts.leading_zeros() as usize / 8);
+        while i < many {
+            let end = (i + FEW).min(many);
+            let (h, o, t) = (&host[i..end], &old[i..end], &title[i..end]);
+            if h == o {
+                if !before && h != t {
+                    host[i..end].copy_from_slice(t);
+                }
+            } else if before || t == o {
+                // The title wrote nothing here: what differs is the
+                // shaders', from their first byte to their last, and the
+                // copy holds title memory's bytes beside them already.
+                let first = h.iter().zip(o).position(|(h, o)| h != o).unwrap_or(0);
+                let last = h.iter().zip(o).rposition(|(h, o)| h != o).unwrap_or(0);
+                note(i + first, i + last + 1);
+            } else {
+                // Both wrote here: byte by byte.
+                for k in i..end {
+                    if host[k] == old[k] {
+                        host[k] = title[k];
+                    } else if host[k] != title[k] {
+                        note(k, k + 1);
+                    }
+                }
             }
-            host[i..i + 8].copy_from_slice(&((h & wrote) | (t & !wrote)).to_le_bytes());
-            i += 8;
-        }
-        while i < end {
-            if host[i] == old[i] {
-                host[i] = title[i];
-            } else if host[i] != title[i] {
-                note(i, i + 1);
-            }
-            i += 1;
+            i = end;
         }
     }
 }
@@ -503,6 +526,53 @@ fn fewer(runs: &mut Vec<(u32, u32)>) {
         joined = vec![(first.0, last.0 + last.1 - first.0)];
     }
     *runs = joined;
+}
+
+/// Takes the bits set in `bits` (dwords of a bitmap, bit 0 of the first
+/// its bit 0): each is cleared and its number added to `out`, in order.
+/// Dwords that are 0 are passed sixteen at a time and not written (a
+/// submission marks a few dwords of thousands).
+pub(crate) fn take_bits(bits: &mut [u32], out: &mut Vec<u32>) {
+    for (k, some) in bits.chunks_mut(16).enumerate() {
+        if some.iter().fold(0, |any, &word| any | word) == 0 {
+            continue;
+        }
+        for (i, word) in some.iter_mut().enumerate() {
+            let mut x = std::mem::take(word);
+            while x != 0 {
+                out.push(((k * 16 + i) * 32) as u32 + x.trailing_zeros());
+                x &= x - 1;
+            }
+        }
+    }
+}
+
+/// The bits set in `map`, or in `other` too, that `seen` does not hold yet:
+/// their numbers are added to `out`, in order, and `seen` takes them. All
+/// three are as long. Dwords with nothing new are passed sixteen at a time.
+pub(crate) fn new_bits(map: &[u32], other: Option<&[u32]>, seen: &mut [u32], out: &mut Vec<u32>) {
+    assert!(map.len() == seen.len() && other.is_none_or(|o| o.len() == seen.len()));
+    let mut at = 0;
+    while at < seen.len() {
+        let end = (at + 16).min(seen.len());
+        let (a, s) = (&map[at..end], &mut seen[at..end]);
+        let b = other.map(|o| &o[at..end]);
+        let new = match b {
+            Some(b) => a.iter().zip(b).zip(s.iter()).fold(0, |any, ((&a, &b), &s)| any | ((a | b) & !s)),
+            None => a.iter().zip(s.iter()).fold(0, |any, (&a, &s)| any | (a & !s)),
+        };
+        if new != 0 {
+            for (i, s) in s.iter_mut().enumerate() {
+                let mut fresh = (a[i] | b.map_or(0, |b| b[i])) & !*s;
+                *s |= fresh;
+                while fresh != 0 {
+                    out.push(((at + i) * 32) as u32 + fresh.trailing_zeros());
+                    fresh &= fresh - 1;
+                }
+            }
+        }
+        at = end;
+    }
 }
 
 /// Sorts `ranges` (from, to) and joins those that overlap or touch; empty
@@ -757,7 +827,7 @@ mod tests {
                 });
             }
         }
-        compare(&all, title, threads);
+        compare(&all, title, threads, false);
         put(&all, title, threads, None);
         again(&all, title, threads);
     }
@@ -931,13 +1001,17 @@ mod tests {
                         Piece::new(BASE + from, bytes, to - from, before, to - from == PIECE, 0)
                     })
                     .collect();
-                compare(&pieces, &title, threads);
+                // Read for the first pass, or (every other time) not.
+                let unread = threads == 3;
+                compare(&pieces, &title, threads, unread);
                 put(&pieces, &title, threads, None);
                 for (k, piece) in pieces.iter().enumerate() {
                     let there = !unmapped.contains(&((piece.at - BASE) / PIECE));
                     assert_eq!(piece.wrote(), wrote_wanted[k], "round {round}, piece {k}");
                     assert_eq!(piece.synced(), there, "round {round}, piece {k}: equal to title memory if it is there");
                     assert!(!piece.wrote() || piece.opens(), "written only where opened");
+                    let untouched = matches!(piece.before, Before::Title) && !unread && !piece.wrote();
+                    assert!(!(untouched && piece.opens()), "read first, a piece with nothing to write is not opened");
                     let (bytes, writes) = piece.written();
                     assert!(bytes as usize <= piece.n && (bytes > 0) == piece.wrote() && writes as usize <= RUNS);
                 }
@@ -966,7 +1040,7 @@ mod tests {
         let second = unsafe { bytes.add(PIECE) };
         let part = Piece::new(BASE + PIECE, second, PIECE - 1, Before::Kept(&segments, PIECE), false, 0);
         let pieces = [whole, part];
-        compare(&pieces, &title, 2);
+        compare(&pieces, &title, 2, false);
         put(&pieces, &title, 2, None);
         // SAFETY: bytes of the test's title memory.
         unsafe {
@@ -986,6 +1060,49 @@ mod tests {
         copies.sort_unstable();
         copies.dedup();
         copies
+    }
+
+    /// The bits of a sparse bitmap, taken sixteen dwords at a time, are the
+    /// bits found dword by dword, and the bitmap is left clear; new bits of
+    /// one map or two are those a dword-by-dword pass finds, and are seen
+    /// from then on.
+    #[test]
+    fn bits_are_found_as_dword_by_dword() {
+        let mut seed = 0x0123_4567_89ab_cdefu64;
+        for round in 0..300 {
+            let words = [0, 1, 15, 16, 17, 100, 1000][round % 7];
+            let sparse = |seed: &mut u64| -> Vec<u32> {
+                (0..words)
+                    .map(|_| match random(seed, 40) {
+                        0 => random(seed, 1 << 31) as u32 * 2 + 1,
+                        1 => 1 << random(seed, 32),
+                        _ => 0,
+                    })
+                    .collect()
+            };
+            let mut bits = sparse(&mut seed);
+            let wanted: Vec<u32> = (0..words as u32 * 32).filter(|&n| bits[n as usize / 32] >> (n % 32) & 1 != 0).collect();
+            let mut taken = Vec::new();
+            take_bits(&mut bits, &mut taken);
+            assert_eq!(taken, wanted, "round {round}");
+            assert!(bits.iter().all(|&w| w == 0));
+            let (a, b, mut seen) = (sparse(&mut seed), sparse(&mut seed), sparse(&mut seed));
+            for other in [None, Some(&b[..])] {
+                let mut seen_now = seen.clone();
+                let both = |i: usize| a[i] | other.map_or(0, |o| o[i]);
+                let wanted: Vec<u32> = (0..words as u32 * 32)
+                    .filter(|&n| (both(n as usize / 32) & !seen[n as usize / 32]) >> (n % 32) & 1 != 0)
+                    .collect();
+                let mut new = Vec::new();
+                new_bits(&a, other, &mut seen_now, &mut new);
+                assert_eq!(new, wanted, "round {round}");
+                assert!((0..words).all(|i| seen_now[i] == seen[i] | both(i)));
+                new.clear();
+                new_bits(&a, other, &mut seen_now, &mut new);
+                assert!(new.is_empty(), "seen from then on");
+            }
+            seen.clear();
+        }
     }
 
     #[test]
