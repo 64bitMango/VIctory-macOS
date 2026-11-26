@@ -40,6 +40,7 @@ pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
 pub mod fence;
+mod batch;
 pub mod frame;
 mod hold;
 #[cfg(windows)]
@@ -65,6 +66,8 @@ pub mod queue;
 mod ranges;
 #[cfg(windows)]
 mod readout;
+// The capture format is plain std: read, and tested, everywhere.
+pub mod replay;
 pub mod resource;
 pub mod root;
 // Plain std, so its tests run everywhere.

@@ -362,6 +362,13 @@ struct Guards {
     /// with no question to the runtime (whose lock its page mappings hold
     /// for long).
     alias_of: BTreeMap<usize, Vec<usize>>,
+    /// Pages found to be the runtime's GPU memory when they were last
+    /// guarded, with the page their region was known to end before
+    /// (`usize::MAX` for a pool): guarded again after a write opened them,
+    /// they are not asked about again ([`vetted_pages`]). Forgotten when the
+    /// runtime maps or unmaps them and when no tracker holds them any more,
+    /// as [`Guards::protected`] is.
+    vetted: BTreeMap<usize, usize>,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
     written: BTreeSet<usize>,
@@ -386,6 +393,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     holders: BTreeMap::new(),
     busy: Vec::new(),
     alias_of: BTreeMap::new(),
+    vetted: BTreeMap::new(),
     #[cfg(feature = "diagnostics")]
     written: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
@@ -589,6 +597,24 @@ fn pools_by_run() -> bool {
     *ON
 }
 
+/// Whether pages guarded before are guarded again without asking what
+/// memory they are ([`Guards::vetted`]): on unless `VICTORY_VETTED_PAGES=0`,
+/// which asks each time, as before. A refresh takes the pages the title
+/// wrote since and guards them again, and asking cost up to three calls
+/// into Wine per page of a physical-page view (one view per page) under
+/// the guard lock the title's write faults wait for. What the answer
+/// depends on changes only when the runtime maps or unmaps the memory
+/// (then the page is forgotten), or when it is freed and reused, which the
+/// guard set already does not see while a tracker holds the page.
+fn vetted_pages() -> bool {
+    #[cfg(test)]
+    if let Some(on) = tests::VETTED.with(|v| v.get()) {
+        return on;
+    }
+    static ON: LazyLock<bool> = LazyLock::new(|| !crate::switch::off("VICTORY_VETTED_PAGES"));
+    *ON
+}
+
 /// Whether all of `[at, at + len)` (whole 4 KiB pages) is in one
 /// write-watched pool (one lookup: the watch answers for a range only if
 /// one watched allocation holds all of it).
@@ -676,6 +702,7 @@ impl Drop for Tracked {
         for page in free {
             let watched_elsewhere = g.alias_of.get(&page).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
             if !watched_elsewhere {
+                g.vetted.remove(&page);
                 open(&mut g, page);
                 // Nobody's any more: what is there next is not known open.
                 forget_opened(page);
@@ -1046,6 +1073,7 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
     // (the runtime's page mappings make one per page) failed and was then
     // guarded page by page, one call more than needed.
     let mut allowed = RuntimeRegions::default();
+    let vetted = vetted_pages();
     // Where the run of consecutive pages each page starts ends: a pool is
     // asked about once for the run (a copy-back guards hundreds of pages a
     // frame again, and each asking is a call into Wine under its one
@@ -1065,6 +1093,13 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
             let i = known.partition_point(|&(_, last)| last <= p);
             if let Some(&(_, last)) = known.get(i).filter(|&&(first, _)| first <= p) {
                 return Some((p, last));
+            }
+            if vetted
+                && let Some(&end) = g.vetted.get(&p)
+            {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::VettedPages, 1);
+                return Some((p, end));
             }
             allowed.region(p, run_end).map(|end| (p, end))
         })
@@ -1086,16 +1121,23 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
             i += 1;
         }
         let run = &pages[first..=i];
+        let run_ends = &ends[first..=i];
         i += 1;
         if set(run[0], run[run.len() - 1] + 1) {
             g.protected.extend(run);
             taken.extend(run);
+            if vetted {
+                g.vetted.extend(run.iter().copied().zip(run_ends.iter().copied()));
+            }
             continue;
         }
-        for &page in run {
+        for (&page, &end) in run.iter().zip(run_ends) {
             if set(page, page + 1) {
                 g.protected.insert(page);
                 taken.push(page);
+                if vetted {
+                    g.vetted.insert(page, end);
+                }
             } else if unmapped(page) {
                 taken.push(page);
                 unmapped_pages.push(page);
@@ -1324,6 +1366,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
+    // Nor what it was: asked about again when next guarded.
+    let gone: Vec<usize> = g.vetted.range(first..last).map(|(&p, _)| p).collect();
+    for page in gone {
+        g.vetted.remove(&page);
+    }
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -1883,6 +1930,49 @@ pub(crate) mod tests {
         /// This thread asks about each page of a pool (as
         /// `VICTORY_MARKS_QUICK=0`).
         pub(crate) static POOLS_BY_PAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// `vetted_pages` on this thread, if set.
+        pub(crate) static VETTED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Pages guarded before are guarded again without asking what memory
+    /// they are, in pools and in views of one page each (asked about page by
+    /// page), with the same pages guarded as when asked; a remap, or no
+    /// tracker holding a page any more, has it asked about again. With the
+    /// switch off every guarding asks, as before.
+    #[test]
+    fn pages_guarded_before_are_not_asked_about_again() {
+        let asks = || POOL_ASKS.with(std::cell::Cell::get);
+        for vetted in [true, false] {
+            VETTED.with(|v| v.set(Some(vetted)));
+            let (views, _) = views_side_by_side(3);
+            let p = pool(3);
+            for (at, first_asks) in [(p, 1), (views, 3)] {
+                let t = track(at, 3 * PAGE, true).expect("tracked");
+                let before = asks();
+                assert_eq!(t.take(at, at + 3 * PAGE), [(at, at + 3 * PAGE)]);
+                assert!(asks() - before >= first_asks, "{at:#x}");
+                let write = |k: usize| {
+                    // SAFETY: a page of ours, guarded: the handler opens it.
+                    unsafe { ((at + k * PAGE + 8) as *mut u8).write_volatile(1) };
+                };
+                for k in [0, 2] {
+                    write(k);
+                }
+                let before = asks();
+                assert_eq!(t.take(at, at + 3 * PAGE), [(at, at + PAGE), (at + 2 * PAGE, at + 3 * PAGE)]);
+                assert_eq!(asks() == before, vetted, "{at:#x}");
+                assert!((0..3).all(|k| read_only(at + k * PAGE)), "the same pages guarded");
+                // Remapped: what it is is asked again.
+                title_memory_remapped(at, PAGE);
+                let before = asks();
+                assert_eq!(t.take(at, at + PAGE), [(at, at + PAGE)]);
+                assert!(asks() > before, "{at:#x}");
+                drop(t);
+                assert!((0..3).all(|k| !guards().vetted.contains_key(&(at / PAGE + k))), "forgotten with its tracker");
+            }
+            free(p);
+        }
+        VETTED.with(|v| v.set(None));
     }
 
     /// A pool's pages are asked about once for a run of them before they
@@ -1893,6 +1983,8 @@ pub(crate) mod tests {
     #[test]
     fn a_run_of_a_pools_pages_is_asked_about_once() {
         let asks = || POOL_ASKS.with(std::cell::Cell::get);
+        // (Asked again each time, as without `vetted_pages`.)
+        VETTED.with(|v| v.set(Some(false)));
         for by_page in [false, true] {
             POOLS_BY_PAGE.with(|b| b.set(by_page));
             let p = pool(6);
@@ -1923,6 +2015,7 @@ pub(crate) mod tests {
         assert_eq!(asks() - before, 3, "once for the run, then page by page");
         assert_eq!(regions.pool, (0, 0));
         free(p);
+        VETTED.with(|v| v.set(None));
     }
 
     /// `single` views of one page each side by side, as the runtime's page

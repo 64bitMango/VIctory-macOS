@@ -290,6 +290,9 @@ pub(crate) enum C {
     /// them: the askings, and the pages they answered for.
     PoolAsks,
     PoolPages,
+    /// Pages guarded again without asking, known from their last guarding
+    /// (`crate::watch`, `VICTORY_VETTED_PAGES`).
+    VettedPages,
     /// Threads recording or releasing a view: waits for the views' index
     /// and for the entries to write one ([`C::ViewsWaitUs`] is the readers'
     /// waits for the entries).
@@ -369,6 +372,19 @@ pub(crate) fn snapshot(start: u64, len: u64, bytes: u64) {
         .get_or_insert_with(HashMap::new)
         .entry((start, len))
         .or_default() += bytes;
+}
+
+/// Refresh batches per host copy (its title start and length): ranges
+/// asked (each an asking of its tracker), nanoseconds, bytes copied, and
+/// the ranges added by a list's own steps, by heaps' hulls, by
+/// title-memory tables.
+static REFRESHED: Mutex<Option<HashMap<(u64, u64), [u64; 6]>>> = Mutex::new(None);
+
+/// Adds `n` to field `field` of [`REFRESHED`] for the copy of `[start,
+/// start + len)`.
+pub(crate) fn refreshed(start: u64, len: u64, field: usize, n: u64) {
+    REFRESHED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry((start, len)).or_default()
+        [field] += n;
 }
 
 /// Pages shaders marked as written, per host copy (its title start and
@@ -820,7 +836,8 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  write marks per frame: bitmaps read in {:.2} ms ({:.0} dwords, {:.0} bits set that go back, {:.0} held back); \
          their pages found and grouped in {:.2} ms ({:.0} copies); pieces made in {:.2} ms; the submissions' declared \
-         ranges gathered in {:.2} ms; pools asked about {:.0} times for {:.0} pages before guarding",
+         ranges gathered in {:.2} ms; pools asked about {:.0} times for {:.0} pages before guarding, {:.0} pages \
+         guarded again without asking (VICTORY_VETTED_PAGES)",
         ms(c[C::MarksScanUs as usize]),
         c[C::MarksWords as usize],
         c[C::MarksBits as usize],
@@ -831,6 +848,7 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::BackGatherUs as usize]),
         c[C::PoolAsks as usize],
         c[C::PoolPages as usize],
+        c[C::VettedPages as usize],
     );
     let mut copies: Vec<((u64, u64), u64)> =
         MARKED.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
@@ -847,6 +865,26 @@ pub(crate) fn log(frames: f64) {
         copies.len(),
         most.join(", ")
     );
+    let mut refreshed: Vec<((u64, u64), [u64; 6])> =
+        REFRESHED.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
+    refreshed.sort_by_key(|&(at, v)| (std::cmp::Reverse(v[1]), at));
+    let most: Vec<String> = refreshed
+        .iter()
+        .take(6)
+        .map(|((start, len), v)| {
+            let f = |i: usize| v[i] as f64 / frames;
+            format!(
+                "{start:#x}+{len:#x} {:.1} askings {:.2} ms {:.1} MB (ranges added by lists {:.1}, hulls {:.1}, tables {:.1})",
+                f(0),
+                f(1) / 1e6,
+                f(2) / 1e6,
+                f(3),
+                f(4),
+                f(5)
+            )
+        })
+        .collect();
+    tracing::info!("  refresh batches per frame by copy, the dearest first: {}", most.join("; "));
     let mut marking: Vec<(String, u64)> = MARKING.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
     marking.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let most: Vec<String> = marking.iter().take(8).map(|(name, n)| format!("{name} {:.1}", *n as f64 / frames)).collect();

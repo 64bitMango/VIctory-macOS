@@ -472,13 +472,16 @@ impl State {
 
     /// Whether an indirect execution of `kind` recorded now would have its
     /// clamp hoisted: a draw or mesh dispatch that is not dropped before
-    /// its clamp. Rectangles are left out: their vertices may be made by
-    /// dispatches of ours between the draws.
+    /// its clamp ([`hoists`]).
     pub(crate) fn hoistable(&self, kind: u32) -> bool {
-        kind != INDIRECT_DISPATCH
-            && !(kind != INDIRECT_MESH && self.topology == RECTANGLES)
-            && !crate::pipeline::is_left_out(self.pipeline as This)
-            && crate::pipeline::host_pipeline(self.pipeline as This).is_some()
+        let rectangles = kind != INDIRECT_MESH && self.topology == RECTANGLES;
+        hoists(
+            kind,
+            rectangles,
+            rectangles && self.completes_rectangles(),
+            crate::pipeline::is_left_out(self.pipeline as This),
+            crate::pipeline::host_pipeline(self.pipeline as This).is_some(),
+        )
     }
 
     /// Whether the clamps of indirect draws recorded in `list` now go to
@@ -2307,7 +2310,8 @@ impl State {
                 }
                 #[cfg(feature = "diagnostics")]
                 clamps.note_op(|| format!("hoisted clamp of indirect kind {kind} max {max} at {arguments:#x}"));
-                crate::indirect::bound_before(&clamps, list, args.gpu(arguments), (kind, stride, max), counted)
+                let from = counter.as_ref().map(|(s, at)| (s.base(), s.gpu(*at)));
+                crate::indirect::bound_before(&clamps, list, (args.base(), args.gpu(arguments)), (kind, stride, max), from)
             });
         let inline = hoisted.is_none();
         let (clamped, clamped_at) = match hoisted {
@@ -2599,6 +2603,33 @@ fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
     t.user_data.iter().any(is_root_view)
 }
 
+/// Whether the clamp of an indirect execution of `kind` goes to the host
+/// list before its own: a draw or mesh dispatch with a host pipeline that is
+/// not left out. Indirect draws of rectangles run only where the pipeline's
+/// geometry shader completes them (no vertices of ours are made between the
+/// draws), and are hoisted then: clamped in place, each put a dispatch of
+/// ours and three barriers between every two draws, ending the host's render
+/// pass (180 times in one list of a traced frame; with those clamps moved
+/// ahead of the draws, its submission replayed 5.4 ms faster, 37 to 32).
+/// `VICTORY_HOIST_RECTANGLES=0` clamps them in place as before.
+fn hoists(kind: u32, rectangles: bool, completed: bool, left_out: bool, has_host: bool) -> bool {
+    kind != INDIRECT_DISPATCH
+        && (!rectangles || (completed && hoist_rectangles()))
+        && !left_out
+        && has_host
+}
+
+/// `VICTORY_HOIST_RECTANGLES=0`: see [`hoists`]. Read once, here.
+fn hoist_rectangles() -> bool {
+    #[cfg(test)]
+    return true;
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| !crate::switch::off("VICTORY_HOIST_RECTANGLES"))
+    }
+}
+
 /// The console's own primitive topologies.
 const TRIANGLE_FAN: u32 = 6;
 const RECTANGLES: u32 = 17;
@@ -2622,6 +2653,21 @@ mod tests {
     /// root constants at slot 8, user data 32-45) read it and were all
     /// dropped as "root view offset: no root view set". A root descriptor's
     /// offset entry still drops a draw whose root view is not set.
+    #[test]
+    fn clamps_of_completed_rectangles_are_hoisted() {
+        const DRAW: u32 = 0;
+        // Draws, mesh dispatches; never dispatches.
+        assert!(hoists(DRAW, false, false, false, true));
+        assert!(hoists(INDIRECT_MESH, false, false, false, true));
+        assert!(!hoists(INDIRECT_DISPATCH, false, false, false, true));
+        // Rectangles whose geometry shader completes them, not others.
+        assert!(hoists(DRAW, true, true, false, true));
+        assert!(!hoists(DRAW, true, false, false, true));
+        // Dropped or left out: clamped where they stand, if at all.
+        assert!(!hoists(DRAW, true, true, false, false));
+        assert!(!hoists(DRAW, false, false, true, true));
+    }
+
     #[test]
     fn root_constants_dword_4_is_a_constant() {
         use victory_shader::emit::{ROOT_SRV_VIEW, ROOT_VIEW_OFFSET, UserData};

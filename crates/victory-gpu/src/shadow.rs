@@ -162,6 +162,11 @@ impl Shadow {
         self.gpu + (address - self.start)
     }
 
+    /// The host GPU address of the copy's first byte.
+    pub(crate) fn base(&self) -> u64 {
+        self.gpu
+    }
+
     /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)

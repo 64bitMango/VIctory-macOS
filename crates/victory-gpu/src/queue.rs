@@ -597,6 +597,32 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// `VICTORY_FRAME_RATE_LOG=1`, in every build (diagnostics or not): every
+/// 5 s a line with the frames presented so far and over the last 5 s, so a
+/// build without diagnostics can be timed against one with them.
+#[cfg(windows)]
+fn start_frame_rate_log() {
+    use std::time::{Duration, Instant};
+    if !matches!(std::env::var("VICTORY_FRAME_RATE_LOG").as_deref().map(str::trim), Ok("1")) {
+        return;
+    }
+    let started = std::thread::Builder::new().name("frame-rate-log".into()).spawn(|| {
+        let mut before = (presented(), Instant::now());
+        loop {
+            std::thread::sleep(Duration::from_secs(5));
+            let now = (presented(), Instant::now());
+            let ms = now.1.duration_since(before.1).as_secs_f64() * 1e3;
+            let frames = now.0 - before.0;
+            let per_frame = if frames > 0 { ms / frames as f64 } else { 0.0 };
+            tracing::info!(presented = now.0, frames, per_frame_ms = per_frame, "frame rate");
+            before = now;
+        }
+    });
+    if let Err(error) = started {
+        tracing::warn!(%error, "could not start the frame-rate log");
+    }
+}
+
 /// Count returns separately from entries so a quiet render thread can be
 /// distinguished from a present call that has yet to return.
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -828,6 +854,10 @@ extern "system" fn present(
     if frame == 1 {
         start_progress_log();
     }
+    #[cfg(windows)]
+    if frame == 1 {
+        start_frame_rate_log();
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -856,6 +886,11 @@ extern "system" fn present(
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
+    // The draws run so far, for the frame recorder's world frame
+    // (`VICTORY_RECORD_AT=w<n>`): read where `capture::presented` reads
+    // them, so that both tell the same frame as the world's first.
+    #[cfg(windows)]
+    let drawn = crate::draw::drawn();
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::presented(frame);
@@ -893,10 +928,15 @@ extern "system" fn present(
             crate::resource::host_transition(*o, s);
         }
         crate::resource::host_transition(resource, state);
+        // The frame recorder's end of a frame (`VICTORY_RECORD`): the
+        // picture is in `state` again.
+        crate::replay::record::present(frame, Some((&texture, state)), drawn);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
+    } else {
+        crate::replay::record::present(frame, None, drawn);
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);

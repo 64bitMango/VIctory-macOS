@@ -241,6 +241,9 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        // The frame recorder (`VICTORY_RECORD`, docs/replay.md), before
+        // anything is made with the device: it sees what the device makes.
+        crate::replay::record::from_env(&device);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -953,6 +956,9 @@ pub(crate) struct HostList {
     /// Clamped arguments of the list's indirect draws that the list before
     /// it writes ([`HostList::clamp_room`]).
     hoisted: Mutex<Hoisted>,
+    /// Clamps of the lists after it recorded here but not yet run
+    /// (`crate::indirect`, batches): recorded where the run of clamps ends.
+    pub(crate) clamp_batch: Mutex<Option<crate::indirect::Pending>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1013,8 +1019,19 @@ fn timing() -> bool {
 }
 
 /// Names a host object for the device-removed report, which names the
-/// allocations a page fault hit (only with device-removed data on).
+/// allocations a page fault hit (only with device-removed data on), and for
+/// the frame recorder (`VICTORY_RECORD`), whose reports name pipelines and
+/// resources by it.
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
+    if crate::replay::record::on() {
+        let text = text();
+        crate::replay::record::name(object, &text);
+        return name_it(object, || text);
+    }
+    name_it(object, text);
+}
+
+fn name_it(object: &impl Interface, text: impl FnOnce() -> String) {
     if dred_on()
         && let Ok(object) = object.cast::<ID3D12Object>()
     {
@@ -1329,6 +1346,7 @@ impl Host {
                 arguments: Mutex::new(None),
                 writes: Default::default(),
                 hoisted: Mutex::default(),
+                clamp_batch: Mutex::new(None),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -2118,6 +2136,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        crate::indirect::flush(self);
         self.clamp_done();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -2158,6 +2177,7 @@ impl HostList {
             let mut hoisted = self.hoisted.lock().unwrap_or_else(|e| e.into_inner());
             (hoisted.used, hoisted.at, hoisted.readable) = (0, 0, false);
         }
+        *self.clamp_batch.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -2658,6 +2678,14 @@ impl HostList {
         Some(result)
     }
 
+    /// The list's budget words as they are (spent, unfilled, cut).
+    #[cfg(test)]
+    pub(crate) fn budget_words(&self) -> [u32; 3] {
+        let at = self.budget.get().and_then(|b| b.as_ref()).map_or(0, |b| b.1);
+        // SAFETY: the list's own mapped words, read when it is not running.
+        if at == 0 { [0; 3] } else { unsafe { (at as *const [u32; 3]).read_volatile() } }
+    }
+
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
@@ -2772,6 +2800,8 @@ impl HostList {
     /// Where `clamps` ends: the clamped arguments it wrote for this list
     /// become readable as indirect arguments.
     pub(crate) fn clamp_end(&self, clamps: &HostList) {
+        // The batch of clamps first: then its writes are made readable.
+        crate::indirect::flush(clamps);
         let mut hoisted = self.hoisted.lock().unwrap_or_else(|e| e.into_inner());
         if hoisted.used == 0 || hoisted.readable {
             return;
@@ -2885,6 +2915,10 @@ impl HostList {
                     }
                     // A list submitted again uses it without a lookup.
                     shadow.ask();
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        batch.why = 0;
+                    }
                     batch.add(shadow, *address, *len);
                     continue;
                 }
@@ -2912,10 +2946,18 @@ impl HostList {
                 // Brought up to date before the submission's lists were made.
                 Step::Texture(..) => continue,
                 Step::Heap(viewed) => {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        batch.why = 1;
+                    }
                     crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
                     continue;
                 }
                 &Step::Memory(heap, _) => {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        batch.why = 2;
+                    }
                     crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
                     continue;
                 }
@@ -2956,6 +2998,10 @@ struct Batch {
     /// (`crate::watch::Tracked::take_resting`); not unless the submission
     /// says so.
     rest: bool,
+    /// Which kind of step asks (diagnostics, `crate::copystat::refreshed`):
+    /// a list's own ranges, a heap's hull, a title-memory table.
+    #[cfg(feature = "diagnostics")]
+    why: usize,
 }
 
 /// How far apart a copy's pending ranges may be and still be done as one,
@@ -2981,6 +3027,11 @@ impl Batch {
         };
         if todo.is_empty() {
             return;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            let (start, len) = shadow.range();
+            crate::copystat::refreshed(start, len, 3 + self.why, 1);
         }
         let i = *self.pending.entry(key).or_insert_with(|| {
             self.refreshes.push((shadow.clone(), Default::default()));
@@ -3033,7 +3084,12 @@ impl Batch {
                 let copied = shadow.update_as(from, to - from, how);
                 let us = started.elapsed().as_micros() as u64;
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::range(from, to - from, us, 0);
+                {
+                    crate::copystat::range(from, to - from, us, 0);
+                    crate::copystat::refreshed(start, len, 0, 1);
+                    crate::copystat::refreshed(start, len, 1, us * 1000);
+                    crate::copystat::refreshed(start, len, 2, copied as u64);
+                }
                 PREPARING[0].fetch_add(us, Ordering::Relaxed);
                 PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
                 total += copied;
@@ -3648,6 +3704,8 @@ impl Meter {
         let indirect = crate::list::take_indirect() as f64 / frames;
         let [records, counted] = crate::indirect::take_records().map(|n| n as f64 / frames);
         let hoisted = crate::indirect::take_hoisted() as f64 / frames;
+        let (batched, batches) = crate::indirect::take_batched();
+        let (batched, batches) = (batched as f64 / frames, batches as f64 / frames);
         let unfilled = crate::indirect::take_unfilled() as f64 / frames;
         let cut = crate::indirect::take_cut() as f64 / frames;
         let hoists = crate::list::take_hoists() as f64 / frames;
@@ -3665,7 +3723,8 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
                  max records {records:.0}/frame ({counted:.0} under a count, {unfilled:.0} unfilled \
                  run empty, {cut:.0} dispatches cut at 65,535 groups), {hoisted:.0} clamps/frame \
-                 in the list before their draw's ({hoists:.0} lists cut for them)",
+                 in the list before their draw's ({hoists:.0} lists cut for them; {batched:.0} \
+                 of them in {batches:.0} batches)",
                 making = crate::pipeline::making()
             );
             if let Some(line) = crate::unwaited::take_line() {

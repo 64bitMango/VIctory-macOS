@@ -64,6 +64,17 @@ pub(crate) fn pipeline(
     params: &[Param],
 ) -> Result<(ID3D12RootSignature, ID3D12PipelineState)> {
     let device = &crate::host::host().ok_or_else(Error::empty)?.device;
+    pipeline_on(device, source, name, flags, params)
+}
+
+/// As [`pipeline`], on `device`.
+pub(crate) fn pipeline_on(
+    device: &ID3D12Device,
+    source: &str,
+    name: PCSTR,
+    flags: u32,
+    params: &[Param],
+) -> Result<(ID3D12RootSignature, ID3D12PipelineState)> {
     let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
@@ -107,6 +118,10 @@ pub(crate) fn pipeline(
             ..Default::default()
         })
     }?;
+    // A pass of ours, by the name it was compiled under: what a frame
+    // replay's reports call it (`VICTORY_RECORD`).
+    // SAFETY: the caller's name, a string that ends with a NUL.
+    crate::host::name(&pso, || format!("victory: {}", unsafe { name.display() }));
     Ok((root, pso))
 }
 

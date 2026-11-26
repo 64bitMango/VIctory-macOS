@@ -7,6 +7,7 @@ mod census;
 mod inspect;
 #[cfg(windows)]
 mod prebuild;
+mod replay;
 mod run;
 mod shader;
 #[cfg(windows)]
@@ -122,6 +123,9 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Run a captured frame's GPU work again without the title, with what
+    /// it costs and experiments on it (docs/replay.md).
+    Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -221,6 +225,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
     }
 }
