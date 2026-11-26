@@ -341,15 +341,24 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
-        for (from, to) in written.take(start as usize, usize::MAX) {
+        #[cfg(feature = "diagnostics")]
+        let taking = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncTakeUs);
+        let changed = written.take(start as usize, usize::MAX);
+        #[cfg(feature = "diagnostics")]
+        drop(taking);
+        for (from, to) in changed {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
             let page_size = crate::watch::PAGE;
             for page in (from & !(page_size - 1)..to).step_by(page_size) {
                 let (page, end) = (page.max(from), (page + page_size).min(to));
+                #[cfg(feature = "diagnostics")]
+                let probing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncProbeUs);
                 if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
                     continue;
                 }
+                #[cfg(feature = "diagnostics")]
+                drop(probing);
                 let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(
