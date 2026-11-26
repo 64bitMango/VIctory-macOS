@@ -1581,6 +1581,8 @@ impl Host {
             .collect();
         #[cfg(feature = "diagnostics")]
         drop(asking);
+        #[cfg(feature = "diagnostics")]
+        let gathering = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::BackGatherUs);
         crate::memory::note_submission(missed.contains(&true));
         let withholding = crate::memory::withholding();
         for (list, &missed) in runs.iter().zip(&missed) {
@@ -1620,6 +1622,8 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
+        #[cfg(feature = "diagnostics")]
+        drop(gathering);
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         #[cfg(feature = "diagnostics")]
