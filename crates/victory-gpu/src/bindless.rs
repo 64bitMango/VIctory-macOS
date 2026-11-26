@@ -37,9 +37,75 @@ const KINDS: [&str; 4] = ["buffer", "unordered buffer", "placed texture", "other
 
 /// A heap's slots that view title memory, and the distinct buffer ranges
 /// and textures among them (with how many slots view each).
-#[derive(Default)]
+///
+/// One mutex held all of it, taken for every slot made (135,000 a frame,
+/// by the title's recording threads and the submitting thread) and held by
+/// the submitting thread while it went through every copy's hull for each
+/// list and every texture for each submission, and by a resource's release
+/// while it went through every slot: once slots had locks of their own the
+/// recording threads waited 265-357 ms a frame here, 22,400 times (run
+/// ab-slots-on). In parts now, each under its own lock:
+/// - What each slot views, by the slot's run (the runs the slots' locks go
+///   by, `crate::descriptor::host`, so the thread making a slot finds its
+///   part free).
+/// - The counts, hulls and textures, by the copy or texture they are of.
+///
+/// What the one lock gave, and what gives it now:
+/// - A slot's entry and the counts move together: both change with the
+///   slot's part held ([`Viewed::put`]), so changes to one slot are counted
+///   in the order they are entered, and each count is the number of slots
+///   whose entry names its range or texture once the threads writing them
+///   are done.
+/// - A reader sees each copy's ranges and hull, and each texture's slots,
+///   as they are at one moment (its part's lock), not all copies at one
+///   moment: a slot made while a submission is prepared was in or out of
+///   it by chance before too.
+/// - A title texture found here is alive while the lock is held: its
+///   release ([`forget`]) takes it out of its part before it goes, so
+///   [`uploads`] looks at a part's textures with that part held.
+///
+/// Locked in the order: a slots part, then one counts part at a time.
+/// `VICTORY_VIEWED_PARTS=0`: one part of each, and the submitting thread
+/// holds off every slot while it reads, as the one lock did.
 pub(crate) struct Viewed {
-    inner: Mutex<Inner>,
+    slots: Box<[Part<crate::quick::Map<u32, Seen>>]>,
+    counts: Box<[Part<Inner>]>,
+}
+
+/// Parts of each kind to a heap ([`Viewed`]).
+const PARTS: usize = 64;
+
+/// Slots in a row in one part (`crate::descriptor::host::RUN`).
+const RUN: u32 = 64;
+
+/// A part of [`Viewed`], on cache lines of its own.
+#[derive(Default)]
+#[repr(align(64))]
+struct Part<T>(Mutex<T>);
+
+impl<T> Part<T> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, T> {
+        crate::contend::lock(&self.0, crate::contend::Lock::Viewed)
+    }
+}
+
+impl Default for Viewed {
+    fn default() -> Self {
+        Self {
+            slots: (0..PARTS).map(|_| Part::default()).collect(),
+            counts: (0..PARTS).map(|_| Part::default()).collect(),
+        }
+    }
+}
+
+/// Whether [`Viewed`] is kept in parts: unless `VICTORY_VIEWED_PARTS=0`.
+fn in_parts() -> bool {
+    #[cfg(test)]
+    if tests::ONE_PART.with(|one| one.get()) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_VIEWED_PARTS"))
 }
 
 type Range = (usize, u64, u64, bool);
@@ -50,9 +116,9 @@ type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
 
 #[derive(Default)]
 struct Inner {
-    slots: crate::quick::Map<u32, Seen>,
     ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
-    textures: BTreeMap<usize, u32>,
+    /// The slots viewing each texture.
+    textures: BTreeMap<usize, crate::quick::Set<u32>>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
     /// as ranges come and go (each list running heap shaders asks for all
     /// of them; rebuilt whole after every change, they cost 13-27 ms a frame,
@@ -79,7 +145,8 @@ fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
 }
 
 impl Inner {
-    fn count(&mut self, seen: &Seen, add: bool) {
+    /// Slot `index` views `seen` now (`add`) or no more.
+    fn count(&mut self, seen: &Seen, index: u32, add: bool) {
         let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
         match seen {
             Seen::Buffer(shadow, address, len, uav) => {
@@ -114,11 +181,15 @@ impl Inner {
                     }
                 }
             }
+            Seen::Texture(r) if add => {
+                self.textures.entry(*r).or_default().insert(index);
+            }
             Seen::Texture(r) => {
-                let n = self.textures.entry(*r).or_insert(0);
-                step(n);
-                if *n == 0 {
-                    self.textures.remove(r);
+                if let Some(slots) = self.textures.get_mut(r) {
+                    slots.remove(&index);
+                    if slots.is_empty() {
+                        self.textures.remove(r);
+                    }
                 }
             }
             Seen::Left(_) => {}
@@ -130,28 +201,85 @@ impl Viewed {
     /// Title slot `index` now holds `view` (none: no view), made on the
     /// host (`made`) or left without a host view.
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
-        let seen = view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) });
-        let mut inner = crate::contend::lock(&self.inner, crate::contend::Lock::Viewed);
-        if let Some(old) = inner.slots.remove(&index) {
-            inner.count(&old, false);
+        // Found before any lock is taken.
+        self.put(index, view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) }));
+    }
+
+    /// Slot `index` views `seen` now (none: nothing title memory feeds).
+    fn put(&self, index: u32, seen: Option<Seen>) {
+        // Held until the counts are changed: another change to this slot
+        // is counted after this one.
+        let mut slots = self.slots[self.slots_part(index)].lock();
+        let old = match &seen {
+            Some(seen) => slots.insert(index, seen.clone()),
+            None => slots.remove(&index),
+        };
+        // The same range or texture as before: no count changes.
+        if let (Some(old), Some(new)) = (&old, &seen)
+            && old.same(new)
+        {
+            return;
         }
-        if let Some(seen) = seen {
-            inner.count(&seen, true);
-            inner.slots.insert(index, seen);
+        for (seen, add) in [(old, false), (seen, true)] {
+            if let Some(seen) = seen
+                && let Some(part) = self.counts_part(&seen)
+            {
+                self.counts[part].lock().count(&seen, index, add);
+            }
         }
+    }
+
+    /// The part slot `index`'s entry is in.
+    fn slots_part(&self, index: u32) -> usize {
+        if in_parts() { (index / RUN) as usize % PARTS } else { 0 }
+    }
+
+    /// The part the counts of what `seen` names are in, if it is counted.
+    fn counts_part(&self, seen: &Seen) -> Option<usize> {
+        match seen {
+            Seen::Buffer(shadow, ..) => Some(self.part_of(Arc::as_ptr(shadow) as usize)),
+            Seen::Texture(r) => Some(self.part_of(*r)),
+            Seen::Left(_) => None,
+        }
+    }
+
+    /// The counts part of the copy or texture at `address`.
+    fn part_of(&self, address: usize) -> usize {
+        use std::hash::BuildHasher;
+        if in_parts() { crate::quick::Build.hash_one(address) as usize % PARTS } else { 0 }
+    }
+
+    /// With one part of each: every slot held off until dropped, as a
+    /// reader of the one lock held them off.
+    fn hold(&self) -> Option<std::sync::MutexGuard<'_, crate::quick::Map<u32, Seen>>> {
+        (!in_parts()).then(|| self.slots[0].lock())
     }
 
     /// How many title slots hold a view (tests).
     #[cfg(test)]
     pub(crate) fn slots(&self) -> usize {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).slots.len()
+        self.slots.iter().map(|part| part.lock().len()).sum()
     }
 
     /// The buffer ranges views reach, merged per host copy and kind
     /// (shader resource, unordered access): copy, start, bytes.
     #[cfg(any(test, feature = "diagnostics"))]
     fn ranges(&self) -> Vec<Hull> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).hulls.values().cloned().collect()
+        self.counts.iter().flat_map(|part| part.lock().hulls.values().cloned().collect::<Vec<_>>()).collect()
+    }
+}
+
+impl Seen {
+    /// Whether both name the same range of the same copy, or the same
+    /// texture.
+    fn same(&self, other: &Seen) -> bool {
+        match (self, other) {
+            (Seen::Buffer(a, from, len, uav), Seen::Buffer(b, from_b, len_b, uav_b)) => {
+                Arc::ptr_eq(a, b) && (from, len, uav) == (from_b, len_b, uav_b)
+            }
+            (Seen::Texture(a), Seen::Texture(b)) => a == b,
+            _ => false,
+        }
     }
 }
 
@@ -239,34 +367,40 @@ pub(crate) fn uploads(
     }
     let mut done = std::collections::HashSet::new();
     for viewed in heaps {
-        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-        for &r in inner.textures.keys() {
-            if !done.insert(r) {
-                continue;
-            }
-            // Not made (given up, or never read): nothing to bring up.
-            let Some(texture) = crate::resource::made_copy(r as This) else {
-                continue;
-            };
-            // Only what shaders read lately (the eviction pass's stamps):
-            // the heaps view thousands of textures a frame never reads, and
-            // bringing each up whenever its pages change re-uploaded about
-            // 4 GB in 30-46 world frames (runs evict2, noevict1).
-            // shortcut: a texture read again after a gap is brought up after
-            // the submission that read it, which can see bytes one refresh
-            // old (a slot the title rewrites is made fresh anyway); upload on
-            // the mark itself if that shows.
-            if !texture.used_recently() {
-                continue;
-            }
-            // Its contents are the host's since a host copy wrote it.
-            if texture.host_written.load(Relaxed) {
-                continue;
-            }
-            if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
-                && staged.insert(Arc::as_ptr(&staging))
-            {
-                work.push((staging, texture));
+        let _held = viewed.hold();
+        // Each part's textures with its lock held: a title texture is
+        // alive while it is in a part and the part is held (its release
+        // takes it out first, `forget`).
+        for part in viewed.counts.iter() {
+            let inner = part.lock();
+            for &r in inner.textures.keys() {
+                if !done.insert(r) {
+                    continue;
+                }
+                // Not made (given up, or never read): nothing to bring up.
+                let Some(texture) = crate::resource::made_copy(r as This) else {
+                    continue;
+                };
+                // Only what shaders read lately (the eviction pass's stamps):
+                // the heaps view thousands of textures a frame never reads, and
+                // bringing each up whenever its pages change re-uploaded about
+                // 4 GB in 30-46 world frames (runs evict2, noevict1).
+                // shortcut: a texture read again after a gap is brought up after
+                // the submission that read it, which can see bytes one refresh
+                // old (a slot the title rewrites is made fresh anyway); upload on
+                // the mark itself if that shows.
+                if !texture.used_recently() {
+                    continue;
+                }
+                // Its contents are the host's since a host copy wrote it.
+                if texture.host_written.load(Relaxed) {
+                    continue;
+                }
+                if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
+                    && staged.insert(Arc::as_ptr(&staging))
+                {
+                    work.push((staging, texture));
+                }
             }
         }
     }
@@ -320,11 +454,16 @@ impl Uploads {
 /// Copies the title has not written since they took it are passed by: a
 /// world submission's heaps reach ~9,000 copies, a few of them written.
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    for (shadow, address, len, _, bit) in inner.hulls.values() {
-        if !crate::watch::clean_bit(*bit) {
-            add(shadow, *address as usize, *len as usize);
-        }
+    let _held = viewed.hold();
+    // The copies written, part by part; entered without the parts' locks.
+    let mut written: Vec<(Arc<Shadow>, u64, u64)> = Vec::new();
+    for part in viewed.counts.iter() {
+        let inner = part.lock();
+        let hulls = inner.hulls.values().filter(|hull| !crate::watch::clean_bit(hull.4));
+        written.extend(hulls.map(|(shadow, address, len, ..)| (shadow.clone(), *address, *len)));
+    }
+    for (shadow, address, len) in &written {
+        add(shadow, *address as usize, *len as usize);
     }
 }
 
@@ -333,8 +472,10 @@ pub(crate) fn shown(copies: &std::collections::HashSet<usize>) -> std::collectio
     let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let mut shown = std::collections::HashSet::new();
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
-        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-        shown.extend(copies.iter().filter(|&&c| inner.ends.contains_key(&(c, false)) || inner.ends.contains_key(&(c, true))));
+        shown.extend(copies.iter().filter(|&&c| {
+            let inner = viewed.counts[viewed.part_of(c)].lock();
+            inner.ends.contains_key(&(c, false)) || inner.ends.contains_key(&(c, true))
+        }));
     }
     shown
 }
@@ -368,9 +509,23 @@ pub(crate) fn register(viewed: &Arc<Viewed>) {
 pub(crate) fn forget(resource: usize) {
     let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
-        let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.textures.remove(&resource).is_some() {
-            inner.slots.retain(|_, seen| !matches!(seen, Seen::Texture(r) if *r == resource));
+        // The slots viewing it (kept with it: going through every slot of
+        // the heap held the lock for all of them), each cleared as a slot
+        // made null is, if it still views it. Until its part has it no
+        // more: whoever holds the part then does not find it
+        // (`uploads` looks at the textures it finds there).
+        loop {
+            let slots = viewed.counts[viewed.part_of(resource)].lock().textures.get(&resource).cloned();
+            let Some(slots) = slots else { break };
+            for index in slots {
+                let mut slots = viewed.slots[viewed.slots_part(index)].lock();
+                if matches!(slots.get(&index), Some(Seen::Texture(r)) if *r == resource) {
+                    slots.remove(&index);
+                }
+                // Counted out either way: a slot that views another thing
+                // by now was counted out already, which changes nothing.
+                viewed.counts[viewed.part_of(resource)].lock().count(&Seen::Texture(resource), index, false);
+            }
         }
     }
 }
@@ -383,36 +538,41 @@ pub(crate) fn log(frames: f64) {
     let uploaded = UPLOADED.swap(0, Relaxed) as f64 / frames;
     let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
-        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut left = [0u32; KINDS.len()];
         let (mut buffers, mut textures) = (0u32, 0u32);
         // Placed textures left null: the largest at each address.
         let mut placed = std::collections::HashMap::new();
-        for seen in inner.slots.values() {
-            match seen {
-                Seen::Buffer(..) => buffers += 1,
-                Seen::Texture(_) => textures += 1,
-                Seen::Left((k, address, bytes)) => {
-                    left[*k] += 1;
-                    if *k == 2 {
-                        let b = placed.entry(*address).or_insert(0u64);
-                        *b = (*b).max(*bytes);
+        for part in viewed.slots.iter() {
+            for seen in part.lock().values() {
+                match seen {
+                    Seen::Buffer(..) => buffers += 1,
+                    Seen::Texture(_) => textures += 1,
+                    Seen::Left((k, address, bytes)) => {
+                        left[*k] += 1;
+                        if *k == 2 {
+                            let b = placed.entry(*address).or_insert(0u64);
+                            *b = (*b).max(*bytes);
+                        }
                     }
                 }
             }
         }
         let placed_mb = placed.values().sum::<u64>() as f64 / 1e6;
-        let bytes: u64 = inner.ranges.keys().map(|&(_, a, b, _)| b - a).sum();
-        drop(inner);
         let hulls = viewed.ranges();
         let uav_hulls: u64 = hulls.iter().filter(|r| r.3).map(|r| r.2).sum();
         let all_hulls: u64 = hulls.iter().map(|r| r.2).sum();
-        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let copies = {
+        // Ranges, their bytes, copies and textures, part by part (a copy's
+        // ranges are all in one part).
+        let (mut ranges, mut bytes, mut copies, mut distinct) = (0usize, 0u64, 0usize, 0usize);
+        for part in viewed.counts.iter() {
+            let inner = part.lock();
+            ranges += inner.ranges.len();
+            bytes += inner.ranges.keys().map(|&(_, a, b, _)| b - a).sum::<u64>();
             let mut c: Vec<usize> = inner.ranges.keys().map(|k| k.0).collect();
             c.dedup();
-            c.len()
-        };
+            copies += c.len();
+            distinct += inner.textures.len();
+        }
         let left: Vec<String> = KINDS.iter().zip(left).map(|(k, n)| format!("{k} {n}")).collect();
         let all = crate::shadow::all();
         let all_bytes: u64 = all.iter().map(|s| s.range().1).sum();
@@ -422,9 +582,9 @@ pub(crate) fn log(frames: f64) {
              {:.1} MB, {copies} copies), {textures} title-written textures ({} distinct); \
              left null: {} (placed textures at {} addresses, {placed_mb:.0} MB); \
              host copies of title memory: {} ({:.1} MB); hulls {:.1} MB, unordered {:.1} MB",
-            inner.ranges.len(),
+            ranges,
             bytes as f64 / 1e6,
-            inner.textures.len(),
+            distinct,
             left.join(", "),
             placed.len(),
             all.len(),
@@ -436,9 +596,128 @@ pub(crate) fn log(frames: f64) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::object::{HRESULT, S_OK};
+
+    thread_local! {
+        /// This thread keeps what heaps' slots view in one part (as
+        /// `VICTORY_VIEWED_PARTS=0`).
+        pub(crate) static ONE_PART: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Threads enter and clear what the same slots view (ranges of a few
+    /// copies, a few textures, views left null) while others read as a
+    /// submission does: once they are done, the counts of ranges, the hulls
+    /// and the textures' slots are those of a table one thread gave the
+    /// entries the slots ended with; a texture released then has no slots.
+    /// In parts and in one.
+    #[test]
+    fn what_slots_view_entered_from_several_threads_adds_up() {
+        let memory = vec![0u8; 0x4000];
+        let at = memory.as_ptr() as u64;
+        let buffers: Vec<(usize, u64)> = (0..4).map(|k| (at as usize + k, at + 0x1000 * k as u64)).collect();
+        buffers.iter().for_each(|&(resource, start)| crate::shadow::register(resource, start, 0x1000));
+        let copies: Vec<Arc<Shadow>> = buffers.iter().filter_map(|&(_, start)| crate::shadow::find(start, 0x1000)).collect();
+        let done = || buffers.iter().for_each(|&(resource, start)| crate::shadow::unregister(resource, start));
+        if copies.len() < 4 {
+            return done(); // no host GPU here
+        }
+        const SLOTS: u32 = 256;
+        // What a slot views, from a number: nothing, a range, a texture
+        // (addresses no test's resource has), a view left null.
+        let seen = |n: u64| -> Option<Seen> {
+            let k = (n >> 8) as usize;
+            match n % 8 {
+                0 => None,
+                1..=4 => {
+                    let (copy, from) = (&copies[k % 4], 0x40 * (k as u64 / 4 % 16));
+                    Some(Seen::Buffer(copy.clone(), copy.range().0 + from, 0x40 + 0x40 * (k as u64 / 64 % 4), k % 3 == 0))
+                }
+                5 | 6 => Some(Seen::Texture(0x7e57_0000_0000 + 0x100 * (k % 6))),
+                _ => Some(Seen::Left((2, 0, 0))),
+            }
+        };
+        for one in [false, true] {
+            ONE_PART.with(|o| o.set(one));
+            let viewed = Arc::new(Viewed::default());
+            register(&viewed);
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                let (stop, viewed, seen, copies) = (&stop, &viewed, &seen, &copies);
+                scope.spawn(move || {
+                    ONE_PART.with(|o| o.set(one));
+                    while !stop.load(Relaxed) {
+                        refresh(viewed, |_, _, _| {});
+                        let _ = shown(&copies.iter().map(|c| Arc::as_ptr(c) as usize).collect());
+                        let _ = viewed.ranges();
+                    }
+                });
+                let writers: Vec<_> = (0..4u64)
+                    .map(|t| {
+                        scope.spawn(move || {
+                            ONE_PART.with(|o| o.set(one));
+                            let mut n = 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(t + 1);
+                            for _ in 0..20_000 {
+                                n = n.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                                // The same slots from every thread.
+                                viewed.put(((n >> 40) % u64::from(SLOTS)) as u32, seen(n >> 16));
+                            }
+                        })
+                    })
+                    .collect();
+                writers.into_iter().for_each(|w| w.join().expect("a writer"));
+                stop.store(true, Relaxed);
+            });
+            // One thread enters what the slots ended with.
+            let alone = Viewed::default();
+            for part in viewed.slots.iter() {
+                for (&slot, seen) in part.lock().iter() {
+                    alone.put(slot, Some(seen.clone()));
+                }
+            }
+            let hulls = |v: &Viewed| {
+                let mut hulls: Vec<(usize, u64, u64, bool)> =
+                    v.ranges().iter().map(|h| (Arc::as_ptr(&h.0) as usize, h.1, h.2, h.3)).collect();
+                hulls.sort_unstable();
+                hulls
+            };
+            let textures = |v: &Viewed| {
+                let mut all: Vec<(usize, Vec<u32>)> = Vec::new();
+                for part in v.counts.iter() {
+                    all.extend(part.lock().textures.iter().map(|(r, slots)| {
+                        let mut slots: Vec<u32> = slots.iter().copied().collect();
+                        slots.sort_unstable();
+                        (*r, slots)
+                    }));
+                }
+                all.sort_unstable();
+                all
+            };
+            let ranges = |v: &Viewed| {
+                let mut all: Vec<(Range, u32)> = Vec::new();
+                for part in v.counts.iter() {
+                    all.extend(part.lock().ranges.iter().map(|(range, (n, _))| (*range, *n)));
+                }
+                all.sort_unstable();
+                all
+            };
+            assert_eq!(viewed.slots(), alone.slots(), "one part: {one}");
+            assert_eq!(ranges(&viewed), ranges(&alone), "one part: {one}");
+            assert_eq!(hulls(&viewed), hulls(&alone), "one part: {one}");
+            assert_eq!(textures(&viewed), textures(&alone), "one part: {one}");
+            assert!(!hulls(&viewed).is_empty() && !textures(&viewed).is_empty());
+            // A texture released: no slot views it, the others stay.
+            let gone = 0x7e57_0000_0000usize;
+            let before = viewed.slots();
+            let its = textures(&viewed).iter().find(|(r, _)| *r == gone).map_or(0, |(_, slots)| slots.len());
+            forget(gone);
+            assert!(textures(&viewed).iter().all(|(r, _)| *r != gone));
+            assert_eq!(viewed.slots(), before - its);
+            ONE_PART.with(|o| o.set(false));
+        }
+        done();
+    }
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::core::s;
 
@@ -534,15 +813,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         };
         let viewed = Viewed::default();
         let set = |slot: u32, range: Option<(u64, u64)>| {
-            let mut inner = viewed.inner.lock().unwrap();
-            if let Some(old) = inner.slots.remove(&slot) {
-                inner.count(&old, false);
-            }
-            if let Some((from, len)) = range {
-                let seen = Seen::Buffer(copy.clone(), at + from, len, false);
-                inner.count(&seen, true);
-                inner.slots.insert(slot, seen);
-            }
+            viewed.put(slot, range.map(|(from, len)| Seen::Buffer(copy.clone(), at + from, len, false)));
         };
         let hull = || viewed.ranges().iter().map(|h| (h.1 - at, h.2)).collect::<Vec<_>>();
         set(0, Some((0x100, 0x100)));

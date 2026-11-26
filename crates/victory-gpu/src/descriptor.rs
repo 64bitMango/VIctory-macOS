@@ -1433,6 +1433,8 @@ pub(crate) mod tests {
         const ROUNDS: u64 = 5_000;
         HEAPS_ALONE.with(|a| a.set(alone));
         ONE_LOCK.with(|one| one.set(one_lock));
+        // What the slots view in one part too (as `VICTORY_VIEWED_PARTS=0`).
+        crate::bindless::tests::ONE_PART.with(|one| one.set(one_lock));
         let page = crate::watch::PAGE;
         let pages = (SLOTS as usize * 32).div_ceil(page);
         // Each heap in pages of its own: samplers, views, and the pair one
@@ -1467,6 +1469,7 @@ pub(crate) mod tests {
             scope.spawn(move || {
                 HEAPS_ALONE.with(|a| a.set(alone));
                 ONE_LOCK.with(|one| one.set(one_lock));
+                crate::bindless::tests::ONE_PART.with(|one| one.set(one_lock));
                 let host = crate::host::host().expect("checked");
                 let mut round = 0u32;
                 while !stop.load(Relaxed) {
@@ -1485,6 +1488,7 @@ pub(crate) mod tests {
                     scope.spawn(move || {
                         HEAPS_ALONE.with(|a| a.set(alone));
                         ONE_LOCK.with(|one| one.set(one_lock));
+                        crate::bindless::tests::ONE_PART.with(|one| one.set(one_lock));
                         let null = std::ptr::null();
                         // Records of 16 samplers and of 16 placed texture
                         // views, where no heap sees them.
@@ -1601,6 +1605,7 @@ pub(crate) mod tests {
         crate::watch::tests::free(memory);
         HEAPS_ALONE.with(|a| a.set(false));
         ONE_LOCK.with(|one| one.set(false));
+        crate::bindless::tests::ONE_PART.with(|one| one.set(false));
     }
 
     /// Several threads write the same slots of a heap no sync looks at, at
