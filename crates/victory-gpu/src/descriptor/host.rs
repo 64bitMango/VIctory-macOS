@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering::{Acquire, Release, SeqCst}};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::paged::Paged;
+use super::paged::Pages;
 use super::{VIEW_TAG, View, view_at, views_current};
 use crate::host::host;
 
@@ -93,7 +93,7 @@ pub(crate) struct HostHeap {
     /// With it the view's own copy of title memory, if it has one. Paged:
     /// the title views through a fraction of the slots, and a dense table
     /// of them all was 37.7 MB, written when the heap was made.
-    kept: Mutex<Paged<Held>>,
+    kept: Pages<Held>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<DynamicSlots>,
@@ -208,6 +208,18 @@ fn sync_threads() -> usize {
         let asked = std::env::var("VICTORY_SYNC_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok());
         asked.map_or(1, |n| n.clamp(1, 16))
     })
+}
+
+/// Whether what a heap's slots hold is under a lock a page of slots
+/// (`super::paged::Pages`): unless `VICTORY_KEPT_PAGES=0`, which puts one
+/// lock before them all.
+fn kept_pages() -> bool {
+    #[cfg(test)]
+    if tests::ONE_LOCK.with(|one| one.get()) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_KEPT_PAGES"))
 }
 
 /// Whether a slot that shows nothing keeps the null view it has when its
@@ -478,7 +490,7 @@ impl HostHeap {
             by_run: [slot_locks(), sync_runs()],
             #[cfg(feature = "diagnostics")]
             noted: [zeroed32(count as usize), zeroed32(count as usize)],
-            kept: Mutex::new(Paged::new((count + extra) as usize)),
+            kept: Pages::new((count + extra) as usize, !kept_pages()),
             next: Mutex::new(DynamicSlots {
                 cursor: 0,
                 taken: vec![false; extra as usize],
@@ -823,35 +835,36 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Kept) {
-        let mut kept = crate::contend::lock(&self.kept, crate::contend::Lock::Kept);
+        #[cfg(feature = "diagnostics")]
+        let now = resource.as_ref().map(|held| windows::core::Interface::as_raw(&held.0));
         // A slot that held nothing and gets nothing is left alone (no page).
-        if let Some(slot) = kept.slot(index as usize, resource.is_some()) {
+        let old = self.kept.replace(index as usize, resource, |holds| {
             if let Some(bits) = self.held.get(index as usize / 64).filter(|_| index < self.count) {
-                // Under the lock: the bit is what the slot holds.
-                match resource.is_some() {
+                // Under the page's lock: the bit is what the slot holds.
+                match holds {
                     true => bits.fetch_or(1 << (index % 64), Release),
                     false => bits.fetch_and(!(1 << (index % 64)), Release),
                 };
             }
-            let old = std::mem::replace(slot, resource);
-            #[cfg(feature = "diagnostics")]
-            if let Some((old, _)) = &old
-                && !self.sampler
-                && slot.as_ref().map(|s| windows::core::Interface::as_raw(&s.0)) != Some(windows::core::Interface::as_raw(old))
-                // SAFETY: a live resource.
-                && unsafe { old.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
-            {
-                use windows::core::Interface;
-                let left = crate::resource::life::holders(old);
-                crate::resource::life::note(old.as_raw() as usize, crate::resource::life::SLOT, u64::from(index), left);
-            }
-            // Title threads rewrite slots while the GPU runs a submission;
-            // one of its shaders may hold the old descriptor (or read the
-            // slot at an index from wrong data): what it views is freed
-            // only once that work has run.
-            if let Some((old, _)) = old {
-                crate::host::retire(old);
-            }
+        });
+        // With no lock held: the page's lock is for the slots.
+        #[cfg(feature = "diagnostics")]
+        if let Some((old, _)) = &old
+            && !self.sampler
+            && now != Some(windows::core::Interface::as_raw(old))
+            // SAFETY: a live resource.
+            && unsafe { old.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+        {
+            use windows::core::Interface;
+            let left = crate::resource::life::holders(old);
+            crate::resource::life::note(old.as_raw() as usize, crate::resource::life::SLOT, u64::from(index), left);
+        }
+        // Title threads rewrite slots while the GPU runs a submission;
+        // one of its shaders may hold the old descriptor (or read the
+        // slot at an index from wrong data): what it views is freed
+        // only once that work has run.
+        if let Some((old, _)) = old {
+            crate::host::retire(old);
         }
     }
 
@@ -1402,12 +1415,14 @@ impl HostHeap {
     /// Of host resources `resources` (raw pointers), those a title slot
     /// views.
     pub(crate) fn viewing(&self, resources: &std::collections::HashSet<usize>) -> Vec<usize> {
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        kept.iter()
-            .take_while(|&(i, _)| i < self.count as usize)
-            .map(|(_, k)| windows::core::Interface::as_raw(&k.0) as usize)
-            .filter(|r| resources.contains(r))
-            .collect()
+        let mut viewing = Vec::new();
+        self.kept.each(self.count as usize, |_, k| {
+            let raw = windows::core::Interface::as_raw(&k.0) as usize;
+            if resources.contains(&raw) {
+                viewing.push(raw);
+            }
+        });
+        viewing
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -1418,7 +1433,7 @@ impl HostHeap {
         let key = self.made_from(index);
         // A view the host could not make leaves a null view, its record
         // noted all the same; it keeps no resource.
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some();
+        let kept = self.kept.with(index as usize, |held| held.is_some());
         if key == 0 || (!kept && !self.sampler) {
             return Some("null".into());
         }
@@ -1443,13 +1458,12 @@ impl HostHeap {
     /// slots had its list searched each time; 62,000 slots a frame, run
     /// evict3).
     pub(crate) fn evict(&self, textures: &std::collections::HashSet<usize>) {
-        let slots: Vec<u32> = {
-            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            kept.iter()
-                .filter(|(_, k)| k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)))
-                .map(|(i, _)| i as u32)
-                .collect()
-        };
+        let mut slots: Vec<u32> = Vec::new();
+        self.kept.each(usize::MAX, |i, k| {
+            if k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)) {
+                slots.push(i as u32);
+            }
+        });
         // No slot is made meanwhile, as under the one lock there was.
         let _still = self.hold_slots();
         for index in slots {
@@ -1469,12 +1483,10 @@ impl HostHeap {
 
     /// The host textures (raw pointers) slots `slots` view.
     pub(crate) fn textures_at(&self, slots: &[u32]) -> Vec<usize> {
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        slots
-            .iter()
-            .filter_map(|&i| kept.get(i as usize).filter(|k| k.1.is_none()))
-            .map(|k| windows::core::Interface::as_raw(&k.0) as usize)
-            .collect()
+        let texture = |held: Option<&Held>| {
+            held.filter(|k| k.1.is_none()).map(|k| windows::core::Interface::as_raw(&k.0) as usize)
+        };
+        slots.iter().filter_map(|&i| self.kept.with(i as usize, texture)).collect()
     }
 
     /// The view of slot `index` if it is a placed texture's left without a
@@ -1482,7 +1494,7 @@ impl HostHeap {
     pub(crate) fn unmade_placed(&self, index: u32) -> Option<View> {
         let key = self.made_from(index);
         let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some();
+        let kept = self.kept.with(index as usize, |held| held.is_some());
         (is_placed_texture(&view) && !kept).then_some(view)
     }
 
@@ -1516,7 +1528,14 @@ impl HostHeap {
     /// Whether slot `index` holds a host view of a resource (tests).
     #[cfg(test)]
     pub(crate) fn kept(&self, index: u32) -> bool {
-        self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some()
+        self.kept.with(index as usize, |held| held.is_some())
+    }
+
+    /// Whether the bit of title slot `index` says what the slot holds, as
+    /// its page in the table does (tests; with no slot being made).
+    #[cfg(test)]
+    pub(crate) fn held_agrees(&self, index: u32) -> bool {
+        self.kept(index) == self.holds(index)
     }
 }
 

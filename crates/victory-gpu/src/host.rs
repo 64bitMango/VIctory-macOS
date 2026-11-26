@@ -635,6 +635,55 @@ pub(crate) mod tests {
         }
     }
 
+    /// What a submission found of a texture a heap views is kept only until
+    /// its host texture is made or given up (not another's): given up, the
+    /// texture is found without one at the next submission, and made again,
+    /// with the new one.
+    #[test]
+    fn a_heap_texture_given_up_and_made_again_is_asked_for_again() {
+        let Some(host) = host() else { return };
+        let address = crate::watch::tests::pool(1) as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let mut object = std::ptr::null();
+        let null = std::ptr::null();
+        assert_eq!(crate::resource::create_at_address(null, address, words.as_ptr().cast(), 0, std::ptr::null(), &iid, &mut object), 0);
+        let copy = crate::resource::host_copy(object).expect("a host texture");
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        let viewed = std::sync::Arc::new(crate::bindless::Viewed::default());
+        viewed.set(0, Some(&crate::descriptor::View::Shader(object as usize, Some(desc))), true);
+        let uploads = || {
+            // No other submission uploads meanwhile.
+            let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[]);
+        };
+        copy.stamp();
+        uploads();
+        assert_eq!(viewed.known_host(object as usize), Some(std::sync::Arc::as_ptr(&copy) as usize));
+        uploads();
+        assert_eq!(viewed.known_host(object as usize), Some(std::sync::Arc::as_ptr(&copy) as usize), "kept");
+        // Another texture getting its host texture and losing it changes
+        // nothing of this one's.
+        let asked = viewed.known_asked(object as usize);
+        assert_ne!(asked, 0);
+        let mut other = std::ptr::null();
+        let other_at = crate::watch::tests::pool(1) as u64;
+        assert_eq!(crate::resource::create_at_address(null, other_at, words.as_ptr().cast(), 0, std::ptr::null(), &iid, &mut other), 0);
+        let other_copy = crate::resource::host_copy(other).expect("a host texture");
+        assert!(crate::resource::give_up_now(other), "the other given up");
+        drop(other_copy);
+        uploads();
+        assert_eq!(viewed.known_asked(object as usize), asked, "not asked again for another's");
+        assert!(crate::resource::give_up_now(object), "given up");
+        uploads();
+        assert_eq!(viewed.known_host(object as usize), None, "given up: found without one");
+        // The same one while something holds it (`copy`), or a new one.
+        let again = crate::resource::host_copy(object).expect("made again");
+        uploads();
+        assert_eq!(viewed.known_host(object as usize), Some(std::sync::Arc::as_ptr(&again) as usize), "made again: found with it");
+    }
+
     /// Textures the heaps view are brought up to date only if the title used
     /// them lately: one whose pages changed but that no shader read is not
     /// uploaded; read in the last pass, it is.
@@ -1374,7 +1423,11 @@ impl Host {
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
+        #[cfg(feature = "diagnostics")]
+        let evicting = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PrepEvictUs);
         crate::resource::evict_unused();
+        #[cfg(feature = "diagnostics")]
+        drop(evicting);
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
@@ -1385,7 +1438,11 @@ impl Host {
         // Copies of title memory outside buffers nothing asked for in a
         // while are released, after the heaps' slots are what the title
         // wrote.
+        #[cfg(feature = "diagnostics")]
+        let sweeping = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PrepSweepUs);
         crate::shadow::idle_sweep();
+        #[cfg(feature = "diagnostics")]
+        drop(sweeping);
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -1476,8 +1533,14 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        #[cfg(feature = "diagnostics")]
+        let flushing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PrepLastFlushUs);
         batch.flush();
+        #[cfg(feature = "diagnostics")]
+        drop(flushing);
         let prepared = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PrepareUs, (prepared - started).as_micros() as u64);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
@@ -4076,20 +4139,33 @@ impl Host {
 
 /// Host resources that view heap slots stopped viewing while a submission
 /// may have been running ([`retire`]).
-static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
+/// In parts, a thread's by its turn at first retiring: every slot made
+/// again retires what it viewed, from the title's recording threads and
+/// the submitting thread at once.
+static RETIRED: [Mutex<Vec<ID3D12Resource>>; 16] = [const { Mutex::new(Vec::new()) }; 16];
+
+thread_local! {
+    /// The part of [`RETIRED`] this thread retires into.
+    static RETIRES_INTO: usize = {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed) % RETIRED.len()
+    };
+}
 
 /// Keeps `resource` alive until the GPU work running now (or the next
 /// submission's) has run: title threads rewrite view heap slots while the
 /// GPU runs, and a shader that took the old descriptor still reads what it
 /// views.
 pub(crate) fn retire(resource: ID3D12Resource) {
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
+    let part = RETIRES_INTO.with(|part| *part);
+    RETIRED[part].lock().unwrap_or_else(|e| e.into_inner()).push(resource);
 }
 
 /// After a submission has run, with none running: the retired resources go.
 pub(crate) fn release_retired() {
     crate::unwaited::not_beside("C6", "retired host objects are released", String::new);
-    let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
+    let retired: Vec<ID3D12Resource> =
+        RETIRED.iter().flat_map(|part| std::mem::take(&mut *part.lock().unwrap_or_else(|e| e.into_inner()))).collect();
     if !retired.is_empty() {
         release_later(Box::new(retired));
     }

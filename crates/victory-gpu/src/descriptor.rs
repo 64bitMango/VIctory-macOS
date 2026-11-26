@@ -826,6 +826,13 @@ fn write_record(handle: u64, i: u32, generation: u32) {
     }
 }
 
+/// Times a thread waited to enter what a host heap's slot holds, and the
+/// microseconds, since last asked (`paged::WAITS`; diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn kept_waits() -> [u64; 2] {
+    [0, 1].map(|k| paged::WAITS[k].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Whether [`record`] looks a view up with the table shared before it
 /// takes it alone to enter a new one: unless `VICTORY_RECORD_SHARED=0`.
 fn record_shared() -> bool {
@@ -1563,6 +1570,11 @@ pub(crate) mod tests {
         // is left null until a shader reads its slot, which none does).
         let textures = vec![0u8; 16 << 12];
         let textures_at = textures.as_ptr() as u64;
+        // Memory of a title buffer that constant buffer views name: their
+        // slots are made at a sync and hold the buffer's host copy.
+        let constants = vec![0u8; 16 << 8];
+        let constants_at = constants.as_ptr() as u64;
+        crate::shadow::register(constants_at as usize, constants_at, 16 << 8);
         let sampler_heap = owners[0].0 as usize;
         let stop = AtomicBool::new(false);
         std::thread::scope(|scope| {
@@ -1629,6 +1641,10 @@ pub(crate) mod tests {
                             let at = start + u64::from(slot) * step;
                             match what >> 1 {
                                 2..=4 if own => create_placed_srv(null, &words, &placed(k), at),
+                                0 if views && !own && k % 2 == 1 => {
+                                    let cbv = [(constants_at + (k << 8)) as u32, ((constants_at + (k << 8)) >> 32) as u32, 256, 0];
+                                    create_cbv(null, &cbv, at);
+                                }
                                 0 if views => create_placed_srv(null, &words, &placed(k), at),
                                 0 => create_sampler(null, &sampler(k), at),
                                 1 => copy_simple(null, 1 + (k as u32 & 3), at, from(views, k.min(12)), kind),
@@ -1669,7 +1685,7 @@ pub(crate) mod tests {
         for h in 0..2 {
             let step = if h == 0 { 16 } else { 32 };
             let (raced, single) = (heap(owners[h].0).host().expect("checked"), heap(owners[h + 2].0).host().expect("checked"));
-            let mut made = 0;
+            let (mut made, mut holding) = (0, 0);
             for i in 0..SLOTS {
                 // SAFETY: a slot of the heap.
                 let record = unsafe { ((base(h) + u64::from(i) * step) as *const [u32; 3]).read_unaligned() };
@@ -1680,10 +1696,13 @@ pub(crate) mod tests {
                 assert_eq!(raced.made_key(i), key, "heap {h} slot {i}: made from its record");
                 assert_eq!(raced.made_key(i), single.made_key(i), "heap {h} slot {i}: as one thread leaves it");
                 assert_eq!(raced.kept(i), single.kept(i), "heap {h} slot {i}: holding what one thread leaves");
+                assert!(raced.held_agrees(i) && single.held_agrees(i), "heap {h} slot {i}: its bit says what it holds");
                 made += usize::from(key != 0);
+                holding += usize::from(raced.kept(i));
             }
             if h == 1 {
                 assert!(made > 0, "views were written");
+                assert!(holding > 0, "constant buffer views hold their copies");
                 assert_eq!(raced.viewed.slots(), made, "what the slots view is entered for the slots made");
                 assert_eq!(single.viewed.slots(), made);
             }
@@ -1704,6 +1723,8 @@ pub(crate) mod tests {
         assert_eq!(raced.viewed.slots(), made, "what the slots view is entered for the slots made");
         drop(unwatched);
         drop(owners);
+        crate::shadow::unregister(constants_at as usize, constants_at);
+        drop(constants);
         crate::watch::tests::free(memory);
         HEAPS_ALONE.with(|a| a.set(false));
         ONE_LOCK.with(|one| one.set(false));

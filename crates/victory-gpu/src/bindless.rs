@@ -153,8 +153,8 @@ type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
 #[derive(Default)]
 struct Inner {
     ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
-    /// The slots viewing each texture.
-    textures: BTreeMap<usize, crate::quick::Set<u32>>,
+    /// The slots viewing each texture, and its host texture as last asked.
+    textures: BTreeMap<usize, Texture>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
     /// as ranges come and go (each list running heap shaders asks for all
     /// of them; rebuilt whole after every change, they cost 13-27 ms a frame,
@@ -166,6 +166,29 @@ struct Inner {
     /// lists, and remerging the world's 130,000 ranges each time cost 0.15
     /// s per frame).
     ends: crate::quick::Map<Piece, Ends>,
+}
+
+/// A title texture some slots view: the slots, and what a submission found
+/// of it ([`uploads`]): its host texture and staging state, as of its count
+/// of host textures made and given up (`crate::resource::hosts_changed`;
+/// 0: not asked yet). Not held: a host texture given up goes when nothing
+/// else holds it, whether or not a submission looks here again (a heap no
+/// submission uses for a while would keep it, and its staging buffer,
+/// alive); one that went is asked for again.
+#[derive(Default)]
+struct Texture {
+    slots: crate::quick::Set<u32>,
+    host: Option<std::sync::Weak<crate::resource::HostTexture>>,
+    staging: Option<std::sync::Weak<crate::texture::Staging>>,
+    asked: u64,
+}
+
+/// Whether [`uploads`] keeps what it found of a texture until its host
+/// texture is made or given up: unless `VICTORY_UPLOADS_KEPT=0`, which asks
+/// for every viewed texture at every submission.
+fn uploads_kept() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::off("VICTORY_UPLOADS_KEPT"))
 }
 
 /// A copy, and the counts of its ranges' starts and ends.
@@ -232,12 +255,12 @@ impl Inner {
                 }
             }
             Seen::Texture(r) if add => {
-                self.textures.entry(*r).or_default().insert(index);
+                self.textures.entry(*r).or_default().slots.insert(index);
             }
             Seen::Texture(r) => {
-                if let Some(slots) = self.textures.get_mut(r) {
-                    slots.remove(&index);
-                    if slots.is_empty() {
+                if let Some(texture) = self.textures.get_mut(r) {
+                    texture.slots.remove(&index);
+                    if texture.slots.is_empty() {
                         self.textures.remove(r);
                     }
                 }
@@ -320,6 +343,22 @@ impl Viewed {
     /// reader of the one lock held them off.
     fn hold(&self) -> Option<std::sync::MutexGuard<'_, crate::quick::Map<u32, Seen>>> {
         (!self.parts).then(|| self.slots[0].lock())
+    }
+
+    /// The host texture [`uploads`] last found for title texture
+    /// `resource`, by address (tests).
+    #[cfg(test)]
+    pub(crate) fn known_host(&self, resource: usize) -> Option<usize> {
+        let inner = self.counts[self.part_of(resource)].lock();
+        inner.textures.get(&resource)?.host.as_ref().map(|host| host.as_ptr() as usize)
+    }
+
+    /// The count of title texture `resource` [`uploads`] last asked at
+    /// (tests; 0: not asked).
+    #[cfg(test)]
+    pub(crate) fn known_asked(&self, resource: usize) -> u64 {
+        let inner = self.counts[self.part_of(resource)].lock();
+        inner.textures.get(&resource).map_or(0, |texture| texture.asked)
     }
 
     /// How many title slots hold a view (tests).
@@ -445,7 +484,7 @@ pub(crate) fn uploads(
     // thread in a new shot, and title threads setting views waited on the
     // lock meanwhile (run evict5).
     let mut work: Vec<(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)> = Vec::new();
-    let mut staged = std::collections::HashSet::new();
+    let mut staged = crate::quick::Set::default();
     for (staging, copy) in textures {
         // A host copy wrote it in a submission made before this one (it
         // was not when the list was recorded).
@@ -456,20 +495,38 @@ pub(crate) fn uploads(
             work.push((staging.clone(), copy.clone()));
         }
     }
-    let mut done = std::collections::HashSet::new();
+    let mut done = crate::quick::Set::default();
     for viewed in heaps {
         let _held = viewed.hold();
         // Each part's textures with its lock held: a title texture is
         // alive while it is in a part and the part is held (its release
         // takes it out first, `forget`).
+        // What was found of a texture holds until its host texture is made or
+        // given up (its count read before looking): a world submission's
+        // heaps view some 2,200 textures, a few of them changed, and asking
+        // each for its host texture and staging state at each of a frame's
+        // twenty submissions was most of this function's time.
         for part in viewed.counts.iter() {
-            let inner = part.lock();
-            for &r in inner.textures.keys() {
+            let mut inner = part.lock();
+            for (&r, known) in inner.textures.iter_mut() {
                 if !done.insert(r) {
                     continue;
                 }
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::UploadsLooked, 1);
+                let now = crate::resource::hosts_changed(r as This);
+                let mut found = known.host.as_ref().and_then(std::sync::Weak::upgrade);
+                // Asked again also when the one found went (not expected
+                // while the count holds: the title texture holds its host
+                // texture until it is given up, which moves the count on).
+                if known.asked != now || !uploads_kept() || (found.is_none() && known.host.is_some()) {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::UploadsAsked, 1);
+                    found = crate::resource::made_copy(r as This);
+                    (known.host, known.staging, known.asked) = (found.as_ref().map(Arc::downgrade), None, now);
+                }
                 // Not made (given up, or never read): nothing to bring up.
-                let Some(texture) = crate::resource::made_copy(r as This) else {
+                let Some(texture) = found else {
                     continue;
                 };
                 // Only what shaders read lately (the eviction pass's stamps):
@@ -487,7 +544,13 @@ pub(crate) fn uploads(
                 if texture.host_written.load(Relaxed) {
                     continue;
                 }
-                if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
+                // Its host texture's own, made on first use (and held by it).
+                let mut staging = known.staging.as_ref().and_then(std::sync::Weak::upgrade);
+                if staging.is_none() {
+                    staging = crate::texture::staging(r as This, &texture.texture);
+                    known.staging = staging.as_ref().map(Arc::downgrade);
+                }
+                if let Some(staging) = staging
                     && staged.insert(Arc::as_ptr(&staging))
                 {
                     work.push((staging, texture));
@@ -601,7 +664,7 @@ pub(crate) fn forget(resource: usize) {
         // more: whoever holds the part then does not find it
         // (`uploads` looks at the textures it finds there).
         loop {
-            let slots = viewed.counts[viewed.part_of(resource)].lock().textures.get(&resource).cloned();
+            let slots = viewed.counts[viewed.part_of(resource)].lock().textures.get(&resource).map(|t| t.slots.clone());
             let Some(slots) = slots else { break };
             for index in slots {
                 let mut slots = viewed.slots[viewed.slots_part(index)].lock();
@@ -810,8 +873,8 @@ pub(crate) mod tests {
             let textures = |v: &Viewed| {
                 let mut all: Vec<(usize, Vec<u32>)> = Vec::new();
                 for part in v.counts.iter() {
-                    all.extend(part.lock().textures.iter().map(|(r, slots)| {
-                        let mut slots: Vec<u32> = slots.iter().copied().collect();
+                    all.extend(part.lock().textures.iter().map(|(r, texture)| {
+                        let mut slots: Vec<u32> = texture.slots.iter().copied().collect();
                         slots.sort_unstable();
                         (*r, slots)
                     }));

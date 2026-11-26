@@ -159,7 +159,11 @@ impl Host {
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
+        #[cfg(feature = "diagnostics")]
+        let evicting = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PrepEvictUs);
         crate::resource::evict_unused();
+        #[cfg(feature = "diagnostics")]
+        drop(evicting);
         let sync_started = Instant::now();
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
@@ -172,7 +176,11 @@ impl Host {
         // Copies of title memory outside buffers nothing asked for in a
         // while are released, after the heaps' slots are what the title
         // wrote.
+        #[cfg(feature = "diagnostics")]
+        let sweeping = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PrepSweepUs);
         crate::shadow::idle_sweep();
+        #[cfg(feature = "diagnostics")]
+        drop(sweeping);
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -246,8 +254,14 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        #[cfg(feature = "diagnostics")]
+        let flushing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PrepLastFlushUs);
         batch.flush();
+        #[cfg(feature = "diagnostics")]
+        drop(flushing);
         let prepared = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PrepareUs, (prepared - started).as_micros() as u64);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
         // ---- end of the copy ----

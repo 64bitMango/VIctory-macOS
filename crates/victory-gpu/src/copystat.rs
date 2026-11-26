@@ -141,8 +141,6 @@ pub(crate) enum C {
     /// for the views table; for what a heap's slots view; for the copies'
     /// registries.
     HeapsContended,
-    KeptWaitUs,
-    KeptContended,
     ViewsWaitUs,
     ViewsContended,
     ViewedWaitUs,
@@ -305,6 +303,17 @@ pub(crate) enum C {
     SlotHostNs,
     SlotViewedNs,
     SlotKeepNs,
+    /// Preparing a submission, all of it, and its steps not timed above:
+    /// giving textures up, the sweep of idle copies, the refresh batch left
+    /// at the end.
+    PrepareUs,
+    PrepEvictUs,
+    PrepSweepUs,
+    PrepLastFlushUs,
+    /// `crate::bindless::uploads`: viewed textures looked at, and those
+    /// asked for their host texture again.
+    UploadsLooked,
+    UploadsAsked,
     /// Not a counter: how many there are.
     Count,
 }
@@ -674,13 +683,14 @@ pub(crate) fn log(frames: f64) {
         c[C::SyncConstant as usize],
         c[C::SyncLeft as usize],
     );
+    let kept_waits = crate::descriptor::kept_waits().map(|n| n as f64 / frames);
     tracing::info!(
         "  lock waits per frame (time, times a thread found the lock taken): title threads writing views for the heaps' lock {:.1} ms, {:.0} (held alone by passes over the slots {:.1} ms); for what a heap's slots hold {:.1} ms, {:.0}; for the views' entries, their readers {:.1} ms, {:.0}, and for the views' index, threads recording a view {:.1} ms, {:.0} ({:.0} views recorded were held already, {:.0} new); for what a heap's slots view {:.1} ms, {:.0}; for the copies' registries {:.1} ms, {:.0}",
         ms(c[C::MirrorWaitUs as usize]),
         c[C::HeapsContended as usize],
         ms(c[C::HeapsAloneUs as usize]),
-        ms(c[C::KeptWaitUs as usize]),
-        c[C::KeptContended as usize],
+        ms(kept_waits[1]),
+        kept_waits[0],
         ms(c[C::ViewsWaitUs as usize]),
         c[C::ViewsContended as usize],
         ms(c[C::ViewIndexWaitUs as usize]),
@@ -691,6 +701,39 @@ pub(crate) fn log(frames: f64) {
         c[C::ViewedContended as usize],
         ms(c[C::CopiesWaitUs as usize]),
         c[C::CopiesContended as usize],
+    );
+    // All of preparing, by step: the lists' steps are timed with the
+    // refresh batches they flush, the last batch apart.
+    let steps = [C::StepRefreshUs, C::StepCopyUs, C::StepWorkUs, C::StepGpuWriteUs, C::StepTextureUs, C::StepHeapUs, C::StepMemoryUs];
+    let lists: f64 = steps.iter().map(|&step| c[step as usize]).sum();
+    let known = c[C::PrepEvictUs as usize]
+        + c[C::SyncHeapsUs as usize]
+        + c[C::PrepSweepUs as usize]
+        + c[C::UploadsUs as usize]
+        + lists
+        + c[C::PreludeUs as usize]
+        + c[C::PrepLastFlushUs as usize];
+    tracing::info!(
+        "  preparing, all of it per frame: {:.1} ms = giving textures up {:.1} + heap syncs {:.1} + the sweep of idle copies {:.1} + heap texture uploads {:.1} ({:.0} viewed textures looked at, {:.0} asked for their host texture) + the lists' steps {:.1} (refresh {:.1}, copy {:.1}, work {:.1}, GPU writes {:.1}, textures {:.1}, heaps' hulls {:.1}, title memory {:.1}; {:.1} of it in refresh batches) + state preludes {:.1} + the last refresh batch {:.1} + the rest {:.1}",
+        ms(c[C::PrepareUs as usize]),
+        ms(c[C::PrepEvictUs as usize]),
+        ms(c[C::SyncHeapsUs as usize]),
+        ms(c[C::PrepSweepUs as usize]),
+        ms(c[C::UploadsUs as usize]),
+        c[C::UploadsLooked as usize],
+        c[C::UploadsAsked as usize],
+        ms(lists),
+        ms(c[C::StepRefreshUs as usize]),
+        ms(c[C::StepCopyUs as usize]),
+        ms(c[C::StepWorkUs as usize]),
+        ms(c[C::StepGpuWriteUs as usize]),
+        ms(c[C::StepTextureUs as usize]),
+        ms(c[C::StepHeapUs as usize]),
+        ms(c[C::StepMemoryUs as usize]),
+        ms(c[C::FlushUs as usize] - c[C::PrepLastFlushUs as usize]),
+        ms(c[C::PreludeUs as usize]),
+        ms(c[C::PrepLastFlushUs as usize]),
+        ms(c[C::PrepareUs as usize] - known),
     );
     let by = |first: C| [0, 1, 2].map(|k| c[first as usize + k]);
     let ([quick_t, quick_d, quick_s], [takes_t, takes_d, takes_s]) = (by(C::SlotQuickTitle), by(C::SlotTakesTitle));

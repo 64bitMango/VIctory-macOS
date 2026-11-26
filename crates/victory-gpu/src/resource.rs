@@ -796,6 +796,10 @@ struct Resource {
     /// given up by [`evict`]); `Some(None)`: the host refused it.
     #[cfg(windows)]
     host: std::sync::Mutex<Option<Option<std::sync::Arc<HostTexture>>>>,
+    /// Moves on, under `host`'s lock, whenever `host` changes
+    /// ([`hosts_changed`]).
+    #[cfg(windows)]
+    host_changes: std::sync::atomic::AtomicU64,
     /// The creation's initial state and clear value, for the host texture.
     #[cfg(windows)]
     made_with: (u32, Option<[u32; 5]>),
@@ -1107,6 +1111,16 @@ pub(crate) fn host_resource(this: This) -> Option<windows::Win32::Graphics::Dire
         return None;
     }
     resource(this).host().map(|h| h.texture.clone())
+}
+
+/// A count of title texture `this` that moves on whenever it gets its host
+/// texture or loses it: what [`made_copy`] gave for it still holds while
+/// this is what it was before that was asked. Never 0. Its own, not one for
+/// all textures: the title's textures get and lose host textures every
+/// frame, and a count for all moved on between most submissions.
+#[cfg(windows)]
+pub(crate) fn hosts_changed(this: This) -> u64 {
+    resource(this).host_changes.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// A title texture's host copy if it is made, without making it: for work
@@ -1519,7 +1533,12 @@ impl Resource {
         let clear = clear.as_ref().map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast());
         let made = shared_texture(self.data() as u64, &self.desc, state, clear);
         // A texture made meanwhile by another thread is the memory's too.
-        self.host.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(made).clone()
+        let mut host = self.host.lock().unwrap_or_else(|e| e.into_inner());
+        let made = host.get_or_insert(made).clone();
+        // With the lock held: whoever reads the count before it looks finds
+        // this, or a count that has moved on (`hosts_changed`).
+        self.host_changes.fetch_add(1, std::sync::atomic::Ordering::Release);
+        made
     }
 
     fn data(&self) -> *mut u8 {
@@ -1787,6 +1806,7 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
             let mut h = resource(r as This).host.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(&*h, Some(Some(x)) if std::sync::Arc::ptr_eq(x, t)) {
                 *h = None;
+                resource(r as This).host_changes.fetch_add(1, std::sync::atomic::Ordering::Release);
             }
         }
         if let Some(k) = t.key {
@@ -1835,6 +1855,8 @@ fn hand_out_resource(
         backing,
         #[cfg(windows)]
         host: std::sync::Mutex::new(None),
+        #[cfg(windows)]
+        host_changes: std::sync::atomic::AtomicU64::new(1),
         // The clear value names the format too: format, then color or
         // depth and stencil (5 words), kept for when the texture is made.
         #[cfg(windows)]
