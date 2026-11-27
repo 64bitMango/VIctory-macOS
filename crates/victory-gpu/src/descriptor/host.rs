@@ -280,7 +280,7 @@ fn stale_left() -> bool {
 }
 
 /// Whether heap syncs leave the new records of draws' tables to the draws
-/// (`VICTORY_TABLES_TO_DRAWS=1`; off by default until measured). A slot a
+/// (on by default since the A/B: heap syncs 24.1 -> 19.2 ms; `VICTORY_TABLES_TO_DRAWS=0` turns it off). A slot a
 /// draw read through a table in the last [`TABLED_FRAMES`] frames is a
 /// table's: when its record changes, a sync passes it by, and the draw that
 /// reads it makes it (`made_already` finds it not made from its record).

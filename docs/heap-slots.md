@@ -190,7 +190,7 @@ new `left as they were` count, `heaps' hulls`, refresh batch ms and MB,
 
 ## Stage 2 of the revised plan: write marks, and draws' table records
 
-Both are off by default until an A/B run measures them.
+Draws' table records left to the draws is on by default (`VICTORY_TABLES_TO_DRAWS=0` turns it off); write marks stay off by default (`VICTORY_WRITE_MARKS=1`), since small coverage gaps remain.
 
 ### Write marks at the source (`VICTORY_WRITE_MARKS=1`)
 
