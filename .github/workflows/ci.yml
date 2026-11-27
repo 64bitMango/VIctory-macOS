@@ -31,9 +31,15 @@ jobs:
       - name: Clippy, diagnostics build
         run: cargo clippy --workspace --all-targets --all-features --locked
       # Includes xtask's repository_passes_policy, the asset-policy check.
+      # Every crate's tests, even after one fails. victory-gpu's without a
+      # GPU device: the runners have none, and WARP crashes in its tests
+      # (#39).
       - name: Tests
-        # Every crate's tests, even after one fails. Without a GPU device:
-        # the runners have none, and WARP crashes in the GPU tests (#39).
         env:
           VICTORY_NO_GPU: "1"
-        run: cargo test --workspace --locked --no-fail-fast
+        run: cargo test --workspace --exclude victory-shader --locked --no-fail-fast
+      # The shader tests need a device and take WARP's; one at a time, so a
+      # crash names its test (#39).
+      - name: Tests, shader translator
+        if: success() || failure()
+        run: cargo test -p victory-shader --locked -- --test-threads=1

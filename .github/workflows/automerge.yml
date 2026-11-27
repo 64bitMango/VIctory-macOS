@@ -118,9 +118,11 @@ jobs:
             fi
             # Both paths of a renamed file: moving a protected file elsewhere
             # changes it as much as editing it.
-            touched=$(gh api --paginate "repos/$REPO/pulls/$n/files" \
-              --jq '.[] | .filename, (.previous_filename // empty)' \
-              | grep -E "$PROTECTED" || true)
+            if ! files=$(gh api --paginate "repos/$REPO/pulls/$n/files" \
+                --jq '.[] | .filename, (.previous_filename // empty)'); then
+              echo "#$n: could not list its files"; continue
+            fi
+            touched=$(grep -E "$PROTECTED" <<<"$files" || true)
             if [ -n "$touched" ]; then
               echo "#$n: touches paths that need the maintainer:"; echo "$touched"; continue
             fi

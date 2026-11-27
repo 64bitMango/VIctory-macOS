@@ -127,11 +127,6 @@ impl Host {
     /// A software default adapter (a machine without a GPU, as CI) is
     /// refused, so hardware-only checks never run on WARP.
     pub fn new(warp: bool) -> Result<Self, String> {
-        // `VICTORY_NO_GPU=1`: no device, so the tests that need one skip
-        // themselves; CI sets it, as its runners' WARP crashes in them (#39).
-        if std::env::var("VICTORY_NO_GPU").is_ok_and(|v| v != "0") {
-            return Err("VICTORY_NO_GPU is set".into());
-        }
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {

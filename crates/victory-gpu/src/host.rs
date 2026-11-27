@@ -189,7 +189,8 @@ pub(crate) fn host() -> Option<&'static Host> {
 
 fn create() -> windows::core::Result<Host> {
     // `VICTORY_NO_GPU=1`: no host device, as on a machine without one; CI
-    // sets it, as its runners' WARP crashes in the tests (#39).
+    // sets it for victory-gpu, as its runners' WARP crashes in the tests
+    // (#39).
     if crate::switch::on("VICTORY_NO_GPU") {
         return Err(windows::core::Error::empty());
     }
@@ -788,6 +789,13 @@ pub(crate) mod tests {
 
     #[test]
     fn warp_adapter_accepts_only_software() {
+        // `VICTORY_NO_GPU=1` (CI, #39): no adapter and no host device at all.
+        // Without it (or with `0`) the probe below runs as on any machine.
+        if crate::switch::on("VICTORY_NO_GPU") {
+            assert!(warp_adapter().is_err(), "VICTORY_NO_GPU leaves no WARP adapter");
+            assert!(create().is_err(), "VICTORY_NO_GPU leaves no host device");
+            return;
+        }
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
         let raw = unsafe {
