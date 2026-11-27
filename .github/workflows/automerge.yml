@@ -8,9 +8,9 @@
 # - Greptile's latest verdict is not an approval of the head commit;
 # - the maintainer's latest verdict is "changes requested";
 # - CI's `check` job has not passed on the head commit;
-# - it touches CI, the policy check, build config, dependencies or tools/,
-#   which always need the maintainer (Greptile's own config excludes these
-#   paths too).
+# - it touches CI, the policy check, build config, dependencies or tools/
+#   (a renamed file by its old path or its new one), which always need the
+#   maintainer (Greptile's own config excludes these paths too).
 name: Auto-merge
 
 on:
@@ -79,7 +79,14 @@ jobs:
             if ! jq -e 'length > 0 and all(. == "success")' <<<"$ci" >/dev/null; then
               echo "#$n: CI has not passed on $sha ($ci)"; continue
             fi
-            touched=$(gh api --paginate "repos/$REPO/pulls/$n/files" --jq '.[].filename' \
+            # The files API lists at most 3000 files: past that, some go unseen.
+            if [ "$(jq -r .changed_files <<<"$pr")" -gt 3000 ]; then
+              echo "#$n: too many files to check"; continue
+            fi
+            # Both paths of a renamed file: moving a protected file elsewhere
+            # changes it as much as editing it.
+            touched=$(gh api --paginate "repos/$REPO/pulls/$n/files" \
+              --jq '.[] | .filename, (.previous_filename // empty)' \
               | grep -E "$PROTECTED" || true)
             if [ -n "$touched" ]; then
               echo "#$n: touches paths that need the maintainer:"; echo "$touched"; continue
