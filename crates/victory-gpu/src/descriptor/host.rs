@@ -975,9 +975,21 @@ impl HostHeap {
                 let key = key.load(Acquire);
                 let view = (key != 0)
                     .then(|| {
-                        self.retained_views
-                            .with(i, |v| v.cloned())
-                            .or_else(|| view_at(key as u32, (key >> 32) as u32))
+                        let generation = (key >> 32) as u32;
+                        let is_placed = matches!(
+                            generation >> super::KIND_SHIFT,
+                            super::PLACED | super::SCRATCH_PLACED
+                        );
+                        if is_placed {
+                            self.retained_views
+                                .with(i, |v| match v {
+                                    Some(View::Placed(..)) => v.cloned(),
+                                    _ => None,
+                                })
+                                .or_else(|| view_at(key as u32, generation))
+                        } else {
+                            view_at(key as u32, generation)
+                        }
                     })
                     .flatten();
                 write_address(data, i, view.as_ref());
@@ -1571,7 +1583,8 @@ impl HostHeap {
             entry.store(was, SeqCst);
             return Made::Needs(view, record);
         }
-        self.retained_views.replace(index as usize, Some(view.clone()), |_| {});
+        let placed = matches!(view, View::Placed(..));
+        self.retained_views.replace(index as usize, placed.then(|| view.clone()), |_| {});
         self.set_stride(index, Some(&view));
         self.note_address(index, Some(&view));
         if later {
