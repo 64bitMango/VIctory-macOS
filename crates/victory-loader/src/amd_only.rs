@@ -340,6 +340,16 @@ fn xmm_to_stack(x: u8, out: &mut Vec<u8>) {
     }
 }
 
+/// `movdqu xmm, [rsp]` (`f3 0f 6f 04 24`), both halves of the register
+/// back where [`xmm_to_stack`] saved them.
+fn stack_to_xmm(x: u8, out: &mut Vec<u8>) {
+    if x >= 8 {
+        out.extend([0xf3, 0x44, 0x0f, 0x6f, 0x04 | (x & 7) << 3, 0x24]);
+    } else {
+        out.extend([0xf3, 0x0f, 0x6f, 0x04 | (x & 7) << 3, 0x24]);
+    }
+}
+
 /// The low qword of `rax` into the low half of `xmm` (`movq` zeroes the
 /// upper one) with its high half as it was: the register saved under the
 /// space the stub's `sub rsp` made, written, and its high half read back
@@ -381,13 +391,37 @@ fn fields_and_mask(out: &mut Vec<u8>) {
 /// after it. It leaves every other register, the flags and memory as the
 /// instruction does (it changes none but its target).
 ///
+/// The immediate forms' field, the length and index, is the instruction's
+/// own bytes, a constant here: its mask is folded into the code, and
+/// nothing computes it at every pass.
+///
 /// ```text
-/// extrq, both forms, the field known (the immediate form) or read
-/// (the register form) at run:
+/// extrq, the immediate form (the target saved under the space the
+/// stub's `sub rsp` made, both halves, its low half shifted and masked,
+/// written back, its high half kept):
+///   pushfq; push rax, rdx; sub rsp, 16
+///   movdqu [rsp], the target; mov rax, [rsp]
+///   shr rax, the index; movabs rdx, the mask; and rax, rdx
+///   mov [rsp], rax; movdqu the target, [rsp]
+///   add rsp, 16; pop rdx, rax; popfq; jmp the instruction after
+///
+/// insertq, the immediate form (the source's masked field into the
+/// destination's low qword, the destination's high half kept):
+///   pushfq; push rax, rcx, rdx; sub rsp, 16
+///   movdqu [rsp], the destination
+///   mov rax, [rsp] (the source is the destination) or movq rax, the source
+///   movabs rdx, the mask; and rax, rdx; shl rax, the index
+///   movabs rdx, the mask's complement at the index
+///   mov rcx, [rsp]; and rcx, rdx; or rcx, rax; mov [rsp], rcx
+///   movdqu the destination, [rsp]
+///   add rsp, 16; pop rdx, rcx, rax; popfq; jmp the instruction after
+///
+/// extrq and insertq, the register form (the field read at run, from the
+/// source's low or high half, so its mask is made of it):
 ///   pushfq; push rax, rcx, rdx, r8, r9; sub rsp, 16
-///   [mov rax, the length and index as one word]     the immediate form's
+///   [mov rax, the length and index as one word]     extrq: the low half
 ///   movdqu [rsp], the source; mov rax, [rsp]        extrq: the low half
-///   or mov rax, [rsp + 8]                          insertq: the high
+///   or mov rax, [rsp + 8]                           insertq: the high
 ///   movzx edx, al; movzx ecx, ah; and both, 63; the index to r9
 ///   mov r8, 64 - the length; shr rdx (-1), r8      the mask
 ///   movq rax, the target; shr rax, r9; and rax, rdx
@@ -404,79 +438,127 @@ fn fields_and_mask(out: &mut Vec<u8>) {
 /// or-ed in.
 pub(crate) fn sse4a_stub(s: &Sse4aSite, code_at: u64, stub: u64) -> Option<Vec<u8>> {
     let mut out = Vec::new();
-    out.extend([
-        0x9c, // pushfq
-        0x50, 0x51, 0x52, // push rax, rcx, rdx
-        0x41, 0x50, 0x41, 0x51, // push r8, r9
-        0x48, 0x83, 0xec, 0x10, // sub rsp, 16
-    ]);
     if s.immediate {
-        // The field as a constant: the length and index bytes as one word.
-        out.extend([0x48, 0xb8]);
-        out.extend([s.len_imm, s.at_imm, 0, 0, 0, 0, 0, 0]);
+        // The instruction's own length and index bytes, masked to the six
+        // bits it reads, with the length's zero the whole qword.
+        let bits = if s.len_imm & 63 == 0 {
+            64
+        } else {
+            u64::from(s.len_imm & 63)
+        };
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1 << bits) - 1
+        };
+        let at = s.at_imm & 63;
+        if s.prefix == 0x66 {
+            // extrq: the target is the register the modrm names.
+            let target = s.src;
+            out.extend([0x9c, 0x50, 0x52, 0x48, 0x83, 0xec, 0x10]);
+            xmm_to_stack(target, &mut out);
+            out.extend([0x48, 0x8b, 0x04, 0x24]); // mov rax, [rsp]
+            out.extend([0x48, 0xc1, 0xe8, at]); // shr rax, the index
+            out.extend([0x48, 0xba]); // movabs rdx, the mask
+            out.extend(mask.to_le_bytes());
+            out.extend([0x48, 0x21, 0xd0]); // and rax, rdx
+            out.extend([0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
+            stack_to_xmm(target, &mut out);
+            out.extend([0x48, 0x83, 0xc4, 0x10, 0x5a, 0x58, 0x9d]);
+        } else {
+            // insertq: the source's masked field into the destination.
+            out.extend([0x9c, 0x50, 0x51, 0x52, 0x48, 0x83, 0xec, 0x10]);
+            xmm_to_stack(s.dst, &mut out);
+            if s.src == s.dst {
+                out.extend([0x48, 0x8b, 0x04, 0x24]); // mov rax, [rsp]
+            } else {
+                xmm_rax(s.src, true, &mut out); // movq rax, the source
+            }
+            out.extend([0x48, 0xba]); // movabs rdx, the mask
+            out.extend(mask.to_le_bytes());
+            out.extend([0x48, 0x21, 0xd0]); // and rax, rdx
+            out.extend([0x48, 0xc1, 0xe0, at]); // shl rax, the index
+            out.extend([0x48, 0xba]); // movabs rdx, the mask's complement
+            let clear = !(mask << u64::from(at));
+            out.extend(clear.to_le_bytes());
+            out.extend([0x48, 0x8b, 0x0c, 0x24]); // mov rcx, [rsp]
+            out.extend([
+                0x48, 0x21, 0xd1, // and rcx, rdx
+                0x48, 0x09, 0xc1, // or rcx, rax
+                0x48, 0x89, 0x0c, 0x24, // mov [rsp], rcx
+            ]);
+            stack_to_xmm(s.dst, &mut out);
+            out.extend([0x48, 0x83, 0xc4, 0x10, 0x5a, 0x59, 0x58, 0x9d]);
+        }
     } else {
+        out.extend([
+            0x9c, // pushfq
+            0x50, 0x51, 0x52, // push rax, rcx, rdx
+            0x41, 0x50, 0x41, 0x51, // push r8, r9
+            0x48, 0x83, 0xec, 0x10, // sub rsp, 16
+        ]);
         xmm_to_stack(s.src, &mut out);
         if s.prefix == 0x66 {
             out.extend([0x48, 0x8b, 0x04, 0x24]); // mov rax, [rsp]
         } else {
             out.extend([0x48, 0x8b, 0x44, 0x24, 0x08]); // mov rax, [rsp + 8]
         }
-    }
-    fields_and_mask(&mut out);
-    if s.prefix == 0x66 {
-        let target = if s.immediate { s.src } else { s.dst };
-        out.extend([
-            0x4c, 0x89, 0xc9, // mov rcx, r9
-        ]);
-        xmm_rax(target, true, &mut out);
-        out.extend([
-            0x48, 0xd3, 0xe8, // shr rax, cl
-            0x48, 0x21, 0xd0, // and rax, rdx
-        ]);
-        rax_into_xmm_low(target, &mut out);
-    } else {
-        xmm_rax(s.src, true, &mut out);
-        out.extend([
-            0x48, 0x21, 0xd0, // and rax, rdx
-            0x4c, 0x89, 0xc9, // mov rcx, r9
-            0x48, 0xd3, 0xe0, // shl rax, cl
-            0x48, 0xd3, 0xe2, // shl rdx, cl
-            0x48, 0xf7, 0xd2, // not rdx
-        ]);
-        // movq rcx, the destination: the low qword the field goes into.
-        out.extend([0x66]);
-        if s.dst >= 8 {
-            out.extend([0x4c]);
+        fields_and_mask(&mut out);
+        if s.prefix == 0x66 {
+            let target = s.dst;
+            out.extend([
+                0x4c, 0x89, 0xc9, // mov rcx, r9
+            ]);
+            xmm_rax(target, true, &mut out);
+            out.extend([
+                0x48, 0xd3, 0xe8, // shr rax, cl
+                0x48, 0x21, 0xd0, // and rax, rdx
+            ]);
+            rax_into_xmm_low(target, &mut out);
         } else {
-            out.extend([0x48]);
+            xmm_rax(s.src, true, &mut out);
+            out.extend([
+                0x48, 0x21, 0xd0, // and rax, rdx
+                0x4c, 0x89, 0xc9, // mov rcx, r9
+                0x48, 0xd3, 0xe0, // shl rax, cl
+                0x48, 0xd3, 0xe2, // shl rdx, cl
+                0x48, 0xf7, 0xd2, // not rdx
+            ]);
+            // movq rcx, the destination: the low qword the field goes into.
+            out.extend([0x66]);
+            if s.dst >= 8 {
+                out.extend([0x4c]);
+            } else {
+                out.extend([0x48]);
+            }
+            out.extend([0x0f, 0x7e, 0xc0 | (s.dst & 7) << 3 | 1]);
+            out.extend([
+                0x48, 0x21, 0xd1, // and rcx, rdx
+                0x48, 0x09, 0xc1, // or rcx, rax
+            ]);
+            // The destination's low half from rcx, its high half as it was.
+            let dst = s.dst;
+            xmm_to_stack(dst, &mut out);
+            out.extend([0x66]);
+            if dst >= 8 {
+                out.extend([0x4c]);
+            } else {
+                out.extend([0x48]);
+            }
+            out.extend([0x0f, 0x6e, 0xc0 | (dst & 7) << 3 | 1]);
+            out.push(0x66);
+            if dst >= 8 {
+                out.push(0x44);
+            }
+            out.extend([0x0f, 0x16, 0x44 | (dst & 7) << 3, 0x24, 0x08]);
         }
-        out.extend([0x0f, 0x7e, 0xc0 | (s.dst & 7) << 3 | 1]);
         out.extend([
-            0x48, 0x21, 0xd1, // and rcx, rdx
-            0x48, 0x09, 0xc1, // or rcx, rax
+            0x48, 0x83, 0xc4, 0x10, // add rsp, 16
+            0x41, 0x59, 0x41, 0x58, // pop r9, r8
+            0x5a, 0x59, 0x58, // pop rdx, rcx, rax
+            0x9d, // popfq
         ]);
-        // The destination's low half from rcx, its high half as it was.
-        let dst = s.dst;
-        xmm_to_stack(dst, &mut out);
-        out.extend([0x66]);
-        if dst >= 8 {
-            out.extend([0x4c]);
-        } else {
-            out.extend([0x48]);
-        }
-        out.extend([0x0f, 0x6e, 0xc0 | (dst & 7) << 3 | 1]);
-        out.push(0x66);
-        if dst >= 8 {
-            out.push(0x44);
-        }
-        out.extend([0x0f, 0x16, 0x44 | (dst & 7) << 3, 0x24, 0x08]);
     }
-    out.extend([
-        0x48, 0x83, 0xc4, 0x10, // add rsp, 16
-        0x41, 0x59, 0x41, 0x58, // pop r9, r8
-        0x5a, 0x59, 0x58, // pop rdx, rcx, rax
-        0x9d, // popfq
-    ]);
     let here = stub + out.len() as u64;
     out.extend(jump(here, code_at + s.at as u64 + s.len as u64)?);
     Some(out)
@@ -1048,14 +1130,26 @@ mod tests {
         assert_eq!(found[1].at, 10);
     }
 
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
     #[test]
     fn the_sse4a_stubs_shape() {
+        // pushfq; push rax, rdx; sub rsp, 16.
+        let extrq_imm = [0x9c, 0x50, 0x52, 0x48, 0x83, 0xec, 0x10];
+        // pushfq; push rax, rcx, rdx; sub rsp, 16.
+        let insertq_imm = [0x9c, 0x50, 0x51, 0x52, 0x48, 0x83, 0xec, 0x10];
         // pushfq; push rax, rcx, rdx; push r8, r9; sub rsp, 16.
-        let prologue = [
+        let reg = [
             0x9c, 0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x48, 0x83, 0xec, 0x10,
         ];
+        // add rsp, 16; pop rdx, rax; popfq.
+        let extrq_imm_end = [0x48, 0x83, 0xc4, 0x10, 0x5a, 0x58, 0x9d];
+        // add rsp, 16; pop rdx, rcx, rax; popfq.
+        let insertq_imm_end = [0x48, 0x83, 0xc4, 0x10, 0x5a, 0x59, 0x58, 0x9d];
         // add rsp, 16; pop r9, r8, rdx, rcx, rax; popfq.
-        let epilogue = [
+        let reg_end = [
             0x48, 0x83, 0xc4, 0x10, 0x41, 0x59, 0x41, 0x58, 0x5a, 0x59, 0x58, 0x9d,
         ];
         for site in [
@@ -1066,17 +1160,43 @@ mod tests {
         ] {
             let s = sse4a_site(site, 0).unwrap();
             let stub = sse4a_stub(&s, 0x1_0000, 0x9000).unwrap();
-            assert_eq!(stub[..prologue.len()], prologue, "{site:02x?}");
+            let (prologue, epilogue) = match (s.immediate, s.prefix) {
+                (true, 0x66) => (&extrq_imm[..], &extrq_imm_end[..]),
+                (true, _) => (&insertq_imm[..], &insertq_imm_end[..]),
+                (false, _) => (&reg[..], &reg_end[..]),
+            };
+            assert_eq!(stub[..prologue.len()], *prologue, "{site:02x?}");
             let back = stub.len() - 5;
-            assert_eq!(stub[back - epilogue.len()..back], epilogue, "{site:02x?}");
+            assert_eq!(stub[back - epilogue.len()..back], *epilogue, "{site:02x?}");
             assert_eq!(stub[back], 0xe9, "{site:02x?}");
             let rel = i32::from_le_bytes(stub[back + 1..].try_into().unwrap());
             let to = 0x9000 + back as i64 + 5 + i64::from(rel);
             assert_eq!(to, 0x1_0000 + s.len as i64, "{site:02x?}");
-            // The immediate form's field as one word.
+            // The immediate form's field folded to its mask, a constant of
+            // the length, the index, and the form's own clear mask.
             if s.immediate {
-                assert_eq!(stub[12..14], [0x48, 0xb8], "{site:02x?}");
-                assert_eq!(&stub[14..16], &[s.len_imm, s.at_imm], "{site:02x?}");
+                let (len, at) = (u64::from(s.len_imm & 63), u64::from(s.at_imm & 63));
+                let bits = if len == 0 { 64 } else { len };
+                let mask = if bits == 64 {
+                    u64::MAX
+                } else {
+                    (1 << bits) - 1
+                };
+                let movabs = |x: u64| {
+                    let mut v = vec![0x48, 0xba];
+                    v.extend(x.to_le_bytes());
+                    v
+                };
+                assert!(
+                    contains(&stub, &movabs(mask)),
+                    "{site:02x?}: the field's mask folded in"
+                );
+                if s.prefix == 0xf2 {
+                    assert!(
+                        contains(&stub, &movabs(!(mask << at))),
+                        "{site:02x?}: the clear mask folded in"
+                    );
+                }
             }
         }
         // Out of a jump's reach.
