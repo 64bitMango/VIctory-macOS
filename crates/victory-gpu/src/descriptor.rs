@@ -950,40 +950,43 @@ const GENERATION_MASK: u32 = (1 << KIND_SHIFT) - 1;
 const CONSTANT: u32 = 1;
 const PLACED: u32 = 2;
 const SCRATCH_PLACED: u32 = 3;
-const PLACED_SCRATCH_LIMIT: usize = 16_384;
-
-/// Scratch slots have no heap lifetime notification. Keep their most recent
-/// records in a ring, using the full sequence number to reject stale records.
+/// Scratch slots have no heap lifetime notification. Placed views outside
+/// registered heaps are deduplicated in addressable storage so live
+/// descriptors never have their views overwritten by unrelated publications.
 struct PlacedScratch {
-    list: Vec<(u64, View)>,
-    next: u64,
+    list: Vec<View>,
+    index: std::collections::BTreeMap<View, u32>,
 }
 
 static PLACED_SCRATCH: std::sync::RwLock<PlacedScratch> =
-    std::sync::RwLock::new(PlacedScratch { list: Vec::new(), next: 0 });
+    std::sync::RwLock::new(PlacedScratch {
+        list: Vec::new(),
+        index: std::collections::BTreeMap::new(),
+    });
 
 fn record_placed_scratch(handle: u64, view: View) {
-    let mut scratch = PLACED_SCRATCH.write().unwrap_or_else(|e| e.into_inner());
-    let sequence = scratch.next;
-    scratch.next += 1;
-    let index = sequence as usize % PLACED_SCRATCH_LIMIT;
-    if index == scratch.list.len() {
-        scratch.list.push((sequence, view));
-    } else {
-        scratch.list[index] = (sequence, view);
-    }
-    let [i, generation] = kind_words(SCRATCH_PLACED, sequence);
+    let id = {
+        let mut scratch = PLACED_SCRATCH.write().unwrap_or_else(|e| e.into_inner());
+        match scratch.index.get(&view) {
+            Some(&id) => id,
+            None => {
+                let id = scratch.list.len() as u32;
+                scratch.list.push(view.clone());
+                scratch.index.insert(view, id);
+                id
+            }
+        }
+    };
+    let [i, generation] = kind_words(SCRATCH_PLACED, u64::from(id));
     write_record(handle, i, generation);
-}
-
-fn scratch_entry(scratch: &PlacedScratch, sequence: u64) -> Option<&View> {
-    let (current, view) = scratch.list.get(sequence as usize % PLACED_SCRATCH_LIMIT)?;
-    (*current == sequence).then_some(view)
+    #[cfg(windows)]
+    mirror(handle);
 }
 
 fn scratch_placed_of(i: u32, generation: u32) -> Option<View> {
+    let id = payload(i, generation) as usize;
     let scratch = PLACED_SCRATCH.read().unwrap_or_else(|e| e.into_inner());
-    scratch_entry(&scratch, payload(i, generation)).cloned()
+    scratch.list.get(id).cloned()
 }
 /// Bits of a constant buffer view's address in its record: any address a
 /// program can have. The 15 bits above them are its size.
@@ -1181,6 +1184,7 @@ fn range_readable(addr: u64, len: u64) -> bool {
 /// # Safety
 /// `addr` must point to a readable 12-byte descriptor header.
 unsafe fn read_record_atomic(addr: u64) -> [u32; 3] {
+    let _slot = slot_lock(addr).lock().unwrap_or_else(|e| e.into_inner());
     use std::sync::atomic::{AtomicU32, Ordering::Acquire, Ordering::Relaxed};
     if addr.is_multiple_of(4) {
         let words = addr as *mut AtomicU32;
@@ -1426,8 +1430,9 @@ fn inline_current(i: u32, generation: u32, shapes: usize) -> bool {
     match generation >> KIND_SHIFT {
         CONSTANT => true,
         SCRATCH_PLACED => {
+            let id = payload(i, generation) as usize;
             let scratch = PLACED_SCRATCH.read().unwrap_or_else(|e| e.into_inner());
-            scratch_entry(&scratch, payload(i, generation)).is_some()
+            id < scratch.list.len()
         }
         PLACED => {
             use std::sync::atomic::Ordering::Acquire;
@@ -1457,6 +1462,10 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
+    if matches!(view, View::Placed(..)) && !in_view_heap(handle) {
+        record_placed_scratch(handle, view);
+        return;
+    }
     // A view its record names whole needs neither the index nor an entry.
     if let Some(([i, generation], pinned)) = inline_words(&view) {
         write_record(handle, i, generation);
@@ -1469,11 +1478,7 @@ fn record(handle: u64, view: View) {
         mirror(handle);
         return;
     }
-    if view_inline() && matches!(view, View::Placed(..)) && !in_view_heap(handle) {
-        record_placed_scratch(handle, view);
-    } else {
-        record_table(handle, view);
-    }
+    record_table(handle, view);
 }
 
 /// Records `view` as a table entry in [`VIEWS`] at `handle` (never inlined).
@@ -1545,17 +1550,29 @@ fn record_table(handle: u64, view: View) {
     mirror(handle);
 }
 
+const SLOT_LOCK_COUNT: usize = 1024;
+static SLOT_LOCKS: [std::sync::Mutex<()>; SLOT_LOCK_COUNT] =
+    [const { std::sync::Mutex::new(()) }; SLOT_LOCK_COUNT];
+
+fn slot_lock(handle: u64) -> &'static std::sync::Mutex<()> {
+    let mut h = handle.wrapping_mul(0x9e3779b97f4a7c15);
+    h ^= h >> 32;
+    &SLOT_LOCKS[(h as usize) % SLOT_LOCK_COUNT]
+}
+
 /// Writes the record of view entry `i`, generation `generation`, at `handle`:
-/// the tag, then the entry and its generation in one store of eight bytes.
-/// Publishes a view header using atomic words so the shape sweep can scan
-/// aligned slots while other threads record views.
+/// the entry and its generation, then the tag published with release ordering.
+/// Publishes a view header using atomic words under a per-slot lock so concurrent
+/// same-slot writers never mix fields or interleave stores.
 fn write_record(handle: u64, i: u32, generation: u32) {
     let _writes = SHAPE_WRITES.read().unwrap_or_else(|e| e.into_inner());
+    let _slot = slot_lock(handle).lock().unwrap_or_else(|e| e.into_inner());
     use std::sync::atomic::{AtomicU32, Ordering::Relaxed, Ordering::Release};
     if handle.is_multiple_of(4) {
         let words = handle as *mut AtomicU32;
         // SAFETY: `handle` is a 4-byte-aligned descriptor slot, at least 16 bytes.
         unsafe {
+            (*words).store(0, Release);
             (*words.add(1)).store(i, Relaxed);
             (*words.add(2)).store(generation, Relaxed);
             (*words).store(VIEW_TAG, Release);
@@ -1563,8 +1580,9 @@ fn write_record(handle: u64, i: u32, generation: u32) {
     } else {
         // SAFETY: the handle is a descriptor slot, at least 16 bytes.
         unsafe {
-            (handle as *mut u32).write_unaligned(VIEW_TAG);
+            (handle as *mut u32).write_unaligned(0);
             ((handle + 4) as *mut u64).write_unaligned(u64::from(generation) << 32 | u64::from(i));
+            (handle as *mut u32).write_unaligned(VIEW_TAG);
         }
     }
 }
@@ -1690,7 +1708,7 @@ pub(crate) fn view(handle: u64) -> Option<View> {
         return None;
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    let [tag, i, generation] = unsafe { read_record_atomic(handle) };
     if tag != VIEW_TAG {
         return None;
     }
@@ -1825,6 +1843,7 @@ fn preserve_copied_placed(slot: u64, step: u64) -> bool {
         PLACED if !in_view_heap(slot) => {
             if let Some(view) = placed_of(i, generation) {
                 record_placed_scratch(slot, view);
+                return true;
             }
         }
         SCRATCH_PLACED if in_view_heap(slot) => {
@@ -2252,10 +2271,8 @@ pub(crate) mod tests {
         assert_eq!(heaps, [(10, 20, 2)]);
     }
 
-    #[cfg(windows)]
     struct HeapOwner(This);
 
-    #[cfg(windows)]
     impl Drop for HeapOwner {
         fn drop(&mut self) {
             if !self.0.is_null() {
@@ -2264,7 +2281,6 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(windows)]
     fn owner(desc: HeapDesc, placement: Placement) -> HeapOwner {
         let mut this = std::ptr::null();
         assert_eq!(create(desc, placement, &mut this), S_OK);
@@ -2399,15 +2415,19 @@ pub(crate) mod tests {
             return;
         }
         let null = std::ptr::null();
-        let mut slots = [0u64; 8];
-        let at = slots.as_mut_ptr() as u64;
-        let scratch = at + 32;
+        let heap_owner = owner(
+            HeapDesc { kind: VIEWS_KIND, count: 8, flags: SHADER_VISIBLE, nodes: 1 },
+            Placement { address: 0, size: 0 },
+        );
+        let at = heap(heap_owner.0).start;
+        let mut scratch_slots = [0u64; 8];
+        let scratch = scratch_slots.as_mut_ptr() as u64;
         let mut first_copy = None;
         // A resource description and a view no other test uses.
         let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
         let addresses = 0x6_0000_0000..0x6_1000_0000;
-        // SAFETY: a slot of `slots`.
+        // SAFETY: a slot of the heap.
         let record = || unsafe { (at as *const [u32; 3]).read_unaligned() };
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
@@ -2422,8 +2442,8 @@ pub(crate) mod tests {
             copy_simple(null, 1, scratch, at, VIEWS_KIND);
             assert_eq!(view(scratch), Some(View::Placed(false, resource, desc)));
             if first_copy.is_none() {
-                // SAFETY: `scratch` is the second 32-byte slot of `slots`.
-                first_copy = Some(unsafe { read_record_atomic(scratch) });
+                // SAFETY: `scratch` is a 32-byte scratch slot.
+                first_copy = Some((unsafe { read_record_atomic(scratch) }, desc));
             }
         }
         assert_eq!(address_entries(addresses.clone(), resource), (0, 1), "no entries, one shape for 20,000 placed views");
@@ -2431,13 +2451,19 @@ pub(crate) mod tests {
         create_placed_uav(null, &resource, &desc, at);
         assert_eq!(view(at), Some(View::Placed(true, resource, desc)));
         assert_eq!(address_entries(addresses.clone(), resource), (0, 2));
-        let [_, i, generation] = first_copy.unwrap();
-        assert!(view_at(i, generation).is_none(), "the oldest scratch copy was evicted");
-        // A scratch view past 1 TiB also uses the bounded cache.
+        let ([_, i, generation], first_desc) = first_copy.unwrap();
+        assert_eq!(
+            view_at(i, generation),
+            Some(View::Placed(false, resource, first_desc)),
+            "scratch copy remains addressable and is never overwritten"
+        );
+        // A scratch view past 1 TiB also uses scratch storage.
         (desc[10], desc[11]) = (0, 0x100);
-        create_placed_srv(null, &resource, &desc, at);
-        assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
-        assert_eq!(record()[2] >> KIND_SHIFT, SCRATCH_PLACED);
+        create_placed_srv(null, &resource, &desc, scratch);
+        assert_eq!(view(scratch), Some(View::Placed(false, resource, desc)));
+        // SAFETY: `scratch` is a 32-byte slot.
+        let scratch_record = unsafe { read_record_atomic(scratch) };
+        assert_eq!(scratch_record[2] >> KIND_SHIFT, SCRATCH_PLACED);
         assert_eq!(address_entries(addresses.clone(), resource), (0, 2));
         // A placed record of a shape not made yet names nothing.
         let unknown = placed_words(SHAPE_LIMIT as u32 - 1, 0x1000);
@@ -2563,7 +2589,11 @@ pub(crate) mod tests {
         assert!(!shapes.free.contains(&idx));
 
         // A scratch copy keeps resolving after its source shape is reclaimed.
-        let mut src_slot = [0u64; 4];
+        let src_heap = owner(
+            HeapDesc { kind: VIEWS_KIND, count: 4, flags: SHADER_VISIBLE, nodes: 1 },
+            Placement { address: 0, size: 0 },
+        );
+        let src_slot = heap(src_heap.0).start;
         let mut dst_slot = [0u64; 4];
         let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee8_0000 + k as u32);
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a78_0000 + k as u32);
@@ -2572,16 +2602,16 @@ pub(crate) mod tests {
             std::ptr::null(),
             &resource,
             &desc,
-            src_slot.as_mut_ptr() as u64,
+            src_slot,
         );
         // SAFETY: `src_slot` holds a 32-byte record.
-        let [_, src_i, src_generation] = unsafe { read_record_atomic(src_slot.as_ptr() as u64) };
+        let [_, src_i, src_generation] = unsafe { read_record_atomic(src_slot) };
         assert_eq!(src_generation >> KIND_SHIFT, PLACED);
         copy_simple(
             std::ptr::null(),
             1,
             dst_slot.as_mut_ptr() as u64,
-            src_slot.as_mut_ptr() as u64,
+            src_slot,
             VIEWS_KIND,
         );
         // SAFETY: `dst_slot` holds a 32-byte record.
@@ -2606,6 +2636,80 @@ pub(crate) mod tests {
             view(dst_slot.as_ptr() as u64),
             Some(View::Placed(false, resource, desc))
         );
+        let dst_heap = owner(
+            HeapDesc { kind: VIEWS_KIND, count: 4, flags: SHADER_VISIBLE, nodes: 1 },
+            Placement { address: 0, size: 0 },
+        );
+        let heap_slot = heap(dst_heap.0).start;
+        // SAFETY: `dst_slot` and `heap_slot` are both 32-byte descriptor slots.
+        unsafe {
+            std::ptr::copy(dst_slot.as_ptr() as *const u8, heap_slot as *mut u8, 32);
+        }
+        assert_eq!(
+            view(heap_slot),
+            Some(View::Placed(false, resource, desc)),
+            "raw-byte copy into registered heap remains addressable"
+        );
+    }
+
+    /// Concurrent writers to the same slot never interleave their stores,
+    /// combine fields from different writes, or resolve to a mixed shape.
+    #[test]
+    fn same_slot_writers_never_combine_fields_or_resolve_to_mixed_shape() {
+        let heap_owner = owner(
+            HeapDesc { kind: VIEWS_KIND, count: 4, flags: SHADER_VISIBLE, nodes: 1 },
+            Placement { address: 0, size: 0 },
+        );
+        let slot = heap(heap_owner.0).start;
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for t in 0..4u32 {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let null = std::ptr::null();
+                    let mut resource: [u32; 14] = [0; 14];
+                    resource[0] = 3;
+                    resource[6] = 1;
+                    resource[7] = 1 | 1 << 16;
+                    resource[8] = 28;
+                    resource[9] = 1;
+                    resource[11] = 0x100 + t;
+                    let mut desc: [u32; 16] = [0; 16];
+                    desc[0] = 28;
+                    desc[1] = 4;
+                    desc[2] = 0x1688 + t;
+                    desc[5] = 1;
+                    let address = 0x6_0000_0000 + (u64::from(t) << 16);
+                    (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+                    barrier.wait();
+                    for _ in 0..2000 {
+                        create_placed_srv(null, &resource, &desc, slot);
+                        if let Some(View::Placed(false, r, d)) = view(slot) {
+                            let thread_id = r[11] - 0x100;
+                            assert!(thread_id < 4, "valid thread id");
+                            assert_eq!(d[2], 0x1688 + thread_id, "shape must not be mixed");
+                            let expected_addr = 0x6_0000_0000 + (u64::from(thread_id) << 16);
+                            assert_eq!(
+                                (u64::from(d[11]) << 32 | u64::from(d[10])),
+                                expected_addr,
+                                "address must match shape"
+                            );
+                        }
+                    }
+                });
+            }
+        });
+        let final_view = view(slot);
+        assert!(final_view.is_some(), "slot must resolve after writes finish");
+        if let Some(View::Placed(false, r, d)) = final_view {
+            let thread_id = r[11] - 0x100;
+            assert!(thread_id < 4);
+            assert_eq!(d[2], 0x1688 + thread_id);
+            let expected_addr = 0x6_0000_0000 + (u64::from(thread_id) << 16);
+            assert_eq!((u64::from(d[11]) << 32 | u64::from(d[10])), expected_addr);
+        } else {
+            panic!("unexpected view: {:?}", final_view);
+        }
     }
 
     /// A record copied as bytes names its constant buffer or placed view
