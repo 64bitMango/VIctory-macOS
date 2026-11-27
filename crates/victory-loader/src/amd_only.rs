@@ -14,6 +14,14 @@
 //!   `VICTORY_PATCH_WAITS=0`: emulated each time). Found by the exception and
 //!   not by their three bytes, which other instructions' operands hold too.
 //!
+//! - `extrq` and `insertq` (SSE4a, `66`/`f2 0f 78/79`), emulated a whole
+//!   exception each by the handler, are replaced when the image is mapped
+//!   by a jump to the same work in plain instructions
+//!   ([`patch_sse4a`], `VICTORY_PATCH_SSE4A=0`: emulated, as before). The
+//!   immediate forms (six or seven bytes) and the register form with a REX
+//!   (five) hold the jump; the plain four-byte register form is left to
+//!   the handler.
+//!
 //! Diagnostics builds log the counts per frame ([`log_emulated`]).
 
 /// `cmp rm, reg` between 64-bit registers (`REX.W 39 /r`): (`rm`, `reg`).
@@ -191,6 +199,377 @@ fn patches_waits_from(value: Option<&str>) -> bool {
     value.map(str::trim) != Some("0")
 }
 
+/// SSE4a's `extrq`/`insertq` where they sit, as the handler emulates them
+/// ([`crate::crash::sse4a`]): one of
+///
+/// ```text
+/// 66 0f 78 /0 ib ib   extrq xmm, len, at   the immediate form
+/// f2 0f 78 /0 ib ib   insertq ...          (a REX may precede the 0f)
+/// 66 0f 79 /r         extrq xmm, xmm      the register form
+/// f2 0f 79 /r         insertq ...
+/// ```
+///
+/// The immediate form's target is the register the modrm names (`src`),
+/// `extrq`'s fields are the source's low qword and `insertq`'s its high,
+/// and the register form works `extrq` on `dst` and `insertq` from `src`
+/// into `dst`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Sse4aSite {
+    /// Where the instruction starts, as an offset in the code searched.
+    pub at: usize,
+    /// How long it is.
+    pub len: usize,
+    /// 0x66 (`extrq`) or 0xf2 (`insertq`).
+    prefix: u8,
+    /// The immediate form (opcode 0x78), or the register form (0x79).
+    immediate: bool,
+    /// What the modrm names: `insertq`'s destination and both forms' source;
+    /// the immediate form's target.
+    dst: u8,
+    src: u8,
+    /// The immediate form's bytes: the field's length and index.
+    len_imm: u8,
+    at_imm: u8,
+}
+
+/// Whether the bytes just before `code[at]` are the opcode of a `mov`
+/// with an immediate and `at` falls inside it, as a pattern found there
+/// is part of the constant, not an instruction: `b8..=bf` loads four,
+/// and with a REX that has the wide bit set, eight bytes.
+fn inside_a_mov_immediate(code: &[u8], at: usize) -> bool {
+    for p in at.saturating_sub(9)..at {
+        let Some(&opcode) = code.get(p) else { continue };
+        if !matches!(opcode, 0xb8..=0xbf) {
+            continue;
+        }
+        let start = p + 1;
+        let len = if p > 0 && code[p - 1].wrapping_sub(0x40) < 0x10 && code[p - 1] & 8 != 0 {
+            8
+        } else {
+            4
+        };
+        if start <= at && at < start + len {
+            return true;
+        }
+    }
+    false
+}
+
+/// The `extrq`/`insertq` at `code[at]`, if it is one of the four forms
+/// ([`Sse4aSite`]); the modrm's register field must be 0 in `extrq`'s
+/// immediate form, as only that is ever emitted, both forms are
+/// register-to-register, and a site inside a `mov` immediate is a
+/// coincidence of bytes, not an instruction.
+pub(crate) fn sse4a_site(code: &[u8], at: usize) -> Option<Sse4aSite> {
+    if inside_a_mov_immediate(code, at) {
+        return None;
+    }
+    let &prefix = code.get(at)?;
+    if !matches!(prefix, 0x66 | 0xf2) {
+        return None;
+    }
+    let (rex, o) = if let Some(rex) = code.get(at + 1)
+        && rex.wrapping_sub(0x40) < 0x10
+    {
+        (*rex, at + 2)
+    } else {
+        (0, at + 1)
+    };
+    if *code.get(o)? != 0x0f {
+        return None;
+    }
+    let immediate = match code.get(o + 1)? {
+        0x78 => true,
+        0x79 => false,
+        _ => return None,
+    };
+    let modrm = *code.get(o + 2)?;
+    if modrm >> 6 != 3 || immediate && prefix == 0x66 && (modrm >> 3) & 7 != 0 {
+        return None;
+    }
+    let dst = (modrm >> 3) & 7 | (rex & 4) << 1;
+    let src = modrm & 7 | (rex & 1) << 3;
+    let (len_imm, at_imm, end) = if immediate {
+        (*code.get(o + 3)?, *code.get(o + 4)?, o + 5)
+    } else {
+        (0, 0, o + 3)
+    };
+    Some(Sse4aSite {
+        at,
+        len: end - at,
+        prefix,
+        immediate,
+        dst,
+        src,
+        len_imm,
+        at_imm,
+    })
+}
+
+/// Every [`sse4a_site`] of `code`, in order.
+pub(crate) fn sse4a_sites(code: &[u8]) -> Vec<Sse4aSite> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < code.len() {
+        if matches!(code[at], 0x66 | 0xf2)
+            && let Some(s) = sse4a_site(code, at)
+        {
+            at += s.len;
+            found.push(s);
+        } else {
+            at += 1;
+        }
+    }
+    found
+}
+
+/// `movq rax, xmm`/`movq xmm, rax` (`66 48 0f 7e`/`6e`, a REX.R for the
+/// high half of the registers).
+fn xmm_rax(x: u8, from_xmm: bool, out: &mut Vec<u8>) {
+    let rex = if x >= 8 { 0x4c } else { 0x48 };
+    out.extend([0x66, rex, 0x0f, if from_xmm { 0x7e } else { 0x6e }, 0xc0 | (x & 7) << 3]);
+}
+
+/// `movdqu [rsp], xmm` (`f3 0f 7f 04 24`), both halves of the register
+/// where the field lengths and indices come from.
+fn xmm_to_stack(x: u8, out: &mut Vec<u8>) {
+    if x >= 8 {
+        out.extend([0xf3, 0x44, 0x0f, 0x7f, 0x04 | (x & 7) << 3, 0x24]);
+    } else {
+        out.extend([0xf3, 0x0f, 0x7f, 0x04 | (x & 7) << 3, 0x24]);
+    }
+}
+
+/// `movdqu xmm, [rsp]` (`f3 0f 6f 04 24`), both halves of the register
+/// back where [`xmm_to_stack`] saved them.
+fn stack_to_xmm(x: u8, out: &mut Vec<u8>) {
+    if x >= 8 {
+        out.extend([0xf3, 0x44, 0x0f, 0x6f, 0x04 | (x & 7) << 3, 0x24]);
+    } else {
+        out.extend([0xf3, 0x0f, 0x6f, 0x04 | (x & 7) << 3, 0x24]);
+    }
+}
+
+/// The low qword of `rax` into the low half of `xmm` (`movq` zeroes the
+/// upper one) with its high half as it was: the register saved under the
+/// space the stub's `sub rsp` made, written, and its high half read back
+/// (`movhpd`, the qword at `[rsp + 8]`).
+fn rax_into_xmm_low(x: u8, out: &mut Vec<u8>) {
+    xmm_to_stack(x, out);
+    xmm_rax(x, false, out);
+    out.push(0x66);
+    if x >= 8 {
+        out.push(0x44);
+    }
+    out.extend([0x0f, 0x16, 0x44 | (x & 7) << 3, 0x24, 0x08]);
+}
+
+/// The register form's fields: `rax`'s low word to `edx` (the field's
+/// length) and `r9` (its index), and both masked to the six bits the
+/// instruction reads; then the length's mask in `rdx`, through a shift of
+/// all ones by `64 - bits` (a length of 0 means the whole qword, and
+/// leaves the shift count masked to 0).
+fn fields_and_mask(out: &mut Vec<u8>) {
+    out.extend([
+        0x0f, 0xb6, 0xd0, // movzx edx, al
+        0x0f, 0xb6, 0xcc, // movzx ecx, ah (a REX would read SPL, not AH)
+        0x83, 0xe2, 0x3f, // and edx, 63
+        0x83, 0xe1, 0x3f, // and ecx, 63
+        0x41, 0x89, 0xc9, // mov r9d, ecx
+        0x41, 0x89, 0xd0, // mov r8d, edx
+        0x41, 0xf7, 0xd8, // neg r8d
+        0x49, 0x83, 0xc0, 0x40, // add r8, 64
+        0x4c, 0x89, 0xc1, // mov rcx, r8
+        0x48, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, // mov rdx, -1
+        0x48, 0xd3, 0xea, // shr rdx, cl
+    ]);
+}
+
+/// The site `s` (of code mapped at `code_at`) as code at `stub`: what
+/// `extrq`/`insertq` does to its XMM registers done by `movq` and integer
+/// instructions every CPU has, ending with a jump to the instruction
+/// after it. It leaves every other register, the flags and memory as the
+/// instruction does (it changes none but its target).
+///
+/// The immediate forms' field, the length and index, is the instruction's
+/// own bytes, a constant here: its mask is folded into the code, and
+/// nothing computes it at every pass.
+///
+/// ```text
+/// extrq, the immediate form (the target saved under the space the
+/// stub's `sub rsp` made, both halves, its low half shifted and masked,
+/// written back, its high half kept):
+///   pushfq; push rax, rdx; sub rsp, 16
+///   movdqu [rsp], the target; mov rax, [rsp]
+///   shr rax, the index; movabs rdx, the mask; and rax, rdx
+///   mov [rsp], rax; movdqu the target, [rsp]
+///   add rsp, 16; pop rdx, rax; popfq; jmp the instruction after
+///
+/// insertq, the immediate form (the source's masked field into the
+/// destination's low qword, the destination's high half kept):
+///   pushfq; push rax, rcx, rdx; sub rsp, 16
+///   movdqu [rsp], the destination
+///   mov rax, [rsp] (the source is the destination) or movq rax, the source
+///   movabs rdx, the mask; and rax, rdx; shl rax, the index
+///   movabs rdx, the mask's complement at the index
+///   mov rcx, [rsp]; and rcx, rdx; or rcx, rax; mov [rsp], rcx
+///   movdqu the destination, [rsp]
+///   add rsp, 16; pop rdx, rcx, rax; popfq; jmp the instruction after
+///
+/// extrq and insertq, the register form (the field read at run, from the
+/// source's low or high half, so its mask is made of it):
+///   pushfq; push rax, rcx, rdx, r8, r9; sub rsp, 16
+///   [mov rax, the length and index as one word]     extrq: the low half
+///   movdqu [rsp], the source; mov rax, [rsp]        extrq: the low half
+///   or mov rax, [rsp + 8]                           insertq: the high
+///   movzx edx, al; movzx ecx, ah; and both, 63; the index to r9
+///   mov r8, 64 - the length; shr rdx (-1), r8      the mask
+///   movq rax, the target; shr rax, r9; and rax, rdx
+///   the target saved at [rsp], its low half written, its high half read
+///   back (`movq` zeroes it; `movhpd` restores it, as the instruction and
+///   the handler's emulation leave it)
+///   add rsp, 16; pop the registers; popfq
+///   jmp the instruction after the site
+/// ```
+///
+/// `insertq` keeps its source's masked field and writes it into the
+/// destination's: the same start, and `and rax, rdx; mov rcx, r9; shl
+/// rax, rdx` and the destination and-ed by the mask's complement and
+/// or-ed in.
+pub(crate) fn sse4a_stub(s: &Sse4aSite, code_at: u64, stub: u64) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    if s.immediate {
+        // The instruction's own length and index bytes, masked to the six
+        // bits it reads, with the length's zero the whole qword.
+        let bits = if s.len_imm & 63 == 0 {
+            64
+        } else {
+            u64::from(s.len_imm & 63)
+        };
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1 << bits) - 1
+        };
+        let at = s.at_imm & 63;
+        if s.prefix == 0x66 {
+            // extrq: the target is the register the modrm names.
+            let target = s.src;
+            out.extend([0x9c, 0x50, 0x52, 0x48, 0x83, 0xec, 0x10]);
+            xmm_to_stack(target, &mut out);
+            out.extend([0x48, 0x8b, 0x04, 0x24]); // mov rax, [rsp]
+            out.extend([0x48, 0xc1, 0xe8, at]); // shr rax, the index
+            out.extend([0x48, 0xba]); // movabs rdx, the mask
+            out.extend(mask.to_le_bytes());
+            out.extend([0x48, 0x21, 0xd0]); // and rax, rdx
+            out.extend([0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
+            stack_to_xmm(target, &mut out);
+            out.extend([0x48, 0x83, 0xc4, 0x10, 0x5a, 0x58, 0x9d]);
+        } else {
+            // insertq: the source's masked field into the destination.
+            out.extend([0x9c, 0x50, 0x51, 0x52, 0x48, 0x83, 0xec, 0x10]);
+            xmm_to_stack(s.dst, &mut out);
+            if s.src == s.dst {
+                out.extend([0x48, 0x8b, 0x04, 0x24]); // mov rax, [rsp]
+            } else {
+                xmm_rax(s.src, true, &mut out); // movq rax, the source
+            }
+            out.extend([0x48, 0xba]); // movabs rdx, the mask
+            out.extend(mask.to_le_bytes());
+            out.extend([0x48, 0x21, 0xd0]); // and rax, rdx
+            out.extend([0x48, 0xc1, 0xe0, at]); // shl rax, the index
+            out.extend([0x48, 0xba]); // movabs rdx, the mask's complement
+            let clear = !(mask << u64::from(at));
+            out.extend(clear.to_le_bytes());
+            out.extend([0x48, 0x8b, 0x0c, 0x24]); // mov rcx, [rsp]
+            out.extend([
+                0x48, 0x21, 0xd1, // and rcx, rdx
+                0x48, 0x09, 0xc1, // or rcx, rax
+                0x48, 0x89, 0x0c, 0x24, // mov [rsp], rcx
+            ]);
+            stack_to_xmm(s.dst, &mut out);
+            out.extend([0x48, 0x83, 0xc4, 0x10, 0x5a, 0x59, 0x58, 0x9d]);
+        }
+    } else {
+        out.extend([
+            0x9c, // pushfq
+            0x50, 0x51, 0x52, // push rax, rcx, rdx
+            0x41, 0x50, 0x41, 0x51, // push r8, r9
+            0x48, 0x83, 0xec, 0x10, // sub rsp, 16
+        ]);
+        xmm_to_stack(s.src, &mut out);
+        if s.prefix == 0x66 {
+            out.extend([0x48, 0x8b, 0x04, 0x24]); // mov rax, [rsp]
+        } else {
+            out.extend([0x48, 0x8b, 0x44, 0x24, 0x08]); // mov rax, [rsp + 8]
+        }
+        fields_and_mask(&mut out);
+        if s.prefix == 0x66 {
+            let target = s.dst;
+            out.extend([
+                0x4c, 0x89, 0xc9, // mov rcx, r9
+            ]);
+            xmm_rax(target, true, &mut out);
+            out.extend([
+                0x48, 0xd3, 0xe8, // shr rax, cl
+                0x48, 0x21, 0xd0, // and rax, rdx
+            ]);
+            rax_into_xmm_low(target, &mut out);
+        } else {
+            xmm_rax(s.src, true, &mut out);
+            out.extend([
+                0x48, 0x21, 0xd0, // and rax, rdx
+                0x4c, 0x89, 0xc9, // mov rcx, r9
+                0x48, 0xd3, 0xe0, // shl rax, cl
+                0x48, 0xd3, 0xe2, // shl rdx, cl
+                0x48, 0xf7, 0xd2, // not rdx
+            ]);
+            // movq rcx, the destination: the low qword the field goes into.
+            out.extend([0x66]);
+            if s.dst >= 8 {
+                out.extend([0x4c]);
+            } else {
+                out.extend([0x48]);
+            }
+            out.extend([0x0f, 0x7e, 0xc0 | (s.dst & 7) << 3 | 1]);
+            out.extend([
+                0x48, 0x21, 0xd1, // and rcx, rdx
+                0x48, 0x09, 0xc1, // or rcx, rax
+            ]);
+            // The destination's low half from rcx, its high half as it was.
+            let dst = s.dst;
+            xmm_to_stack(dst, &mut out);
+            out.extend([0x66]);
+            if dst >= 8 {
+                out.extend([0x4c]);
+            } else {
+                out.extend([0x48]);
+            }
+            out.extend([0x0f, 0x6e, 0xc0 | (dst & 7) << 3 | 1]);
+            out.push(0x66);
+            if dst >= 8 {
+                out.push(0x44);
+            }
+            out.extend([0x0f, 0x16, 0x44 | (dst & 7) << 3, 0x24, 0x08]);
+        }
+        out.extend([
+            0x48, 0x83, 0xc4, 0x10, // add rsp, 16
+            0x41, 0x59, 0x41, 0x58, // pop r9, r8
+            0x5a, 0x59, 0x58, // pop rdx, rcx, rax
+            0x9d, // popfq
+        ]);
+    }
+    let here = stub + out.len() as u64;
+    out.extend(jump(here, code_at + s.at as u64 + s.len as u64)?);
+    Some(out)
+}
+
+/// Whether `extrq`/`insertq` are replaced when the image is mapped; not
+/// with `VICTORY_PATCH_SSE4A=0`.
+fn patches_sse4a_from(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
+}
+
 #[cfg(windows)]
 pub use on_windows::*;
 
@@ -238,6 +617,8 @@ mod on_windows {
     /// their first exception, so far.
     static LOOPS_REPLACED: AtomicU64 = AtomicU64::new(0);
     static WAITS_REPLACED: AtomicU64 = AtomicU64::new(0);
+    /// `extrq`/`insertq` replaced at load, so far.
+    static SSE4A_REPLACED: AtomicU64 = AtomicU64::new(0);
 
     /// The handler emulated one of `kind`.
     pub(crate) fn count(kind: Kind) {
@@ -272,7 +653,7 @@ mod on_windows {
             "  AMD-only instructions emulated per frame (an exception each): clzero {:.1} single lines and {:.1} whole loops, \
              monitorx {:.1}, mwaitx {:.1}, rdpru {:.1}, clwb {:.1} single and {:.1} whole loops, extrq/insertq {:.1}, \
              waits already replaced {:.1}; {:.3} ms in their handler (the exception's own cost not counted); \
-             replaced so far: {} clzero loops at load, {} wait instructions at their first exception",
+             replaced so far: {} clzero loops at load, {} extrq/insertq at load, {} wait instructions at their first exception",
             n(Kind::Clzero),
             n(Kind::ClzeroLoop),
             n(Kind::Monitorx),
@@ -284,6 +665,7 @@ mod on_windows {
             n(Kind::Replaced),
             HANDLER_NS.swap(0, Relaxed) as f64 / 1e6 / frames.max(1.0),
             LOOPS_REPLACED.load(Relaxed),
+            SSE4A_REPLACED.load(Relaxed),
             WAITS_REPLACED.load(Relaxed),
         );
     }
@@ -449,6 +831,94 @@ mod on_windows {
         (patched, left)
     }
 
+    /// Makes the `extrq`/`insertq` in the executable sections of the image
+    /// mapped at `base` jump to plain instructions ([`sse4a_stub`]), and
+    /// returns how many, and how many it left to the handler: the register
+    /// form without a REX is four bytes, too few for the jump that reaches
+    /// the plain code. Nothing with `VICTORY_PATCH_SSE4A=0`. Before any
+    /// title thread runs.
+    ///
+    /// The jump takes the site's first five bytes, always whole
+    /// instructions: a jump straight to what follows them was already into
+    /// the middle of the instruction, and a register form with a REX is
+    /// exactly five. The immediate forms leave their own last one or two
+    /// bytes behind the jump, unread.
+    pub fn patch_sse4a(base: u64, info: &victory_pe::ImageInfo) -> (usize, usize) {
+        if !patches_sse4a_from(std::env::var("VICTORY_PATCH_SSE4A").ok().as_deref()) {
+            return (0, 0);
+        }
+        let (mut patched, mut left) = (0, 0);
+        let mut pool = None;
+        for s in info.sections.iter().filter(|s| s.characteristics & EXECUTE != 0) {
+            let start = base + u64::from(s.rva);
+            let len = s.virtual_size.min(s.file_size) as usize;
+            // SAFETY: the mapped section, before any title thread runs.
+            let (p, l) = unsafe { patch_sse4a_in(start, len, base, &mut pool) };
+            patched += p;
+            left += l;
+        }
+        seal(pool);
+        SSE4A_REPLACED.fetch_add(patched as u64, Relaxed);
+        (patched, left)
+    }
+
+    /// [`patch_sse4a`] of the code `[start, start + len)`, its plain code in
+    /// `pool` (where it is and the bytes used; made near `base` when first
+    /// needed). Returns the instructions replaced and left.
+    ///
+    /// # Safety
+    /// The range is mapped code that no thread runs meanwhile.
+    pub(crate) unsafe fn patch_sse4a_in(
+        start: u64,
+        len: usize,
+        base: u64,
+        pool: &mut Option<(u64, usize)>,
+    ) -> (usize, usize) {
+        let (mut patched, mut left) = (0, 0);
+        // SAFETY: mapped, readable code (the caller's).
+        let code = unsafe { std::slice::from_raw_parts(start as *const u8, len) };
+        for s in sse4a_sites(code) {
+            if s.len < 5 {
+                left += 1;
+                continue;
+            }
+            if pool.is_none() {
+                *pool = near(base).map(|at| (at, 0));
+            }
+            let Some((at, used)) = pool.as_mut() else {
+                tracing::warn!("no memory near the image for extrq/insertq: left to the handler");
+                left += 1;
+                continue;
+            };
+            let stub = *at + *used as u64;
+            let site = start + s.at as u64;
+            let (Some(body), Some(jump)) = (sse4a_stub(&s, start, stub), jump(site, stub)) else {
+                left += 1;
+                continue;
+            };
+            if *used + body.len() > POOL {
+                left += 1;
+                continue;
+            }
+            let mut old = 0;
+            // SAFETY: our pool has room for the body; the site is the
+            // title's code, writable for the moment of the write, which no
+            // thread runs.
+            unsafe {
+                std::ptr::copy_nonoverlapping(body.as_ptr(), stub as *mut u8, body.len());
+                if VirtualProtect(site as *const _, jump.len(), PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+                    left += 1;
+                    continue;
+                }
+                std::ptr::copy_nonoverlapping(jump.as_ptr(), site as *mut u8, jump.len());
+                VirtualProtect(site as *const _, jump.len(), old, &mut old);
+            }
+            *used += body.len().next_multiple_of(16);
+            patched += 1;
+        }
+        (patched, left)
+    }
+
     /// The plain stores are written: their memory becomes code.
     pub(crate) fn seal(pool: Option<(u64, usize)>) {
         if let Some((at, _)) = pool {
@@ -578,5 +1048,159 @@ mod tests {
         assert!(patches_waits_from(None));
         assert!(patches_waits_from(Some("1")));
         assert!(!patches_waits_from(Some(" 0 ")));
+        assert!(patches_sse4a_from(None));
+        assert!(patches_sse4a_from(Some("1")));
+        assert!(!patches_sse4a_from(Some(" 0 ")));
+    }
+
+    /// `extrq xmm, len, at` (the immediate form, target xmm6).
+    const EXTRQ_IMM: [u8; 6] = [0x66, 0x0f, 0x78, 0xc6, 0x08, 0x14];
+    /// `insertq xmm0, xmm1, len 16, at 16`.
+    const INSERTQ_IMM: [u8; 6] = [0xf2, 0x0f, 0x78, 0xc1, 0x10, 0x10];
+    /// `extrq xmm8, xmm1` (the register form with a REX).
+    const EXTRQ_REG: [u8; 5] = [0x66, 0x44, 0x0f, 0x79, 0xc1];
+    /// `insertq xmm0, xmm9`.
+    const INSERTQ_REG: [u8; 5] = [0xf2, 0x41, 0x0f, 0x79, 0xc1];
+
+    #[test]
+    fn sse4a_sites_are_found_with_their_lengths() {
+        let f = sse4a_site(&EXTRQ_IMM, 0).unwrap();
+        assert_eq!(
+            (f.len, f.prefix, f.immediate, f.src, f.dst),
+            (6, 0x66, true, 6, 0)
+        );
+        let f = sse4a_site(&INSERTQ_IMM, 0).unwrap();
+        assert_eq!(
+            (f.len, f.prefix, f.immediate, f.src, f.dst),
+            (6, 0xf2, true, 1, 0)
+        );
+        let f = sse4a_site(&EXTRQ_REG, 0).unwrap();
+        assert_eq!(
+            (f.len, f.prefix, f.immediate, f.src, f.dst),
+            (5, 0x66, false, 1, 8)
+        );
+        let f = sse4a_site(&INSERTQ_REG, 0).unwrap();
+        assert_eq!(
+            (f.len, f.prefix, f.immediate, f.src, f.dst),
+            (5, 0xf2, false, 9, 0)
+        );
+        // The register form without a REX: found (so it can be counted as
+        // left), though too short to patch.
+        let found = sse4a_site(&[0x66, 0x0f, 0x79, 0xc1], 0).unwrap();
+        assert_eq!(found.len, 4);
+        // `insertq`'s immediate form keeps its register field: the bits land
+        // in the register it names, not in the one the modrm encodes.
+        let f = sse4a_site(&[0xf2, 0x0f, 0x78, 0xc9, 0x10, 0x10], 0).unwrap();
+        assert_eq!(
+            (f.len, f.prefix, f.immediate, f.src, f.dst),
+            (6, 0xf2, true, 1, 1)
+        );
+        // The forms' own rules: `extrq`'s immediate form has the register
+        // field 0, and both are register-to-register.
+        assert!(sse4a_site(&[0x66, 0x0f, 0x78, 0xc9, 0x08, 0x14], 0).is_none());
+        assert!(sse4a_site(&[0x66, 0x0f, 0x78, 0x06, 0x08, 0x14], 0).is_none());
+        assert!(sse4a_site(&[0xf3, 0x0f, 0x79, 0xc1], 0).is_none());
+        assert!(sse4a_site(&[0x66, 0x0f, 0x7a, 0xc1], 0).is_none());
+        // A pattern inside another instruction's immediate is a constant,
+        // not an instruction: `movabs rax, 0x1408c6780f66`.
+        let movabs = [
+            0x48, 0xb8, 0x66, 0x0f, 0x78, 0xc6, 0x08, 0x14, 0x00, 0x00, 0xc3,
+        ];
+        assert!(sse4a_site(&movabs, 2).is_none());
+        assert_eq!(sse4a_sites(&movabs).len(), 0);
+        // The same, as a four-byte immediate (`mov eax, 0x1408c6780f66`),
+        // and a real `extrq` right after one, still found.
+        let mov = [0xb8, 0x66, 0x0f, 0x78, 0xc6, 0xc3];
+        assert!(sse4a_site(&mov, 1).is_none());
+        let after = [
+            0xb8, 0x00, 0x00, 0x00, 0x00, 0x66, 0x0f, 0x78, 0xc6, 0x08, 0x14,
+        ];
+        assert_eq!(sse4a_sites(&after).len(), 1);
+    }
+
+    #[test]
+    fn every_sse4a_site_of_the_code_in_order() {
+        let mut code = vec![0x90; 4];
+        code.extend(EXTRQ_IMM);
+        code.extend(INSERTQ_REG);
+        code.push(0xc3);
+        let found = sse4a_sites(&code);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].at, 4);
+        assert_eq!(found[1].at, 10);
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn the_sse4a_stubs_shape() {
+        // pushfq; push rax, rdx; sub rsp, 16.
+        let extrq_imm = [0x9c, 0x50, 0x52, 0x48, 0x83, 0xec, 0x10];
+        // pushfq; push rax, rcx, rdx; sub rsp, 16.
+        let insertq_imm = [0x9c, 0x50, 0x51, 0x52, 0x48, 0x83, 0xec, 0x10];
+        // pushfq; push rax, rcx, rdx; push r8, r9; sub rsp, 16.
+        let reg = [
+            0x9c, 0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x48, 0x83, 0xec, 0x10,
+        ];
+        // add rsp, 16; pop rdx, rax; popfq.
+        let extrq_imm_end = [0x48, 0x83, 0xc4, 0x10, 0x5a, 0x58, 0x9d];
+        // add rsp, 16; pop rdx, rcx, rax; popfq.
+        let insertq_imm_end = [0x48, 0x83, 0xc4, 0x10, 0x5a, 0x59, 0x58, 0x9d];
+        // add rsp, 16; pop r9, r8, rdx, rcx, rax; popfq.
+        let reg_end = [
+            0x48, 0x83, 0xc4, 0x10, 0x41, 0x59, 0x41, 0x58, 0x5a, 0x59, 0x58, 0x9d,
+        ];
+        for site in [
+            &EXTRQ_IMM[..],
+            &INSERTQ_IMM[..],
+            &EXTRQ_REG[..],
+            &INSERTQ_REG[..],
+        ] {
+            let s = sse4a_site(site, 0).unwrap();
+            let stub = sse4a_stub(&s, 0x1_0000, 0x9000).unwrap();
+            let (prologue, epilogue) = match (s.immediate, s.prefix) {
+                (true, 0x66) => (&extrq_imm[..], &extrq_imm_end[..]),
+                (true, _) => (&insertq_imm[..], &insertq_imm_end[..]),
+                (false, _) => (&reg[..], &reg_end[..]),
+            };
+            assert_eq!(stub[..prologue.len()], *prologue, "{site:02x?}");
+            let back = stub.len() - 5;
+            assert_eq!(stub[back - epilogue.len()..back], *epilogue, "{site:02x?}");
+            assert_eq!(stub[back], 0xe9, "{site:02x?}");
+            let rel = i32::from_le_bytes(stub[back + 1..].try_into().unwrap());
+            let to = 0x9000 + back as i64 + 5 + i64::from(rel);
+            assert_eq!(to, 0x1_0000 + s.len as i64, "{site:02x?}");
+            // The immediate form's field folded to its mask, a constant of
+            // the length, the index, and the form's own clear mask.
+            if s.immediate {
+                let (len, at) = (u64::from(s.len_imm & 63), u64::from(s.at_imm & 63));
+                let bits = if len == 0 { 64 } else { len };
+                let mask = if bits == 64 {
+                    u64::MAX
+                } else {
+                    (1 << bits) - 1
+                };
+                let movabs = |x: u64| {
+                    let mut v = vec![0x48, 0xba];
+                    v.extend(x.to_le_bytes());
+                    v
+                };
+                assert!(
+                    contains(&stub, &movabs(mask)),
+                    "{site:02x?}: the field's mask folded in"
+                );
+                if s.prefix == 0xf2 {
+                    assert!(
+                        contains(&stub, &movabs(!(mask << at))),
+                        "{site:02x?}: the clear mask folded in"
+                    );
+                }
+            }
+        }
+        // Out of a jump's reach.
+        let s = sse4a_site(&EXTRQ_IMM, 0).unwrap();
+        assert!(sse4a_stub(&s, 0x1_0000, 0x9000_0000_0000).is_none());
     }
 }
