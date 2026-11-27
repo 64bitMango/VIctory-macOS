@@ -108,6 +108,15 @@ pub fn run(
                 _ => "",
             }
         );
+        let (made, left) = victory_loader::patch_sse4a(image.base() as u64, image.info());
+        println!(
+            "extrq/insertq  {made} made plain code, {left} left to the handler{}",
+            match std::env::var("VICTORY_PATCH_SSE4A").as_deref() {
+                Ok("0") => " (VICTORY_PATCH_SSE4A=0: none replaced)",
+                _ if left > 0 => " (the four-byte register form: too few bytes for a jump)",
+                _ => "",
+            }
+        );
         println!(
             "wait hints     monitorx and mwaitx {}",
             if victory_loader::patches_waits() {
