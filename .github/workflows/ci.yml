@@ -32,4 +32,5 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
-        run: cargo test --workspace --locked
+        # Every crate's tests, even after one fails.
+        run: cargo test --workspace --locked --no-fail-fast
