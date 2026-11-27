@@ -13,8 +13,10 @@ reviews:
   high_level_summary: true
   poem: false
   in_progress_fortune: false
-  # One summary comment, kept short; no status or info messages.
-  review_status: false
+  # One summary comment, kept short. Its status line stays: it says why a
+  # review was skipped or paused (rate limit, too many commits), inside the
+  # same comment.
+  review_status: true
   review_info: false
   review_details: false
   related_issues: false
