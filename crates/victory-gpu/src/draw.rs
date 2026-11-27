@@ -368,6 +368,19 @@ impl State {
 
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
+    /// `OMSetDepthBounds`: the host list keeps the bounds itself, so the
+    /// draws after the call get them; the pipeline must enable the test.
+    pub(crate) fn depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+        use windows::core::Interface;
+        // SAFETY: an open list.
+        unsafe {
+            list.list
+                .cast::<ID3D12GraphicsCommandList1>()
+                .expect("a command list")
+                .OMSetDepthBounds(min, max)
+        };
+    }
+
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
         self.topology = topology;
         self.fixed.topology = true;
@@ -2310,8 +2323,8 @@ impl State {
                 }
                 #[cfg(feature = "diagnostics")]
                 clamps.note_op(|| format!("hoisted clamp of indirect kind {kind} max {max} at {arguments:#x}"));
-                let from = counter.as_ref().map(|(s, at)| (s.base(), s.gpu(*at)));
-                crate::indirect::bound_before(&clamps, list, (args.base(), args.gpu(arguments)), (kind, stride, max), from)
+                let from = counter.as_ref().map(|(s, at)| (s.gpu_base(), s.gpu(*at)));
+                crate::indirect::bound_before(&clamps, list, (args.gpu_base(), args.gpu(arguments)), (kind, stride, max), from)
             });
         let inline = hoisted.is_none();
         let (clamped, clamped_at) = match hoisted {

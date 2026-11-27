@@ -2281,6 +2281,7 @@ pub(crate) mod tests {
         assert_eq!(calls(), before, "no protection changed");
         // A write during the rest: no fault to say so, and it is told all
         // the same, as often as asked.
+        // SAFETY: a byte of our pool, through its mapping.
         unsafe { ((p + 9) as *mut u8).write_volatile(2) };
         for _ in 0..3 {
             assert_eq!(t.take_resting(all.0, all.1), [(p, p + PAGE)], "a write during the rest is told");
@@ -2295,6 +2296,7 @@ pub(crate) mod tests {
         assert!(opened(p / PAGE).is_none());
         assert!(t.take_resting(all.0, all.1).is_empty(), "and not told again");
         // A write now faults, and is told.
+        // SAFETY: a byte of our pool, through its mapping.
         unsafe { ((p + 10) as *mut u8).write_volatile(3) };
         assert!(t.changed(p / PAGE) && writable(p));
         // A rest of nothing: guarded at once, as before.
@@ -2321,6 +2323,7 @@ pub(crate) mod tests {
         assert!(writable(p) && !a.clean() && !b.clean());
         // `b` takes it for good: read-only from here, and `a` is told what
         // was written while it was open.
+        // SAFETY: a byte of our pool, through its mapping.
         unsafe { ((p + 1) as *mut u8).write_volatile(2) };
         assert_eq!(b.take(all.0, all.1), [all]);
         assert!(read_only(p) && b.clean() && !a.clean());
@@ -2380,6 +2383,7 @@ pub(crate) mod tests {
         assert!(writable(b) && read_only(a) && t.changed(a / PAGE));
         assert_eq!(t.take_resting(a, a + PAGE), [(a, a + PAGE)]);
         assert!(writable(b) && t.changed(a / PAGE), "the written view left open, the page still marked");
+        // SAFETY: a byte of our pool, through its mapping.
         unsafe { ((b + 1) as *mut u8).write_volatile(2) };
         assert_eq!(t.take_resting(a, a + PAGE), [(a, a + PAGE)], "a write during the rest is told");
         rest(20);

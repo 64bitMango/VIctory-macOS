@@ -29,6 +29,9 @@ struct Cli {
     command: Command,
 }
 
+// A clap subcommand enum is parsed once at startup, so the size of its largest
+// variant (the replay options) does not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
