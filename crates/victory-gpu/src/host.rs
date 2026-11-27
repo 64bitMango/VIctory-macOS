@@ -187,11 +187,20 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// `VICTORY_NO_GPU=1`: no host device and no WARP adapter, as on a machine
+/// without a GPU. CI sets it for victory-gpu, as its runners' WARP crashes
+/// in the tests (#39).
+fn no_gpu() -> bool {
+    no_gpu_in(std::env::var_os("VICTORY_NO_GPU").as_deref())
+}
+
+/// [`no_gpu`] for the switch's value: on for anything but `0` or unset.
+fn no_gpu_in(value: Option<&std::ffi::OsStr>) -> bool {
+    crate::switch::value_is_on(value)
+}
+
 fn create() -> windows::core::Result<Host> {
-    // `VICTORY_NO_GPU=1`: no host device, as on a machine without one; CI
-    // sets it for victory-gpu, as its runners' WARP crashes in the tests
-    // (#39).
-    if crate::switch::on("VICTORY_NO_GPU") {
+    if no_gpu() {
         return Err(windows::core::Error::empty());
     }
     // SAFETY: plain D3D12 object creation with valid descriptions.
@@ -350,8 +359,7 @@ fn process_memory() -> (u64, u64) {
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
-    // As in `create`: `VICTORY_NO_GPU=1` means no device at all (#39).
-    if crate::switch::on("VICTORY_NO_GPU") {
+    if no_gpu() {
         return Err(windows::core::Error::empty());
     }
     // SAFETY: plain DXGI adapter queries.
@@ -787,11 +795,21 @@ pub(crate) mod tests {
         list.close();
     }
 
+    /// The guards in `create` and `warp_adapter` ask `no_gpu`: only a set
+    /// value other than `0` turns the device off, so `0` and unset leave it.
+    #[test]
+    fn no_gpu_is_on_only_when_set_and_not_zero() {
+        use std::ffi::OsStr;
+        assert!(no_gpu_in(Some(OsStr::new("1"))));
+        assert!(!no_gpu_in(Some(OsStr::new("0"))));
+        assert!(!no_gpu_in(None));
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         // `VICTORY_NO_GPU=1` (CI, #39): no adapter and no host device at all.
         // Without it (or with `0`) the probe below runs as on any machine.
-        if crate::switch::on("VICTORY_NO_GPU") {
+        if no_gpu() {
             assert!(warp_adapter().is_err(), "VICTORY_NO_GPU leaves no WARP adapter");
             assert!(create().is_err(), "VICTORY_NO_GPU leaves no host device");
             return;
