@@ -219,7 +219,7 @@ mod tests {
                 // Which dot of which glyph: its bit says the colour.
                 let (dx, dy) = ((x - 6) / 2, (y - 6) / 2);
                 let (column, row) = ((dx + 5) % 6, dy.wrapping_sub(1));
-                let bits = text.chars().nth(((dx + 5) / 6).wrapping_sub(1) as usize).map(glyph);
+                let bits = text.chars().nth(dx.div_ceil(6).wrapping_sub(1) as usize).map(glyph);
                 let on = dx >= 1 && column < 5 && row < 7 && bits.is_some_and(|b| b[row as usize] & (0x10 >> column) != 0);
                 let want = if on { MARK } else { BLACK };
                 for i in 0..4 {

@@ -53,11 +53,10 @@ impl Hasher for Quick {
         if let Quick::Sip(sip) = self {
             return sip.write(bytes);
         }
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in &mut chunks {
-            self.word(u64::from_le_bytes(chunk.try_into().unwrap_or_default()));
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            self.word(u64::from_le_bytes(*chunk));
         }
-        let rest = chunks.remainder();
         if !rest.is_empty() {
             let mut last = [0u8; 8];
             last[..rest.len()].copy_from_slice(rest);
