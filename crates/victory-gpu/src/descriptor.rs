@@ -691,6 +691,7 @@ impl Drop for Heap {
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .retain(|h| h.at != at);
+            SHAPE_LIVENESS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         #[cfg(windows)]
         {
@@ -947,11 +948,16 @@ const PLACED: u32 = 2;
 /// program can have. The 15 bits above them are its size.
 const CONSTANT_ADDRESS_BITS: u32 = 47;
 /// Bits of a placed view's address in its record: placed memory is title
-/// memory, which lies below 1 TiB. The 22 bits above them number its shape
-/// slot, bounded to [`SHAPE_LIMIT`] (16,384 shapes); slots are only reused
-/// once no live descriptor heap names them.
+/// memory, which lies below 1 TiB. The 22 bits above them carry the shape
+/// slot (14 bits, bounding [`SHAPES`] to 16,384 slots) and a non-wrapping
+/// 8-bit generation (slots retire at `u8::MAX` rather than wrapping).
 const PLACED_ADDRESS_BITS: u32 = 40;
-const SHAPE_LIMIT: usize = 1 << 14;
+const SHAPE_BITS: u32 = 14;
+const SHAPE_LIMIT: usize = 1 << SHAPE_BITS;
+const SHAPE_INDEX_MASK: usize = SHAPE_LIMIT - 1;
+/// Minimum missed `shape_number` inserts between unsuccessful full sweeps
+/// when no view heap was dropped meanwhile.
+const SWEEP_RETRY_MISSES: u32 = 1024;
 
 /// A view of placed memory without its address: whether it is unordered
 /// access, the resource description, and the view's words but the two that
@@ -967,24 +973,40 @@ struct Shapes {
     list: Vec<Shape>,
     index: std::collections::BTreeMap<Shape, u32>,
     free: Vec<u32>,
+    last_sweep_epoch: u64,
+    misses_since_sweep: u32,
 }
 
 static SHAPES: std::sync::RwLock<Shapes> = std::sync::RwLock::new(Shapes {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     free: Vec::new(),
+    last_sweep_epoch: 0,
+    misses_since_sweep: 0,
 });
 
-/// Per-slot liveness and in-flight pin count for [`SHAPES`]:
+/// Per-slot liveness, non-wrapping generation, and in-flight pin count for [`SHAPES`]:
 /// - `SHAPE_ALIVE`: `true` while the slot holds an active shape (false while
-///   on `free`), checked lock-free by [`inline_current`] and [`placed_of`].
+///   on `free` or retired).
+/// - `SHAPE_GENERATIONS`: monotonically incremented on reclamation; slots at
+///   `u8::MAX` retire instead of wrapping so stale headers never alias.
 /// - `SHAPE_PINNED`: incremented before [`shape_number`] returns a slot and
-///   decremented in [`record`] only after [`write_record`] publishes the
-///   record, so [`Shapes::sweep`] never reclaims an in-flight slot.
+///   decremented in [`record`] only after [`write_record`] publishes.
 static SHAPE_ALIVE: [std::sync::atomic::AtomicBool; SHAPE_LIMIT] =
     [const { std::sync::atomic::AtomicBool::new(false) }; SHAPE_LIMIT];
+static SHAPE_GENERATIONS: [std::sync::atomic::AtomicU8; SHAPE_LIMIT] =
+    [const { std::sync::atomic::AtomicU8::new(0) }; SHAPE_LIMIT];
 static SHAPE_PINNED: [std::sync::atomic::AtomicU32; SHAPE_LIMIT] =
     [const { std::sync::atomic::AtomicU32::new(0) }; SHAPE_LIMIT];
+
+/// Bumped when a `VIEWS_KIND` heap is dropped so [`shape_number`] knows
+/// heap liveness may have changed.
+static SHAPE_LIVENESS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tracks concurrent `copy_simple` calls so [`Shapes::sweep`] never reclaims
+/// shapes based on a scan that raced with a descriptor copy.
+static COPY_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static COPY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The number of shapes in [`SHAPES`], for [`views_current`] to know a
 /// record's shape without the lock (stored after the shape is there).
@@ -1056,11 +1078,23 @@ fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, 
     ((unordered, *resource, rest), u64::from(desc[10]) | u64::from(desc[11]) << 32)
 }
 
+/// Encodes a shape slot and its non-wrapping 8-bit generation into the 22-bit
+/// shape code carried by `PLACED` record headers.
+fn shape_code(idx: u32, generation: u8) -> u32 {
+    u32::from(generation) << SHAPE_BITS | idx
+}
+
 /// Pins shape slot `idx` in `pinned` so [`Shapes::sweep`] will not reclaim
-/// it before [`write_record`] publishes the record, and returns `idx`.
-fn pin_shape(idx: u32, pinned: &[std::sync::atomic::AtomicU32]) -> u32 {
-    pinned[idx as usize].fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    idx
+/// it before [`write_record`] publishes the record, and returns `(code, idx)`.
+fn pin_shape(
+    idx: u32,
+    pinned: &[std::sync::atomic::AtomicU32],
+    generations: &[std::sync::atomic::AtomicU8],
+) -> (u32, u32) {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    pinned[idx as usize].fetch_add(1, AcqRel);
+    let generation = generations[idx as usize].load(Acquire);
+    (shape_code(idx, generation), idx)
 }
 
 /// Whether the descriptor memory `[addr, addr + len)` is readable. On Windows
@@ -1117,36 +1151,50 @@ unsafe fn read_record_atomic(addr: u64) -> [u32; 3] {
     }
 }
 
-/// Atomically copies `bytes` (a multiple of 4 when 4-byte aligned) between
-/// descriptor slots so concurrent [`Shapes::sweep`] reads do not data-race.
+/// Atomically copies `count` descriptor slots of `step` bytes from `src` to
+/// `dst`. The 12-byte `[tag, i, generation]` header uses `AtomicU32` loads and
+/// stores when 4-byte aligned so concurrent [`Shapes::sweep`] reads do not
+/// data-race; any remaining tail bytes (`12..step`) use an untyped byte copy
+/// so uninitialized descriptor-tail bytes are never read as typed atomics.
 ///
 /// # Safety
-/// `src` and `dst` must be valid for `bytes` bytes (and non-overlapping or
-/// handled safely).
-unsafe fn copy_slots_atomic(dst: u64, src: u64, bytes: usize) {
+/// `src` and `dst` must be valid for `count * step` bytes.
+unsafe fn copy_slots_atomic(dst: u64, src: u64, count: u32, step: u64) {
     use std::sync::atomic::{AtomicU32, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
-    if dst.is_multiple_of(4) && src.is_multiple_of(4) && bytes.is_multiple_of(4) {
-        let count = bytes / 4;
-        let s = src as *const AtomicU32;
-        let d = dst as *mut AtomicU32;
-        if dst < src || dst >= src + bytes as u64 {
-            for k in 0..count {
-                // SAFETY: aligned, in-bounds descriptor memory.
-                let v = unsafe { (*s.add(k)).load(Acquire) };
-                // SAFETY: aligned, in-bounds descriptor memory.
-                unsafe { (*d.add(k)).store(v, Release) };
+    let total = u64::from(count) * step;
+    let non_overlapping_or_forward = dst < src || dst >= src + total;
+    let copy_one = |k: u64| {
+        let d = dst + k * step;
+        let s = src + k * step;
+        if step >= 12 && d.is_multiple_of(4) && s.is_multiple_of(4) {
+            let sa = s as *const AtomicU32;
+            let da = d as *mut AtomicU32;
+            // SAFETY: aligned, in-bounds 12-byte record header.
+            unsafe {
+                let i = (*sa.add(1)).load(Relaxed);
+                let generation = (*sa.add(2)).load(Relaxed);
+                let tag = (*sa).load(Acquire);
+                (*da.add(1)).store(i, Relaxed);
+                (*da.add(2)).store(generation, Relaxed);
+                (*da).store(tag, Release);
+            }
+            if step > 12 {
+                // SAFETY: caller guarantees valid tail bytes `12..step`.
+                unsafe { std::ptr::copy((s + 12) as *const u8, (d + 12) as *mut u8, (step - 12) as usize) };
             }
         } else {
-            for k in (0..count).rev() {
-                // SAFETY: aligned, in-bounds descriptor memory.
-                let v = unsafe { (*s.add(k)).load(Relaxed) };
-                // SAFETY: aligned, in-bounds descriptor memory.
-                unsafe { (*d.add(k)).store(v, Release) };
-            }
+            // SAFETY: caller guarantees valid `src` and `dst` slot ranges.
+            unsafe { std::ptr::copy(s as *const u8, d as *mut u8, step as usize) };
+        }
+    };
+    if non_overlapping_or_forward {
+        for k in 0..u64::from(count) {
+            copy_one(k);
         }
     } else {
-        // SAFETY: caller guarantees valid `src` and `dst` ranges.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, bytes) };
+        for k in (0..u64::from(count)).rev() {
+            copy_one(k);
+        }
     }
 }
 
@@ -1160,22 +1208,39 @@ fn in_view_heap(addr: u64) -> bool {
 }
 
 impl Shapes {
-    fn get(&self, shape: &Shape, pinned: &[std::sync::atomic::AtomicU32]) -> Option<u32> {
-        self.index.get(shape).map(|&idx| pin_shape(idx, pinned))
+    fn get(
+        &self,
+        shape: &Shape,
+        pinned: &[std::sync::atomic::AtomicU32],
+        generations: &[std::sync::atomic::AtomicU8],
+    ) -> Option<(u32, u32)> {
+        self.index.get(shape).map(|&idx| pin_shape(idx, pinned, generations))
     }
 
-    /// Scans every live view heap in `heaps` and moves any active shape slot
-    /// that is neither named by any heap slot nor pinned in `pinned` onto
-    /// `self.free`. If any heap range is unreadable, conservatively aborts
-    /// and retains all shapes.
+    /// Snapshots `pinned` before scanning `heaps`, then reclaims active slots
+    /// that were unpinned at snapshot time and are not named by any live heap
+    /// slot. If any heap range is unreadable or a descriptor copy runs
+    /// concurrently, conservatively aborts and retains all shapes. Slots whose
+    /// generation reaches `u8::MAX` retire instead of wrapping.
     fn sweep(
         &mut self,
         heaps: &[ViewHeap],
         pinned: &[std::sync::atomic::AtomicU32],
         alive: &[std::sync::atomic::AtomicBool],
+        generations: &[std::sync::atomic::AtomicU8],
+        copy_guard: Option<(&std::sync::atomic::AtomicUsize, &std::sync::atomic::AtomicU64)>,
     ) -> usize {
         use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+        let copy_seq = if let Some((in_flight, seq)) = copy_guard {
+            if in_flight.load(Acquire) != 0 {
+                return 0;
+            }
+            Some(seq.load(Acquire))
+        } else {
+            None
+        };
         let n = self.list.len();
+        let pinned_snapshot: Vec<u32> = (0..n).map(|idx| pinned[idx].load(Acquire)).collect();
         let mut live = vec![false; n];
         for h in heaps {
             let bytes = u64::from(h.count) * 32;
@@ -1187,19 +1252,30 @@ impl Shapes {
                 // SAFETY: `h` is a live `VIEWS_KIND` heap and `range_readable` succeeded.
                 let [tag, i, generation] = unsafe { read_record_atomic(addr) };
                 if tag == VIEW_TAG && (generation >> KIND_SHIFT) == PLACED {
-                    let idx = (payload(i, generation) >> PLACED_ADDRESS_BITS) as usize;
-                    if idx < n {
+                    let code = (payload(i, generation) >> PLACED_ADDRESS_BITS) as usize;
+                    let idx = code & SHAPE_INDEX_MASK;
+                    let shape_gen = (code >> SHAPE_BITS) as u8;
+                    if idx < n && generations[idx].load(Acquire) == shape_gen {
                         live[idx] = true;
                     }
                 }
             }
         }
+        if let (Some((in_flight, seq)), Some(start_seq)) = (copy_guard, copy_seq)
+            && (in_flight.load(Acquire) != 0 || seq.load(Acquire) != start_seq)
+        {
+            return 0;
+        }
         let mut freed = 0;
         for (idx, &in_heap) in live.iter().enumerate() {
-            if !in_heap && pinned[idx].load(Acquire) == 0 && alive[idx].load(Relaxed) {
+            if !in_heap && pinned_snapshot[idx] == 0 && alive[idx].load(Relaxed) {
                 alive[idx].store(false, Release);
                 self.index.remove(&self.list[idx]);
-                self.free.push(idx as u32);
+                let gen_now = generations[idx].load(Relaxed);
+                if let Some(next_gen) = gen_now.checked_add(1) {
+                    generations[idx].store(next_gen, Release);
+                    self.free.push(idx as u32);
+                }
                 freed += 1;
             }
         }
@@ -1215,73 +1291,93 @@ impl Shapes {
         limit: usize,
         pinned: &[std::sync::atomic::AtomicU32],
         alive: &[std::sync::atomic::AtomicBool],
-    ) -> (Option<u32>, bool) {
+        generations: &[std::sync::atomic::AtomicU8],
+    ) -> (Option<(u32, u32)>, bool) {
         use std::sync::atomic::Ordering::Release;
-        if let Some(idx) = self.get(&shape, pinned) {
-            return (Some(idx), false);
+        if let Some(res) = self.get(&shape, pinned, generations) {
+            return (Some(res), false);
         }
         if let Some(idx) = self.free.pop() {
             let slot = idx as usize;
             self.list[slot] = shape;
             self.index.insert(shape, idx);
             alive[slot].store(true, Release);
-            pin_shape(idx, pinned);
-            return (Some(idx), false);
+            return (Some(pin_shape(idx, pinned, generations)), false);
         }
         if self.list.len() < limit {
             let idx = self.list.len() as u32;
             self.list.push(shape);
             self.index.insert(shape, idx);
+            generations[idx as usize].store(0, Release);
             alive[idx as usize].store(true, Release);
-            pin_shape(idx, pinned);
-            return (Some(idx), true);
+            return (Some(pin_shape(idx, pinned, generations)), true);
         }
         (None, false)
     }
 }
 
-/// The number of `shape`, a new or reused slot (pinned in [`SHAPE_PINNED`]) if
-/// one is available; when [`SHAPES`] reaches [`SHAPE_LIMIT`], sweeps live
-/// [`VIEW_HEAPS`] for unused slots, returning `None` if every slot is still
-/// named or pinned.
-fn shape_number(shape: Shape) -> Option<u32> {
-    if let Some(idx) = SHAPES
+/// The `(code, slot_idx)` of `shape`, pinned in [`SHAPE_PINNED`], if one is
+/// available; when [`SHAPES`] reaches [`SHAPE_LIMIT`], sweeps live
+/// [`VIEW_HEAPS`] for unused slots only when liveness may have changed or after
+/// [`SWEEP_RETRY_MISSES`] misses, falling back to `None` in between.
+fn shape_number(shape: Shape) -> Option<(u32, u32)> {
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    if let Some(res) = SHAPES
         .read()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&shape, &SHAPE_PINNED)
+        .get(&shape, &SHAPE_PINNED, &SHAPE_GENERATIONS)
     {
-        return Some(idx);
+        return Some(res);
     }
     let mut shapes = SHAPES.write().unwrap_or_else(|e| e.into_inner());
-    let (idx, grew) = shapes.insert(shape, SHAPE_LIMIT, &SHAPE_PINNED, &SHAPE_ALIVE);
+    let (res, grew) = shapes.insert(shape, SHAPE_LIMIT, &SHAPE_PINNED, &SHAPE_ALIVE, &SHAPE_GENERATIONS);
     if grew {
-        SHAPES_KNOWN.store(shapes.list.len(), std::sync::atomic::Ordering::Release);
-        return idx;
+        SHAPES_KNOWN.store(shapes.list.len(), Release);
+        return res;
     }
-    if idx.is_some() {
-        return idx;
+    if res.is_some() {
+        return res;
     }
+    let epoch = SHAPE_LIVENESS_EPOCH.load(Acquire);
+    if shapes.last_sweep_epoch == epoch && shapes.misses_since_sweep < SWEEP_RETRY_MISSES {
+        shapes.misses_since_sweep += 1;
+        return None;
+    }
+    shapes.last_sweep_epoch = epoch;
+    shapes.misses_since_sweep = 0;
     let heaps = VIEW_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    shapes.sweep(&heaps, &SHAPE_PINNED, &SHAPE_ALIVE);
+    let freed = shapes.sweep(
+        &heaps,
+        &SHAPE_PINNED,
+        &SHAPE_ALIVE,
+        &SHAPE_GENERATIONS,
+        Some((&COPY_IN_FLIGHT, &COPY_SEQ)),
+    );
     drop(heaps);
-    shapes.insert(shape, SHAPE_LIMIT, &SHAPE_PINNED, &SHAPE_ALIVE).0
+    if freed == 0 {
+        return None;
+    }
+    shapes.insert(shape, SHAPE_LIMIT, &SHAPE_PINNED, &SHAPE_ALIVE, &SHAPE_GENERATIONS).0
 }
 
 /// The record words that name the view of placed memory at `address` with
-/// shape number `shape`.
+/// shape code `shape`.
 fn placed_words(shape: u32, address: u64) -> [u32; 2] {
     kind_words(PLACED, u64::from(shape) << PLACED_ADDRESS_BITS | address)
 }
 
 /// The view of placed memory [`placed_words`] named, if its shape slot is
-/// known and active.
+/// active and still at the header's generation.
 fn placed_of(i: u32, generation: u32) -> Option<View> {
+    use std::sync::atomic::Ordering::Acquire;
     let payload = payload(i, generation);
     let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
-    let idx = (payload >> PLACED_ADDRESS_BITS) as usize;
+    let code = (payload >> PLACED_ADDRESS_BITS) as usize;
+    let idx = code & SHAPE_INDEX_MASK;
+    let shape_gen = (code >> SHAPE_BITS) as u8;
     let shapes = SHAPES.read().unwrap_or_else(|e| e.into_inner());
     let &(unordered, resource, rest) = shapes.list.get(idx)?;
-    if !SHAPE_ALIVE[idx].load(std::sync::atomic::Ordering::Acquire) {
+    if !SHAPE_ALIVE[idx].load(Acquire) || SHAPE_GENERATIONS[idx].load(Acquire) != shape_gen {
         return None;
     }
     let mut desc = [0u32; 16];
@@ -1311,8 +1407,8 @@ fn inline_words(view: &View) -> Option<([u32; 2], Option<u32>)> {
             if address >> PLACED_ADDRESS_BITS != 0 {
                 return None;
             }
-            let idx = shape_number(shape)?;
-            let words = placed_words(idx, address);
+            let (code, idx) = shape_number(shape)?;
+            let words = placed_words(code, address);
             NAMED_WHOLE[1].fetch_add(1, Relaxed);
             Some((words, Some(idx)))
         }
@@ -1327,8 +1423,13 @@ fn inline_current(i: u32, generation: u32, shapes: usize) -> bool {
     match generation >> KIND_SHIFT {
         CONSTANT => true,
         PLACED => {
-            let idx = (payload(i, generation) >> PLACED_ADDRESS_BITS) as usize;
-            idx < shapes && SHAPE_ALIVE[idx].load(std::sync::atomic::Ordering::Acquire)
+            use std::sync::atomic::Ordering::Acquire;
+            let code = (payload(i, generation) >> PLACED_ADDRESS_BITS) as usize;
+            let idx = code & SHAPE_INDEX_MASK;
+            let shape_gen = (code >> SHAPE_BITS) as u8;
+            idx < shapes
+                && SHAPE_ALIVE[idx].load(Acquire)
+                && SHAPE_GENERATIONS[idx].load(Acquire) == shape_gen
         }
         _ => false,
     }
@@ -1717,19 +1818,22 @@ fn preserve_copied_placed(slot: u64, step: u64) {
 
 /// Device method: `count` descriptors of `kind` from `src` to `dst`.
 pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
+    use std::sync::atomic::Ordering::{AcqRel, Release};
     let Some(step) = increment(kind).map(u64::from) else {
         return;
     };
-    let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
+        COPY_IN_FLIGHT.fetch_add(1, AcqRel);
         // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { copy_slots_atomic(dst, src, len as usize) };
+        unsafe { copy_slots_atomic(dst, src, count, step) };
         for i in 0..u64::from(count) {
             let slot = dst + i * step;
             preserve_copied_placed(slot, step);
             #[cfg(windows)]
             mirror(slot);
         }
+        COPY_SEQ.fetch_add(1, Release);
+        COPY_IN_FLIGHT.fetch_sub(1, Release);
     }
 }
 
@@ -2313,15 +2417,18 @@ pub(crate) mod tests {
     /// materialized into `VIEWS` so they keep resolving after slot reuse.
     #[test]
     fn shapes_table_is_bounded_and_evicts_stale() {
-        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Acquire};
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering::Acquire, Ordering::Release};
         const CAP: usize = 4;
         let mut shapes = Shapes {
             list: Vec::new(),
             index: std::collections::BTreeMap::new(),
             free: Vec::new(),
+            last_sweep_epoch: 0,
+            misses_since_sweep: 0,
         };
         let pinned = [const { AtomicU32::new(0) }; CAP];
         let alive = [const { AtomicBool::new(false) }; CAP];
+        let generations = [const { AtomicU8::new(0) }; CAP];
         let make = |k: u32| -> Shape { (false, [k; 14], [k + 100; 14]) };
 
         // Two backing heaps (4 slots each); slot 0 of heap_a holds shape 0
@@ -2329,13 +2436,13 @@ pub(crate) mod tests {
         let mut heap_a = [[0u32; 8]; 4];
         let mut heap_b = [[0u32; 8]; 4];
         for k in 0..CAP as u32 {
-            let (idx, grew) = shapes.insert(make(k), CAP, &pinned, &alive);
+            let (res, grew) = shapes.insert(make(k), CAP, &pinned, &alive, &generations);
             assert!(grew);
-            let idx = idx.unwrap();
-            let [i, generation] = placed_words(idx, 0x1000);
+            let (code, idx) = res.unwrap();
+            let [i, generation] = placed_words(code, 0x1000);
             let dst = if k == 0 { &mut heap_a[0] } else { &mut heap_b[k as usize] };
             write_record(dst.as_mut_ptr() as u64, i, generation);
-            pinned[idx as usize].fetch_sub(1, std::sync::atomic::Ordering::Release);
+            pinned[idx as usize].fetch_sub(1, Release);
         }
         assert_eq!(shapes.list.len(), CAP);
 
@@ -2345,39 +2452,58 @@ pub(crate) mod tests {
         ];
 
         // All 4 shapes are in live heaps, so none are evicted.
-        assert_eq!(shapes.sweep(&heaps, &pinned, &alive), 0);
-        assert_eq!(shapes.insert(make(99), CAP, &pinned, &alive), (None, false));
+        assert_eq!(shapes.sweep(&heaps, &pinned, &alive, &generations, None), 0);
+        assert_eq!(shapes.insert(make(99), CAP, &pinned, &alive, &generations), (None, false));
 
         // Pin slot 1 in-flight, drop heap_b, and sweep: slot 1 stays protected
-        // while slots 2 and 3 are reclaimed.
-        pin_shape(1, &pinned);
-        assert_eq!(shapes.sweep(&heaps[..1], &pinned, &alive), 2);
+        // while slots 2 and 3 are reclaimed and their generations advance.
+        pin_shape(1, &pinned, &generations);
+        assert_eq!(shapes.sweep(&heaps[..1], &pinned, &alive, &generations, None), 2);
         assert!(alive[1].load(Acquire));
         assert!(!alive[2].load(Acquire));
+        assert_eq!(generations[2].load(Acquire), 1);
 
         // Unpin slot 1 after publication: now it is reclaimed too.
-        pinned[1].fetch_sub(1, std::sync::atomic::Ordering::Release);
-        assert_eq!(shapes.sweep(&heaps[..1], &pinned, &alive), 1);
+        pinned[1].fetch_sub(1, Release);
+        assert_eq!(shapes.sweep(&heaps[..1], &pinned, &alive, &generations, None), 1);
         assert!(!alive[1].load(Acquire));
+        assert_eq!(generations[1].load(Acquire), 1);
         assert!(alive[0].load(Acquire));
 
-        // Shape 0 is still intact; a new shape reuses one of the freed slots.
-        assert_eq!(shapes.get(&make(0), &pinned), Some(0));
-        pinned[0].fetch_sub(1, std::sync::atomic::Ordering::Release);
-        let (reused, grew) = shapes.insert(make(99), CAP, &pinned, &alive);
+        // Shape 0 is still intact; a new shape reuses one of the freed slots
+        // with generation 1.
+        assert_eq!(shapes.get(&make(0), &pinned, &generations), Some((0, 0)));
+        pinned[0].fetch_sub(1, Release);
+        let (reused, grew) = shapes.insert(make(99), CAP, &pinned, &alive, &generations);
         assert!(!grew);
-        assert!(matches!(reused, Some(1..=3)));
+        let (code, idx) = reused.unwrap();
+        assert!(matches!(idx, 1..=3));
+        assert_eq!((code >> SHAPE_BITS) as u8, 1);
+        pinned[idx as usize].fetch_sub(1, Release);
         assert_eq!(shapes.list.len(), CAP);
+
+        // A slot at generation `u8::MAX` retires instead of wrapping around.
+        generations[idx as usize].store(u8::MAX, Release);
+        let freed_at_max = shapes.sweep(&heaps[..1], &pinned, &alive, &generations, None);
+        assert!(freed_at_max >= 1);
+        assert!(!alive[idx as usize].load(Acquire));
+        assert!(!shapes.free.contains(&idx));
 
         // Copying a PLACED record outside VIEW_HEAPS materializes it into VIEWS
         // so it keeps resolving even if the shape slot is later reused.
-        let src_slot = [0u64; 4];
-        let dst_slot = [0u64; 4];
+        let mut src_slot = [0u64; 4];
+        let mut dst_slot = [0u64; 4];
         let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee8_0000 + k as u32);
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a78_0000 + k as u32);
         (desc[10], desc[11]) = (0x2000, 0x2);
-        create_placed_srv(std::ptr::null(), &resource, &desc, src_slot.as_ptr() as u64);
-        copy_simple(std::ptr::null(), 1, dst_slot.as_ptr() as u64, src_slot.as_ptr() as u64, VIEWS_KIND);
+        create_placed_srv(std::ptr::null(), &resource, &desc, src_slot.as_mut_ptr() as u64);
+        copy_simple(
+            std::ptr::null(),
+            1,
+            dst_slot.as_mut_ptr() as u64,
+            src_slot.as_mut_ptr() as u64,
+            VIEWS_KIND,
+        );
         // SAFETY: `dst_slot` holds a 32-byte record.
         let copied = unsafe { read_record_atomic(dst_slot.as_ptr() as u64) };
         assert_eq!(copied[2] >> KIND_SHIFT, 0, "copied outside VIEW_HEAPS becomes a table entry");
