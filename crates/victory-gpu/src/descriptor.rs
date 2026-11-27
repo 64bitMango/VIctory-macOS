@@ -928,27 +928,41 @@ const PLACED: u32 = 2;
 /// program can have. The 15 bits above them are its size.
 const CONSTANT_ADDRESS_BITS: u32 = 47;
 /// Bits of a placed view's address in its record: placed memory is title
-/// memory, which lies below 1 TiB. The 22 bits above them number its shape.
+/// memory, which lies below 1 TiB. The 22 bits above them carry the shape
+/// slot (14 bits, bounding the table to 16,384 shapes) and its 8-bit
+/// generation (so an evicted slot's old record never names the new shape).
 const PLACED_ADDRESS_BITS: u32 = 40;
-const SHAPE_LIMIT: usize = 1 << (62 - PLACED_ADDRESS_BITS);
+const SHAPE_BITS: u32 = 14;
+const SHAPE_LIMIT: usize = 1 << SHAPE_BITS;
+const SHAPE_INDEX_MASK: usize = SHAPE_LIMIT - 1;
 
 /// A view of placed memory without its address: whether it is unordered
 /// access, the resource description, and the view's words but the two that
 /// hold the address (10 and 11).
 type Shape = (bool, [u32; 14], [u32; 14]);
 
-/// The shapes of placed views named whole in their records, by number, and
-/// where each is. Only ever added to: as many as the title has kinds of
-/// textures and buffers, however often it moves them. A lock of its own,
-/// apart from the entries and their index: nearly every placed view has a
-/// shape seen before, which readers share.
+/// The shapes of placed views named whole in their records, by slot, and
+/// where each is. Bounded to [`SHAPE_LIMIT`] entries via clock eviction;
+/// a lock of its own, apart from the entries and their index: nearly every
+/// placed view has a shape seen before, which readers share.
 struct Shapes {
     list: Vec<Shape>,
     index: std::collections::BTreeMap<Shape, u32>,
+    clock: usize,
 }
 
-static SHAPES: std::sync::RwLock<Shapes> =
-    std::sync::RwLock::new(Shapes { list: Vec::new(), index: std::collections::BTreeMap::new() });
+static SHAPES: std::sync::RwLock<Shapes> = std::sync::RwLock::new(Shapes {
+    list: Vec::new(),
+    index: std::collections::BTreeMap::new(),
+    clock: 0,
+});
+
+/// Per-slot generation and second-chance bit for [`SHAPES`], lock-free so
+/// [`views_current`] and [`shape_number`] hits avoid taking the write lock.
+static SHAPE_GENERATIONS: [std::sync::atomic::AtomicU8; SHAPE_LIMIT] =
+    [const { std::sync::atomic::AtomicU8::new(0) }; SHAPE_LIMIT];
+static SHAPE_REFERENCED: [std::sync::atomic::AtomicBool; SHAPE_LIMIT] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; SHAPE_LIMIT];
 
 /// The number of shapes in [`SHAPES`], for [`views_current`] to know a
 /// record's shape without the lock (stored after the shape is there).
@@ -1020,25 +1034,87 @@ fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, 
     ((unordered, *resource, rest), u64::from(desc[10]) | u64::from(desc[11]) << 32)
 }
 
-/// The number of `shape`, a new one if it is not there yet; `None` when the
-/// shapes are full (the view is then a table entry).
+/// Encodes a shape slot and its current generation into the 22-bit shape code.
+fn shape_code(idx: u32, generation: u8) -> u32 {
+    u32::from(generation) << SHAPE_BITS | idx
+}
+
+/// Marks shape slot `idx` as recently used without dirtying its cache line on
+/// repeated hits, and returns its encoded shape code.
+fn shape_hit(idx: u32, generations: &[std::sync::atomic::AtomicU8], referenced: &[std::sync::atomic::AtomicBool]) -> u32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let slot = idx as usize;
+    if !referenced[slot].load(Relaxed) {
+        referenced[slot].store(true, Relaxed);
+    }
+    shape_code(idx, generations[slot].load(Relaxed))
+}
+
+impl Shapes {
+    fn get(
+        &self,
+        shape: &Shape,
+        generations: &[std::sync::atomic::AtomicU8],
+        referenced: &[std::sync::atomic::AtomicBool],
+    ) -> Option<u32> {
+        self.index.get(shape).map(|&idx| shape_hit(idx, generations, referenced))
+    }
+
+    /// Inserts `shape` or evicts an unreferenced slot via a second-chance
+    /// clock sweep once `limit` is reached. Returns `(code, grew)`.
+    fn insert(
+        &mut self,
+        shape: Shape,
+        limit: usize,
+        generations: &[std::sync::atomic::AtomicU8],
+        referenced: &[std::sync::atomic::AtomicBool],
+    ) -> (u32, bool) {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        if let Some(code) = self.get(&shape, generations, referenced) {
+            return (code, false);
+        }
+        if self.list.len() < limit {
+            let idx = self.list.len() as u32;
+            self.list.push(shape);
+            self.index.insert(shape, idx);
+            generations[idx as usize].store(0, Release);
+            referenced[idx as usize].store(true, Relaxed);
+            return (shape_code(idx, 0), true);
+        }
+        let idx = loop {
+            let candidate = self.clock;
+            self.clock = (candidate + 1) % limit;
+            if !referenced[candidate].swap(false, Relaxed) {
+                break candidate;
+            }
+        };
+        let old = std::mem::replace(&mut self.list[idx], shape);
+        self.index.remove(&old);
+        self.index.insert(shape, idx as u32);
+        let generation = generations[idx].load(Relaxed).wrapping_add(1);
+        generations[idx].store(generation, Release);
+        referenced[idx].store(true, Relaxed);
+        (shape_code(idx as u32, generation), false)
+    }
+}
+
+/// The number of `shape`, a new one if it is not there yet; when [`SHAPES`]
+/// reaches [`SHAPE_LIMIT`], a second-chance clock sweep evicts an unreferenced
+/// slot and advances its generation.
 fn shape_number(shape: Shape) -> Option<u32> {
-    if let Some(&at) = SHAPES.read().unwrap_or_else(|e| e.into_inner()).index.get(&shape) {
-        return Some(at);
+    if let Some(code) = SHAPES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&shape, &SHAPE_GENERATIONS, &SHAPE_REFERENCED)
+    {
+        return Some(code);
     }
     let mut shapes = SHAPES.write().unwrap_or_else(|e| e.into_inner());
-    // Looked up again: another thread may have entered it meanwhile.
-    if let Some(&at) = shapes.index.get(&shape) {
-        return Some(at);
+    let (code, grew) = shapes.insert(shape, SHAPE_LIMIT, &SHAPE_GENERATIONS, &SHAPE_REFERENCED);
+    if grew {
+        SHAPES_KNOWN.store(shapes.list.len(), std::sync::atomic::Ordering::Release);
     }
-    if shapes.list.len() >= SHAPE_LIMIT {
-        return None;
-    }
-    let at = shapes.list.len() as u32;
-    shapes.list.push(shape);
-    shapes.index.insert(shape, at);
-    SHAPES_KNOWN.store(shapes.list.len(), std::sync::atomic::Ordering::Release);
-    Some(at)
+    Some(code)
 }
 
 /// The record words that name the view of placed memory at `address` with
@@ -1047,12 +1123,19 @@ fn placed_words(shape: u32, address: u64) -> [u32; 2] {
     kind_words(PLACED, u64::from(shape) << PLACED_ADDRESS_BITS | address)
 }
 
-/// The view of placed memory [`placed_words`] named, if its shape is known.
+/// The view of placed memory [`placed_words`] named, if its shape is known
+/// and still at the same generation.
 fn placed_of(i: u32, generation: u32) -> Option<View> {
     let payload = payload(i, generation);
     let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
+    let code = (payload >> PLACED_ADDRESS_BITS) as usize;
+    let idx = code & SHAPE_INDEX_MASK;
+    let shape_gen = (code >> SHAPE_BITS) as u8;
     let shapes = SHAPES.read().unwrap_or_else(|e| e.into_inner());
-    let &(unordered, resource, rest) = shapes.list.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
+    let &(unordered, resource, rest) = shapes.list.get(idx)?;
+    if SHAPE_GENERATIONS[idx].load(std::sync::atomic::Ordering::Acquire) != shape_gen {
+        return None;
+    }
     let mut desc = [0u32; 16];
     desc[..10].copy_from_slice(&rest[..10]);
     (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
@@ -1089,11 +1172,16 @@ fn inline_words(view: &View) -> Option<[u32; 2]> {
 
 /// Whether the record words `i`, `generation` of a kind other than a table
 /// entry name a view: a constant buffer view always does, a placed view if
-/// its shape is known.
+/// its shape slot is known and still at the same generation.
 fn inline_current(i: u32, generation: u32, shapes: usize) -> bool {
     match generation >> KIND_SHIFT {
         CONSTANT => true,
-        PLACED => ((payload(i, generation) >> PLACED_ADDRESS_BITS) as usize) < shapes,
+        PLACED => {
+            let code = (payload(i, generation) >> PLACED_ADDRESS_BITS) as usize;
+            let idx = code & SHAPE_INDEX_MASK;
+            let shape_gen = (code >> SHAPE_BITS) as u8;
+            idx < shapes && SHAPE_GENERATIONS[idx].load(std::sync::atomic::Ordering::Acquire) == shape_gen
+        }
         _ => false,
     }
 }
@@ -2021,6 +2109,53 @@ pub(crate) mod tests {
         }
         ENTRIES_ONLY.with(|only| only.set(false));
         assert_eq!(address_entries(addresses, resource).0, before + 100);
+    }
+
+    /// The placed-view shapes table stays bounded at its limit, keeps
+    /// recently hit shapes via the second-chance clock sweep, and bumps an
+    /// evicted slot's generation so stale records no longer match.
+    #[test]
+    fn shapes_table_is_bounded_and_evicts_stale() {
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Acquire};
+        const CAP: usize = 8;
+        let mut shapes = Shapes {
+            list: Vec::new(),
+            index: std::collections::BTreeMap::new(),
+            clock: 0,
+        };
+        let generations = [const { AtomicU8::new(0) }; CAP];
+        let referenced = [const { AtomicBool::new(false) }; CAP];
+        let make = |k: u32| -> Shape {
+            (false, [k; 14], [k + 100; 14])
+        };
+
+        // Fill the table to `CAP` (all slots start with `referenced = true`).
+        for k in 0..CAP as u32 {
+            let (_, grew) = shapes.insert(make(k), CAP, &generations, &referenced);
+            assert!(grew);
+        }
+        assert_eq!(shapes.list.len(), CAP);
+
+        // First eviction sweeps 0..CAP clearing `referenced` to false, then
+        // evicts slot 0, leaving `clock = 1` and slots 1..CAP unreferenced.
+        let (evict0, grew) = shapes.insert(make(99), CAP, &generations, &referenced);
+        assert!(!grew);
+        assert_eq!((evict0 as usize) & SHAPE_INDEX_MASK, 0);
+        assert_eq!((evict0 >> SHAPE_BITS) as u8, 1);
+
+        // Touch slot 1 so the next sweep gives it a second chance and evicts slot 2.
+        let slot1 = shapes.get(&make(1), &generations, &referenced).expect("slot 1 present");
+        let (evict2, grew) = shapes.insert(make(100), CAP, &generations, &referenced);
+        assert!(!grew);
+        assert_eq!(shapes.list.len(), CAP);
+        assert_eq!(shapes.index.len(), CAP);
+
+        assert_eq!(shapes.get(&make(1), &generations, &referenced), Some(slot1));
+        assert_eq!(shapes.get(&make(2), &generations, &referenced), None);
+        assert_eq!(shapes.get(&make(100), &generations, &referenced), Some(evict2));
+        assert_eq!(generations[2].load(Acquire), 1);
+        assert_eq!((evict2 >> SHAPE_BITS) as u8, 1);
+        assert_eq!((evict2 as usize) & SHAPE_INDEX_MASK, 2);
     }
 
     /// A record copied as bytes names its constant buffer or placed view
