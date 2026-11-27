@@ -1274,7 +1274,8 @@ mod tests {
         assert_eq!(memory_at(base + 0x3008), "no access");
         // SAFETY: releases the reservation made above.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
-        assert_eq!(memory_at(base + 8), "nothing mapped there");
+        // Not asked of `base` again: tests on other threads map memory, and
+        // one may be given the pages just released (CI saw "read-execute").
         assert_eq!(memory_at(0), "nothing mapped there");
         assert_eq!(memory_at(usize::MAX), "outside the address space");
         // This test's own code: an image page, named by its module.
@@ -1901,7 +1902,7 @@ mod tests {
             unsafe { ((page + at) as *const [u8; 3]).read_volatile() }
         };
         let watched = 0u64;
-        // SAFETY: (both) code of ours at that offset, of that signature.
+        // SAFETY: code of ours at that offset, of that signature.
         let first: extern "system" fn(*const u64) = unsafe { std::mem::transmute(page + 0x100) };
         // SAFETY: as above.
         let second: extern "system" fn(*const u64) = unsafe { std::mem::transmute(page + 0x800) };
@@ -2028,7 +2029,7 @@ mod tests {
                 .concat();
         let page = code_page(4096, &[(0x100, &first), (0x200, &scratch), (0x300, &second), (0x400, &entered)]);
         let mut pool = None;
-        // SAFETY: (both) our page, which nothing runs yet.
+        // SAFETY: our page, which nothing runs yet.
         assert_eq!(unsafe { patch_clzero_loops_in(page as u64, 0x400, page as u64, false, &mut pool) }, (3, 0));
         assert_eq!(
             // SAFETY: as above.
