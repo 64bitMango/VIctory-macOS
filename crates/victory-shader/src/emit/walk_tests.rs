@@ -373,6 +373,13 @@ fn programs() -> Vec<(&'static str, Vec<u32>, u32, u32, Want)> {
 /// with four root constants in s0-s3 and a table in s4 whose first view is
 /// a raw buffer.
 fn native(words: &[u32], lds_bytes: u32) -> NativeProgram {
+    native_group(words, lds_bytes, [64, 1, 1])
+}
+
+/// [`native`] for a group of `threads`: with more than one dimension the
+/// thread ids x and y are in v0 and v1, else the flat id is in v0.
+fn native_group(words: &[u32], lds_bytes: u32, threads: [u32; 3]) -> NativeProgram {
+    let id_vgprs = if threads[1] > 1 { 2 } else { 1 };
     let param = |root, user_data, sgprs, slot| RootParam {
         root,
         table_offset_dwords: 0,
@@ -400,8 +407,8 @@ fn native(words: &[u32], lds_bytes: u32) -> NativeProgram {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: (lds_bytes / 512) << 15 | 5 << 1,
-            threads: [64, 1, 1],
+            rsrc2: (lds_bytes / 512) << 15 | (id_vgprs - 1) << 11 | 5 << 1,
+            threads,
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     }
@@ -605,4 +612,306 @@ fn walked_programs_give_the_console_wave_s_results() {
     eprintln!(
         "ran on the hardware device: {ran} wave64 programs in halves with wave-wide branches"
     );
+}
+
+// ---- the first live lane of the console wave, with only its upper half live ----
+
+const V_OR: u32 = 0x1C;
+const V_MUL_U24: u32 = 0x0B;
+
+/// [`branch`] with EXEC saved in s[`save`:`save` + 1], so that one can be
+/// inside another.
+fn branch_saving(save: u32, lanes: &[u32], body: &[u32]) -> Vec<u32> {
+    let mut w = lanes.to_vec();
+    w.push(sop1(S_AND_SAVEEXEC_B64, save, VCC));
+    w.push(sopp(EXECZ, body.len() as i32));
+    w.extend(body);
+    w.push(sop1(S_MOV_B64, EXEC, save));
+    w
+}
+
+/// VCC as `lo <= lane < hi`, the lane (in v4) being the thread's console
+/// lane: `hi == 64` leaves the upper bound out.
+fn lanes_between(lo: u32, hi: u32) -> Vec<u32> {
+    let mut w = vec![vopc(V_CMP_LT_U32, k(lo - 1), v(4))];
+    if hi < 64 {
+        w.extend(vop3c(V_CMP_GT_U32, 14, k(hi), v(4)));
+        w.push(sop2(S_AND_B64, VCC, VCC, 14));
+    }
+    w
+}
+
+/// The first lane's 2 × id, stored by each lane of the branch (`id` in
+/// v0, 2 × id in v3).
+fn read_first_and_store() -> Vec<u32> {
+    let mut w = vec![
+        vop2(V_LSHLREV, 3, k(1), v(0)),
+        vop1(V_READFIRSTLANE, 16, v(3)),
+        vop1(V_MOV, 2, 16),
+    ];
+    w.extend(store(2, 0));
+    w
+}
+
+/// A first-lane read (of 2 × id, as in [`first_lane_in_branch`]) in
+/// branches that leave the lanes `lo..hi` of each console wave: with
+/// `nested`, inside `if (lane >= 16)` first, which both halves enter. A
+/// lane count in the program asks for the console's lanes. Each lane in
+/// the branch stores 2 × the id of the first of those lanes of its own
+/// console wave.
+fn first_lane_upper(lo: u32, hi: u32, nested: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend(V_MBCNT_LO_V9);
+    w.push(vop2(V_AND, 4, k(63), v(0)));
+    let inner = |body: &[u32]| branch_saving(22, &lanes_between(lo, hi), body);
+    if nested {
+        let body = inner(&read_first_and_store());
+        w.extend(branch(&lanes_between(16, 64), &body));
+    } else {
+        w.extend(inner(&read_first_and_store()));
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What thread `id` of [`first_lane_upper`] stores.
+fn first_lane_upper_wants(id: u32, lo: u32, hi: u32) -> u32 {
+    let lane = id % 64;
+    if (lo..hi).contains(&lane) {
+        2 * (id - lane + lo)
+    } else {
+        0
+    }
+}
+
+/// Each thread stores its id plus one (so that a thread that never stores
+/// reads as 0) at the dword of its flat id: for a group of `[x, 1, 1]` its
+/// id in v0; for one of `[x, y, 1]` its ids x and y in v0 and v1, stored
+/// as `x | y << 8`. A lane count in the program asks for the console's
+/// lanes.
+fn thread_ids(shape: [u32; 3]) -> Vec<u32> {
+    let mut w = PROLOGUE[..3].to_vec();
+    w.extend(V_MBCNT_LO_V9);
+    if shape[1] == 1 {
+        w.push(vop2(V_ADD, 7, k(1), v(0)));
+        w.push(vop2(V_LSHLREV, 1, k(2), v(0)));
+    } else {
+        // (the address, v1 last: it holds y until then)
+        w.push(vop2(V_LSHLREV, 7, k(8), v(1)));
+        w.push(vop2(V_OR, 7, v(7), 0));
+        w.push(vop2(V_ADD, 7, k(1), v(7)));
+        w.push(vop2(V_MUL_U24, 4, k(shape[0]), v(1)));
+        w.push(vop2(V_ADD, 4, v(0), 4));
+        w.push(vop2(V_LSHLREV, 1, k(2), v(4)));
+    }
+    w.extend(store(7, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What the thread at dword `f` of [`thread_ids`] stores.
+fn thread_ids_wants(f: u32, shape: [u32; 3]) -> u32 {
+    if shape[1] == 1 {
+        f + 1
+    } else {
+        ((f % shape[0]) | ((f / shape[0]) << 8)) + 1
+    }
+}
+
+/// Name, program, group, and what each thread of the group stores at its
+/// dword.
+type Case = (&'static str, Vec<u32>, [u32; 3], fn(u32) -> u32);
+
+fn upper_cases() -> Vec<Case> {
+    let mut cases: Vec<Case> = Vec::new();
+    for threads in [64, 128] {
+        let g = [threads, 1, 1];
+        cases.push((
+            if threads == 64 {
+                "a first lane, upper half only, 64"
+            } else {
+                "a first lane, upper half only, 128"
+            },
+            first_lane_upper(32, 64, false),
+            g,
+            |id| first_lane_upper_wants(id, 32, 64),
+        ));
+        cases.push((
+            if threads == 64 {
+                "a first lane, lanes 40..48, 64"
+            } else {
+                "a first lane, lanes 40..48, 128"
+            },
+            first_lane_upper(40, 48, false),
+            g,
+            |id| first_lane_upper_wants(id, 40, 48),
+        ));
+        cases.push((
+            if threads == 64 {
+                "a first lane, upper half only, nested, 64"
+            } else {
+                "a first lane, upper half only, nested, 128"
+            },
+            first_lane_upper(32, 64, true),
+            g,
+            |id| first_lane_upper_wants(id, 32, 64),
+        ));
+        cases.push((
+            if threads == 64 {
+                "a first lane, lanes 40..48, nested, 64"
+            } else {
+                "a first lane, lanes 40..48, nested, 128"
+            },
+            first_lane_upper(40, 48, true),
+            g,
+            |id| first_lane_upper_wants(id, 40, 48),
+        ));
+        cases.push((
+            if threads == 64 {
+                "thread ids, 64"
+            } else {
+                "thread ids, 128"
+            },
+            thread_ids(g),
+            g,
+            |f| f + 1,
+        ));
+    }
+    cases.push(
+        ("thread ids, 8 x 8", thread_ids([8, 8, 1]), [8, 8, 1], |f| {
+            thread_ids_wants(f, [8, 8, 1])
+        }),
+    );
+    cases.push((
+        "thread ids, 16 x 8",
+        thread_ids([16, 8, 1]),
+        [16, 8, 1],
+        |f| thread_ids_wants(f, [16, 8, 1]),
+    ));
+    cases
+}
+
+/// `words` for a group of `threads`, as the translation makes any program.
+fn translated_in(name: &str, words: &[u32], threads: [u32; 3]) -> HostShader {
+    let native = native_group(words, 0, threads);
+    let bytes = dxbc::build(&[]);
+    let c = dxbc::Container::parse(&bytes).expect("container");
+    let options = Options {
+        narrow_waves: true,
+        ..Options::default()
+    };
+    super::translate_program(&c, &native, options, None)
+        .unwrap_or_else(|e| panic!("{name}: translate: {e}"))
+}
+
+#[test]
+fn the_upper_half_test_programs_are_what_their_comments_say() {
+    let text = |words: &[u32]| -> Vec<String> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        crate::gfx10::decode(&code)
+            .unwrap_or_else(|e| panic!("{words:08x?}: {e}"))
+            .iter()
+            .map(|i| i.text(true))
+            .collect()
+    };
+    assert_eq!(
+        text(&first_lane_upper(40, 48, true)[PROLOGUE.len()..]),
+        [
+            "v_mbcnt_lo_u32_b32 v9, -1, 0",
+            "v_and_b32 v4, 63, v0",
+            "v_cmp_lt_u32 vcc, 15, v4",
+            "s_and_saveexec_b64 s[20:21], vcc",
+            "s_cbranch_execz label_0048",
+            "v_cmp_lt_u32 vcc, 39, v4",
+            "v_cmp_gt_u32 s[14:15], 48, v4",
+            "s_and_b64 vcc, vcc, s[14:15]",
+            "s_and_saveexec_b64 s[22:23], vcc",
+            "s_cbranch_execz label_0044",
+            "v_lshlrev_b32 v3, 1, v0",
+            "v_readfirstlane_b32 s16, v3",
+            "v_mov_b32 v2, s16",
+            "buffer_store_dword v2, v1, s[8:11], 0 offen",
+            "s_mov_b64 exec, s[22:23]",
+            "s_mov_b64 exec, s[20:21]",
+            "s_endpgm",
+        ]
+    );
+    assert_eq!(
+        text(&thread_ids([16, 8, 1])[3..]),
+        [
+            "v_mbcnt_lo_u32_b32 v9, -1, 0",
+            "v_lshlrev_b32 v7, 8, v1",
+            "v_or_b32 v7, v7, v0",
+            "v_add_nc_u32 v7, 1, v7",
+            "v_mul_u32_u24 v4, 16, v1",
+            "v_add_nc_u32 v4, v0, v4",
+            "v_lshlrev_b32 v1, 2, v4",
+            "buffer_store_dword v7, v1, s[8:11], 0 offen",
+            "s_endpgm",
+        ]
+    );
+}
+
+/// Every one runs in halves, not as the console's 64 lanes, which
+/// D3DMetal does not run.
+#[test]
+fn the_upper_half_cases_run_in_halves() {
+    for (name, words, threads, _) in upper_cases() {
+        let shader = translated_in(name, &words, threads);
+        assert_ne!(wave_size(&shader.dxil), 64, "{name}");
+    }
+}
+
+/// On the hardware device (D3DMetal under Wine: 32-lane waves): the first
+/// live lane of the console wave when only its upper half is live (in a
+/// second console wave too), and every thread of a group given its own id.
+#[cfg(windows)]
+#[test]
+fn the_upper_half_cases_give_the_console_wave_s_results() {
+    use super::host::{Dispatch, Host, Root, View};
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 hardware device ({e}); skipped");
+            return;
+        }
+    };
+    let mut ran = 0;
+    for (name, words, threads, want) in upper_cases() {
+        let shader = translated_in(name, &words, threads);
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{name}: compute_pipeline failed: {e}"));
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let n: u32 = threads.iter().product();
+        // A few groups at once, as in the walked programs.
+        for groups in [1u32, 8] {
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud.clone()))],
+                        views: &[View::RawUav(n)],
+                        samplers: &[],
+                        groups: [groups, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{name}: dispatch failed: {e}"));
+            // (every group stores the same)
+            let expect: Vec<u32> = (0..n).map(want).collect();
+            assert_eq!(out[0][..n as usize], expect[..], "{name}, {groups} groups");
+        }
+        ran += 1;
+    }
+    eprintln!("ran on the hardware device: {ran} upper-half and thread-id programs in halves");
 }
