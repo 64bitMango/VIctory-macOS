@@ -146,7 +146,7 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 }
 
 /// [`lower`], with the trial interface layout and the mesh store order
-/// [`super::Options`] chooses; `barycentrics`: the barycentric input VGPRs
+/// [`crate::emit::Options`] chooses; `barycentrics`: the barycentric input VGPRs
 /// read as values are `SV_Barycentrics` (else reading one stops the
 /// program with [`BARYCENTRICS_READ`]; only a program that cannot do
 /// without them is made again with them, `super::emit_with`).

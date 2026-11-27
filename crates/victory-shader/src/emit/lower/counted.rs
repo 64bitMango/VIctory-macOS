@@ -49,7 +49,7 @@ use crate::ir::Program;
 use crate::native::StageIo;
 use crate::resource::{MEMORY, Resources, USER_DATA};
 
-/// What [`super::super::Options`] asks of the lowering besides
+/// What [`crate::emit::Options`] asks of the lowering besides
 /// [`super::Parts`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Extra {
