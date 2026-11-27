@@ -32,5 +32,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
-        # Every crate's tests, even after one fails.
+        # Every crate's tests, even after one fails. Without a GPU device:
+        # the runners have none, and WARP crashes in the GPU tests (#39).
+        env:
+          VICTORY_NO_GPU: "1"
         run: cargo test --workspace --locked --no-fail-fast

@@ -188,6 +188,11 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    // `VICTORY_NO_GPU=1`: no host device, as on a machine without one; CI
+    // sets it, as its runners' WARP crashes in the tests (#39).
+    if crate::switch::on("VICTORY_NO_GPU") {
+        return Err(windows::core::Error::empty());
+    }
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -344,6 +349,10 @@ fn process_memory() -> (u64, u64) {
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
+    // As in `create`: `VICTORY_NO_GPU=1` means no device at all (#39).
+    if crate::switch::on("VICTORY_NO_GPU") {
+        return Err(windows::core::Error::empty());
+    }
     // SAFETY: plain DXGI adapter queries.
     unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
