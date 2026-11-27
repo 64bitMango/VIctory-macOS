@@ -75,6 +75,7 @@ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
 
 impl Heap {
     /// Whether this is a sampler heap.
+    #[cfg(windows)]
     pub(crate) fn samplers(&self) -> bool {
         self.desc.kind == SAMPLERS
     }
@@ -114,6 +115,8 @@ impl Heap {
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
+    #[cfg(windows)]
+    #[cfg(windows)]
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);
         let at = handle.checked_sub(self.start)?;
@@ -336,6 +339,7 @@ pub(crate) fn sync_heaps() {
     let _syncing = crate::contend::syncing();
     let began = std::time::Instant::now();
     let frame = crate::frame::current();
+    let mut runs = Vec::new();
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -347,7 +351,7 @@ pub(crate) fn sync_heaps() {
         let step = u64::from(step);
         // The slots to make, then made together: on several threads where
         // there are enough (`host::HostHeap::make_runs`).
-        let mut runs = Vec::new();
+        runs.clear();
         due_in_heap(host, start, step, heap.desc.count, Some(written), frame, &mut runs);
         host.make_runs(&runs, start, step);
     }
@@ -430,7 +434,7 @@ pub(crate) fn due_in_heap(
         // again at the next sync: `crate::watch::rest_ms`. A slot is made
         // again only if its record changed, so a page told twice costs the
         // look.)
-        let Some(written) = written else {
+        let Some(written) = written.filter(|written| !written.clean()) else {
             return checked;
         };
         #[cfg(feature = "diagnostics")]
@@ -1005,6 +1009,7 @@ fn constant_words(address: u64, size: u32) -> Option<[u32; 2]> {
 }
 
 /// The constant buffer view [`constant_words`] named.
+#[cfg(any(windows, test))]
 fn constant_of(i: u32, generation: u32) -> View {
     let payload = payload(i, generation);
     let code = (payload >> CONSTANT_ADDRESS_BITS) as u32;
@@ -1048,6 +1053,7 @@ fn placed_words(shape: u32, address: u64) -> [u32; 2] {
 }
 
 /// The view of placed memory [`placed_words`] named, if its shape is known.
+#[cfg(any(windows, test))]
 fn placed_of(i: u32, generation: u32) -> Option<View> {
     let payload = payload(i, generation);
     let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
@@ -1221,6 +1227,7 @@ fn record_shared() -> bool {
 }
 
 /// The title released `resource`: the views naming it go stale.
+#[cfg(any(windows, test))]
 pub(crate) fn forget(resource: usize) {
     let mut index = VIEW_INDEX.write().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = index.by_resource.remove(&resource) else {
@@ -1257,6 +1264,7 @@ pub(crate) fn forget(resource: usize) {
 /// The view the record words `i` and `generation` name: the one they hold
 /// whole ([`inline_words`]), or the view of entry `i` if `generation` is
 /// still its own.
+#[cfg(any(windows, test))]
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
         0 => {
@@ -1314,6 +1322,7 @@ fn generations_alone() -> bool {
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
+#[cfg(any(windows, test))]
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
         return None;
@@ -1508,15 +1517,18 @@ pub(crate) extern "system" fn copy(
 }
 
 /// The view recorded at `handle`, if one is.
+#[cfg(windows)]
 pub(crate) fn rtv_record(handle: u64) -> Option<RtvRecord> {
     tagged_record(handle, RTV_TAG)
 }
 
 /// The depth view recorded at `handle`, if one is.
+#[cfg(windows)]
 pub(crate) fn dsv_record(handle: u64) -> Option<RtvRecord> {
     tagged_record(handle, DSV_TAG)
 }
 
+#[cfg(windows)]
 fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
     if handle == 0 {
         return None;
@@ -1628,11 +1640,14 @@ static FUNCTIONS: Table<24> = {
 pub(crate) mod tests {
     /// Work to run while `make_read` makes the textures of a read slot (the
     /// slot), outside the heaps' lock.
+    #[cfg(windows)]
     pub(crate) static WHILE_MAKING: std::sync::Mutex<Option<(u32, Work)>> = std::sync::Mutex::new(None);
 
     /// The work [`WHILE_MAKING`] runs.
+    #[cfg(windows)]
     pub(crate) type Work = Box<dyn FnOnce() + Send>;
 
+    #[cfg(windows)]
     pub(crate) fn while_making(slots: &[u32]) {
         let mut hook = WHILE_MAKING.lock().unwrap_or_else(|e| e.into_inner());
         if hook.as_ref().is_some_and(|(slot, _)| slots.contains(slot))
@@ -2334,7 +2349,7 @@ pub(crate) mod tests {
                             let slot = FIRST + ((seed >> 20) % span) as u32;
                             // A third of the writes into the heap no sync
                             // looks at: by calls only.
-                            let own = (seed >> 48) % 3 == 0;
+                            let own = (seed >> 48).is_multiple_of(3);
                             let views = own || what & 1 == 1;
                             let (kind, step) = if views { (VIEWS_KIND, 32u64) } else { (SAMPLERS, 16) };
                             let start = if own { unwatched_start } else { base(usize::from(views)) };
@@ -2479,7 +2494,7 @@ pub(crate) mod tests {
                         let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
                         let mut view = [0u32; 16];
                         view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
-                        let address = textures_at + ((round + t) % 16 << 12);
+                        let address = textures_at + (((round + t) % 16) << 12);
                         (view[10], view[11]) = (address as u32, (address >> 32) as u32);
                         barrier.wait();
                         for i in FIRST..SLOTS {

@@ -173,20 +173,24 @@ pub(crate) fn segments(this: This) -> Vec<std::sync::Arc<crate::host::HostList>>
 
 /// Waits recorded after commands: the title list goes on in a new host
 /// list, which runs once the wait holds.
+#[cfg(windows)]
 static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Lists reset or released while a queue still held some of their host
 /// lists: D3D12 lets a list be reset as soon as it is submitted (Grand
 /// Theft Auto VI does, 0-21 times a world frame).
+#[cfg(windows)]
 static EARLY_RESETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Cuts and early resets since the last call (the frame line).
+#[cfg(windows)]
 pub(crate) fn take_cuts() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (CUTS.swap(0, Relaxed), EARLY_RESETS.swap(0, Relaxed))
 }
 
 /// Cuts for hoisted clamps since the last call (the frame-rate line).
+#[cfg(windows)]
 pub(crate) fn take_hoists() -> u64 {
     HOISTS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
@@ -229,6 +233,7 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
 
 /// Runs of indirect draws whose clamps went to the host list before
 /// ([`hoist`]): each cut the title list once more.
+#[cfg(windows)]
 static HOISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Before an indirect draw (`crate::indirect::hoisting`): unless the clamps
@@ -507,6 +512,8 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    #[cfg(not(windows))]
+    let _ = this;
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         end_hoist(this);
@@ -606,6 +613,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
 
 /// An unordered access barrier on every resource: earlier shader writes
 /// finish before later work reads or writes.
+#[cfg(windows)]
 const UAV_BARRIER: Barrier = Barrier {
     kind: 2,
     flags: 0,
@@ -616,6 +624,8 @@ const UAV_BARRIER: Barrier = Barrier {
 
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
+    #[cfg(not(windows))]
+    let _ = (this, count, barriers);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
@@ -919,10 +929,12 @@ extern "system" fn copy_texture_region(
 #[cfg(test)]
 impl CopyLocation {
     /// A placed footprint in `resource` (tests).
+    #[cfg(windows)]
     pub(crate) fn placed(resource: This, footprint: crate::resource::PlacedFootprint) -> Self {
         Self { resource, kind: 1, footprint }
     }
     /// Subresource 0 of `resource` (tests).
+    #[cfg(windows)]
     pub(crate) fn whole(resource: This) -> Self {
         Self { resource, kind: 0, footprint: crate::resource::PlacedFootprint::new(0, 0, 0, 0, 0) }
     }
@@ -931,10 +943,12 @@ impl CopyLocation {
 /// Texture read backs since the last frame-rate line: how many, bytes
 /// (diagnostics).
 #[cfg(feature = "diagnostics")]
+#[cfg(windows)]
 pub(crate) static READ_BACKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// (texture, buffer) pairs read back so far, each logged once (diagnostics).
 #[cfg(feature = "diagnostics")]
+#[cfg(windows)]
 static READ_BACK_PAIRS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
 
 /// Texture to buffer (a read back): the region is copied on the host into
@@ -1862,7 +1876,11 @@ extern "system" fn execute_indirect(
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
+    #[cfg(not(windows))]
+    let _ = (this, count_offset);
+    #[cfg(windows)]
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    #[cfg(windows)]
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -1887,6 +1905,7 @@ extern "system" fn execute_indirect(
             count.is_null() || counter.is_some()
         ));
     }
+    #[cfg(windows)]
     if ran {
         return;
     }
@@ -1907,6 +1926,7 @@ extern "system" fn execute_indirect(
 }
 
 /// Indirect executions dropped since the last call.
+#[cfg(windows)]
 pub(crate) fn take_indirect() -> u64 {
     INDIRECT.swap(0, std::sync::atomic::Ordering::Relaxed)
 }

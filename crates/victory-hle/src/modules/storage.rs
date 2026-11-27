@@ -172,14 +172,13 @@ static VTABLE: Methods<8> = Methods([
     prompt_result as *const (),    // 0x38
 ]);
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
 
     #[test]
     // Reaching the folder goes through the Windows file layer.
-    #[cfg(windows)]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {
         type Size = extern "system" fn(This, *mut usize) -> HRESULT;
         type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;

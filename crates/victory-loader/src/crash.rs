@@ -1903,6 +1903,7 @@ mod tests {
         let watched = 0u64;
         // SAFETY: (both) code of ours at that offset, of that signature.
         let first: extern "system" fn(*const u64) = unsafe { std::mem::transmute(page + 0x100) };
+        // SAFETY: code of ours at that offset, of that signature.
         let second: extern "system" fn(*const u64) = unsafe { std::mem::transmute(page + 0x800) };
         // Not a title's code: emulated, and left as it is.
         let before = exceptions();
@@ -2030,6 +2031,7 @@ mod tests {
         // SAFETY: (both) our page, which nothing runs yet.
         assert_eq!(unsafe { patch_clzero_loops_in(page as u64, 0x400, page as u64, false, &mut pool) }, (3, 0));
         assert_eq!(
+            // SAFETY: this is our page and nothing runs it yet.
             unsafe { patch_clzero_loops_in(page as u64 + 0x400, 0x100, page as u64, false, &mut pool) },
             (0, 1),
             "a loop bytes nearby jump into is left"
@@ -2049,7 +2051,7 @@ mod tests {
         type Loop = extern "system" fn(u64, u64, *mut [u64; 3]) -> u64;
         // SAFETY: (all three) code of ours at that offset, of that signature.
         let run: [Loop; 3] = unsafe {
-            [std::mem::transmute(page + 0x100), std::mem::transmute(page + 0x200), std::mem::transmute(page + 0x300)]
+            [0x100, 0x200, 0x300].map(|offset| std::mem::transmute::<usize, Loop>(page + offset))
         };
         // (start, limit) from `base`: inside a line, on a line's edge, an
         // unaligned start, the limit at the start and below it.

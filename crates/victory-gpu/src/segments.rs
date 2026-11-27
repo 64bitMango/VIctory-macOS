@@ -220,8 +220,8 @@ mod tests {
                 // into the segments holding it, as `Shadow::update_busy`
                 // puts it; other bytes just change.
                 let (p, q) = (random(N - 8), 1 + random(8));
-                for at in p..p + q {
-                    host[at] = host[at].wrapping_add(step as u8 + 1);
+                for byte in &mut host[p..p + q] {
+                    *byte = byte.wrapping_add(step as u8 + 1);
                 }
                 if random(2) == 0 {
                     for segments in [&mut j, &mut a] {

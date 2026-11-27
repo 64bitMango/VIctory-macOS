@@ -1204,6 +1204,9 @@ impl HostHeap {
     pub(crate) fn make_runs(&self, runs: &[Run], start: u64, step: u64) {
         #[cfg(feature = "diagnostics")]
         let _making = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncRunsUs);
+        if runs.is_empty() {
+            return;
+        }
         let slots: usize = runs.iter().map(Vec::len).sum();
         let threads = if slots >= SPREAD || cfg!(test) { sync_threads() } else { 1 };
         // The helpers work for this thread, which waits for them: where it

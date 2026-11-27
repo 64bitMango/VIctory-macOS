@@ -545,6 +545,10 @@ pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTextur
 }
 
 impl Staging {
+    pub(crate) fn dirty_bit(&self) -> Option<u32> {
+        self.tracked.as_ref().and_then(crate::watch::Tracked::bit)
+    }
+
     /// Whether its memory may have changed since it was last detiled (an
     /// untracked texture always may).
     pub(crate) fn maybe_changed(&self) -> bool {

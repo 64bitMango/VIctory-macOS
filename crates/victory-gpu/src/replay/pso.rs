@@ -54,9 +54,9 @@ pub(super) trait Keep {
 /// # Safety
 /// `at` points at a value of `size` bytes.
 unsafe fn plain(kind: i32, at: *const c_void, size: usize) -> Part {
-    // SAFETY: the caller's.
     Part::Plain {
         kind,
+        // SAFETY: the caller supplies size readable bytes at at.
         data: Blob(unsafe { std::slice::from_raw_parts(at.cast::<u8>(), size) }.to_vec()),
     }
 }
@@ -300,8 +300,10 @@ pub(super) fn make(
     bytes.resize(bytes.len().next_multiple_of(8), 0);
     // Aligned for the pointers in it.
     let mut words: Vec<u64> = bytes
-        .chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().unwrap_or_default()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
         .collect();
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
         SizeInBytes: words.len() * 8,

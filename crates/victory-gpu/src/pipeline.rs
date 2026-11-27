@@ -18,7 +18,9 @@
 
 use std::collections::HashMap;
 use std::mem::offset_of;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
+#[cfg(windows)]
+use std::sync::OnceLock;
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -398,6 +400,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 /// dispatches a world frame, dropped until 640b830 read their root constants
 /// as root views. Unset: none is known, so `VICTORY_BVH_BUILDS=0` leaves out
 /// only the ray activation.
+#[cfg(windows)]
 fn bvh_builder() -> &'static [String] {
     static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
@@ -439,6 +442,7 @@ fn bvh_builds() -> bool {
 ///   left out with the structure builds ([`activates_rays`]).
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy)]
+#[cfg(windows)]
 pub(crate) enum Hook {
     Ambient,
     Reflected,
@@ -447,7 +451,7 @@ pub(crate) enum Hook {
 }
 
 /// The name [`Hook`] `which` is given, read once; empty when unset.
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 pub(crate) fn hook(which: Hook) -> &'static [u8] {
     static NAMES: std::sync::OnceLock<[Vec<u8>; 4]> = std::sync::OnceLock::new();
     let names = NAMES.get_or_init(|| {
@@ -471,7 +475,7 @@ pub(crate) fn names(bytes: &[u8], name: &[u8]) -> bool {
 /// Belobug fork. There, once it ran with no rays behind it, the whole
 /// picture lost light, shadows and reflections (its runs opt31b against
 /// sans39, 2026-11-25).
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn activates_rays(container: &[u8]) -> bool {
     names(container, hook(Hook::Rays))
 }

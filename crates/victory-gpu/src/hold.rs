@@ -14,7 +14,9 @@
 //! again until none can move. Order within a queue never changes, only the
 //! interleaving across queues.
 
+#[cfg(any(windows, test))]
 use std::collections::VecDeque;
+#[cfg(any(windows, test))]
 use std::time::{Duration, Instant};
 
 /// A wait for a memory value, as a list records it: the value at `address`
@@ -30,19 +32,28 @@ pub(crate) struct ValueWait {
 }
 
 /// D3D12 comparison functions (`D3D12_COMPARISON_FUNC`).
+#[cfg(any(windows, test))]
 const NEVER: u32 = 1;
+#[cfg(any(windows, test))]
 const LESS: u32 = 2;
+#[cfg(any(windows, test))]
 const EQUAL: u32 = 3;
+#[cfg(any(windows, test))]
 const LESS_EQUAL: u32 = 4;
+#[cfg(any(windows, test))]
 const GREATER: u32 = 5;
+#[cfg(any(windows, test))]
 const NOT_EQUAL: u32 = 6;
+#[cfg(any(windows, test))]
 const GREATER_EQUAL: u32 = 7;
+#[cfg(any(windows, test))]
 const ALWAYS: u32 = 8;
 
 impl ValueWait {
     /// Whether it holds with `read` giving the memory's value: `None` for a
     /// comparison we do not know (counted by the caller, taken as holding)
     /// and for memory that cannot be read (taken as not holding).
+    #[cfg(any(windows, test))]
     pub(crate) fn holds(&self, read: &dyn Fn(u64, u8) -> Option<u64>) -> Option<bool> {
         if !(NEVER..=ALWAYS).contains(&self.comparison) {
             return None;
@@ -63,6 +74,7 @@ impl ValueWait {
 }
 
 /// What a queue holds, in its order.
+#[cfg(any(windows, test))]
 pub(crate) enum Item<S> {
     /// A list segment and the waits at its start.
     Segment(S, Vec<ValueWait>),
@@ -74,6 +86,7 @@ pub(crate) enum Item<S> {
 
 /// What a pump did, for the frame's accounting.
 #[derive(Default, Debug, PartialEq, Eq)]
+#[cfg(any(windows, test))]
 pub(crate) struct Pumped {
     /// Pieces given to the host GPU, and the segments in them.
     pub(crate) pieces: u32,
@@ -86,20 +99,24 @@ pub(crate) struct Pumped {
 }
 
 /// Every queue's held work.
+#[cfg(any(windows, test))]
 pub(crate) struct Held<S> {
     queues: Vec<(usize, Fifo<S>)>,
 }
 
 /// A queue's items, each with when it was pushed and whether it is fresh
 /// (not yet found waiting).
+#[cfg(any(windows, test))]
 type Fifo<S> = VecDeque<(Item<S>, Instant, bool)>;
 
+#[cfg(any(windows, test))]
 impl<S> Default for Held<S> {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(any(windows, test))]
 impl<S> Held<S> {
     pub(crate) const fn new() -> Self {
         Held { queues: Vec::new() }
@@ -107,6 +124,7 @@ impl<S> Held<S> {
 }
 
 /// What the pump needs from the outside world.
+#[cfg(any(windows, test))]
 pub(crate) struct World<'a, S> {
     /// A memory value (address, bytes).
     pub(crate) read: &'a dyn Fn(u64, u8) -> Option<u64>,
@@ -119,6 +137,7 @@ pub(crate) struct World<'a, S> {
     pub(crate) signal: &'a mut dyn FnMut(usize, u64),
 }
 
+#[cfg(any(windows, test))]
 impl<S> Held<S> {
     /// Appends `item` to `queue`'s FIFO, marked fresh: whether it waited is
     /// decided by its first test.
@@ -216,6 +235,7 @@ impl<S> Held<S> {
     }
 
     /// Whether no queue holds anything.
+    #[cfg(windows)]
     pub(crate) fn is_empty(&self) -> bool {
         self.queues.is_empty()
     }
@@ -246,8 +266,10 @@ impl<S> Held<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-    use std::collections::HashMap;
+    #[cfg(any(windows, test))]
+use std::cell::RefCell;
+    #[cfg(any(windows, test))]
+use std::collections::HashMap;
 
     /// Memory, fences and a log of what ran, for a recording executor.
     #[derive(Default)]

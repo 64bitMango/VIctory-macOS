@@ -233,6 +233,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
 /// 24-bit depth it never tested EQUAL against a draw on the RX 6700 XT.
 /// shortcut: a depth bias on such a target counts in float steps, not
 /// 1/65535; scale it if a title's 16-bit depth biased draws show acne.
+#[cfg(windows)]
 pub(crate) fn pc_format(format: u32) -> u32 {
     match format {
         118 => 20,
@@ -283,16 +284,12 @@ fn host_lacks_target(format: u32) -> bool {
     })
 }
 
-#[cfg(not(windows))]
-fn host_lacks_target(_: u32) -> bool {
-    false
-}
-
 /// The format a render target or unordered-access texture of `format` is
 /// made in on the host, and that render target views and pipelines name:
 /// R8G8B8A8_UNORM for a packed 16-bit format the GPU cannot render to or
 /// write typed (`crate::packed`); else the format as the host has it.
 /// Textures only sampled keep theirs.
+#[cfg(windows)]
 pub(crate) fn target_format(format: u32) -> u32 {
     let format = pc_format(format);
     if crate::packed::is_packed(format) && host_lacks_target(format) {
@@ -303,6 +300,7 @@ pub(crate) fn target_format(format: u32) -> u32 {
 }
 
 /// The typeless format of a format's family (itself if it has none).
+#[cfg(any(windows, test))]
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
         (1, 4),
@@ -339,6 +337,7 @@ pub(crate) fn family(format: u32) -> u32 {
 }
 
 /// sRGB formats and their linear twins.
+#[cfg(windows)]
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
 /// The format a view of a title texture must name when its host copy is
@@ -355,16 +354,10 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     (format != own && format != target_format(own)).then_some(own)
 }
 
-/// Without a host device there is no host copy, so no view needs to
-/// rename its format.
-#[cfg(not(windows))]
-pub(crate) fn view_format(_this: This) -> Option<u32> {
-    None
-}
-
 /// Depth formats with their typeless family: depth textures that shaders
 /// read are made typeless on the host, which only allows views of
 /// typeless depth resources.
+#[cfg(windows)]
 pub(crate) const DEPTH_FORMATS: [(u32, u32); 4] = [(20, 19), (40, 39), (45, 44), (55, 53)];
 
 /// Mip levels, the full chain for 0.
@@ -401,11 +394,13 @@ pub(crate) struct PlacedFootprint {
 impl PlacedFootprint {
     /// A footprint at `offset` (tests).
     #[cfg(test)]
+    #[cfg(windows)]
     pub(crate) fn new(offset: u64, format: u32, width: u32, height: u32, row_pitch: u32) -> Self {
         Self { offset, format, width, height, depth: 1, row_pitch }
     }
 
     /// The bytes it spans in a buffer: every row pitched but the last.
+    #[cfg(windows)]
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
         let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
@@ -416,6 +411,7 @@ impl PlacedFootprint {
     /// The byte ranges (from the footprint's start) that a `size` texel
     /// region at texel `at` covers: one per row of blocks; `None` if the
     /// format has no size or the region leaves the footprint.
+    #[cfg(any(windows, test))]
     pub(crate) fn rows(&self, at: [u32; 3], size: [u32; 3]) -> Option<Vec<(u64, u64)>> {
         let (element, block) = element(self.format)?;
         let blocks = |texels: u32| u64::from(texels).div_ceil(block);
@@ -1175,6 +1171,18 @@ pub(crate) fn host_resource(this: This) -> Option<windows::Win32::Graphics::Dire
     resource(this).host().map(|h| h.texture.clone())
 }
 
+// Partition invalidation so unrelated host texture changes do not force a
+// scan of every texture in a heap. Collisions only cause extra checks.
+#[cfg(windows)]
+pub(crate) static TEXTURE_HOST_EPOCHS: [std::sync::atomic::AtomicU64; 1024] =
+    [const { std::sync::atomic::AtomicU64::new(1) }; 1024];
+
+#[cfg(windows)]
+pub(crate) fn texture_host_bucket(resource: usize) -> usize {
+    use std::hash::BuildHasher;
+    crate::quick::Build.hash_one(resource) as usize % TEXTURE_HOST_EPOCHS.len()
+}
+
 /// A count of title texture `this` that moves on whenever it gets its host
 /// texture or loses it: what [`made_copy`] gave for it still holds while
 /// this is what it was before that was asked. Never 0. Its own, not one for
@@ -1244,6 +1252,7 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
 
 #[cfg(windows)]
 const RENDER_TARGET: u32 = 1;
+#[cfg(any(windows, test))]
 const DEPTH: u32 = 2;
 #[cfg(windows)]
 const UNORDERED: u32 = 4;
@@ -1256,6 +1265,7 @@ const USES: u32 = 0x7;
 /// and texels of an element), and whether it is a depth texture (which
 /// cannot share with colour ones on the host).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg(any(windows, test))]
 pub(crate) struct MemoryKey {
     address: u64,
     dimension: u32,
@@ -1271,6 +1281,7 @@ pub(crate) struct MemoryKey {
 
 /// The texture memory `desc` describes at `address`; `None` for buffers
 /// and formats without a known element.
+#[cfg(any(windows, test))]
 pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey> {
     if desc.dimension == BUFFER {
         return None;
@@ -1297,6 +1308,7 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
 /// view takes them) and R10G10B10_XR_BIAS_A2_UNORM (D3DMetal has no Metal
 /// format for it and refuses every list that names it), nor the packed
 /// R8G8_B8G8_UNORM and G8R8_G8B8_UNORM (refused the same way).
+#[cfg(any(windows, test))]
 pub(crate) fn castable(format: u32) -> Vec<u32> {
     const DEPTH_FAMILIES: [u32; 10] = [19, 20, 21, 22, 40, 44, 45, 46, 47, 55];
     const XR_BIAS: u32 = 89;
@@ -1558,6 +1570,7 @@ fn desc1_of(p: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC) -> wi
 }
 
 /// A texture's console memory and description; `None` for buffers.
+#[cfg(windows)]
 pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     if this.is_null() {
         return None;
@@ -1568,6 +1581,7 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
 
 /// A texture's description as words (the layout of placed views'
 /// resource descriptions); `None` for buffers.
+#[cfg(windows)]
 pub(crate) fn texture_desc(this: This) -> Option<[u32; 14]> {
     let (_, desc) = texture_memory(this)?;
     let mut words = [0u32; 14];
@@ -1577,6 +1591,7 @@ pub(crate) fn texture_desc(this: This) -> Option<[u32; 14]> {
 }
 
 /// A texture's format as the title gave it.
+#[cfg(windows)]
 pub(crate) fn title_format(this: This) -> Option<u32> {
     (!this.is_null()).then(|| resource(this).desc.format)
 }
@@ -1611,6 +1626,8 @@ impl Resource {
         // With the lock held: whoever reads the count before it looks finds
         // this, or a count that has moved on (`hosts_changed`).
         self.host_changes.fetch_add(1, std::sync::atomic::Ordering::Release);
+        TEXTURE_HOST_EPOCHS[texture_host_bucket(std::ptr::from_ref(self) as usize)]
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         made
     }
 
@@ -1880,6 +1897,7 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
             if matches!(&*h, Some(Some(x)) if std::sync::Arc::ptr_eq(x, t)) {
                 *h = None;
                 resource(r as This).host_changes.fetch_add(1, std::sync::atomic::Ordering::Release);
+                TEXTURE_HOST_EPOCHS[texture_host_bucket(r)].fetch_add(1, std::sync::atomic::Ordering::Release);
             }
         }
         if let Some(k) = t.key {
