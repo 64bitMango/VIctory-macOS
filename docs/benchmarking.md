@@ -1,5 +1,12 @@
 # Benchmarking: comparing runs fairly
 
+`tools/macos/run-summary.sh [log]` prints what this page tells you to look
+for from one run's log: the 5-second frame lines with their medians, the
+last of each periodic breakdown (preparing, heap syncs, copying back, the
+AMD-only instructions, video memory), warnings by template, and how the run
+ended. Capture a run's log with `tools/macos/victory.sh run --execute <exe>
+2>run.log`.
+
 Comparing two runs by frame time alone misleads: after the opening, the camera's position can differ slightly between runs, and a heavier view can make a real improvement look like a regression (as happened in #20).
 
 ## 1. Match the scene and normalize by work
