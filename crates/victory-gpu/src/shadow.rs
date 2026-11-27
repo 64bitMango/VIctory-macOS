@@ -163,7 +163,7 @@ impl Shadow {
     }
 
     /// The host GPU address of the copy's first byte.
-    pub(crate) fn base(&self) -> u64 {
+    pub(crate) fn gpu_base(&self) -> u64 {
         self.gpu
     }
 
@@ -2458,15 +2458,15 @@ pub(crate) mod tests {
                         LOOKUPS_ALONE.with(|alone| alone.set(t % 3 == 2));
                         let mut seen = [0usize; 6];
                         for round in 0..2000u64 {
-                            for k in 0..6 {
+                            for (k, slot) in seen.iter_mut().enumerate() {
                                 let address = match k {
                                     0..4 => buffer(k) as u64 + 16 * (round % 8),
                                     _ => w + (k as u64 - 4) * WINDOW + 4096 * (round % 8),
                                 };
                                 let copy = find(address, 64).expect("a copy");
                                 let at = Arc::as_ptr(&copy) as usize;
-                                assert!(seen[k] == 0 || seen[k] == at, "another copy of range {k}");
-                                seen[k] = at;
+                                assert!(*slot == 0 || *slot == at, "another copy of range {k}");
+                                *slot = at;
                             }
                         }
                         seen.to_vec()
@@ -3606,9 +3606,11 @@ pub(crate) mod tests {
         assert_eq!(host(40), 0x11);
         assert!(tracked.rested(p, p + len) && !copy.clean(), "left open and marked");
         // Written again while it rests: no fault, and the next refresh has it.
+        // SAFETY: a byte of our pool, through its mapping.
         unsafe { title(41).write_volatile(0x22) };
         assert_eq!(copy.update_as(p, len, Take::Resting), PAGE, "copied again while it rests");
         assert_eq!(host(41), 0x22);
+        // SAFETY: a byte of our pool, through its mapping.
         unsafe { title(42).write_volatile(0x33) };
         // Shaders are to write the range: taken for good, with that write.
         copy.writing(p, len, true);
@@ -3616,6 +3618,7 @@ pub(crate) mod tests {
         assert_eq!(host(42), 0x33);
         // The shaders write a byte of page 0; the title another meanwhile.
         copy.write_host((p + 10) as u64, &[0xaa]);
+        // SAFETY: a byte of our pool, through its mapping.
         unsafe { title(50).write_volatile(0x44) };
         let bits = b.data as *mut u32;
         // SAFETY: a dword of the mapped bitmap.
