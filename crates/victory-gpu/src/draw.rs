@@ -2649,7 +2649,7 @@ mod tests {
     use windows::core::s;
 
     /// Dword 4 of root constants is a constant, not a root view's offset:
-    /// the Xbox BVH builder's dispatches (run 13: compute f6e47efa50226beb,
+    /// the BVH builder's dispatches (run 13: one of its compute programs,
     /// root constants at slot 8, user data 32-45) read it and were all
     /// dropped as "root view offset: no root view set". A root descriptor's
     /// offset entry still drops a draw whose root view is not set.

@@ -392,23 +392,23 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// The title's ray-tracing acceleration-structure builder (its
-/// XboxBvhBuilder.dll compute shaders, the title the known build): about
-/// 2,000 dispatches a world frame, dropped until 640b830 read their root
-/// constants as root views.
-const BVH_BUILDER: [&str; 11] = [
-    "f6e47efa50226beb",
-    "3b90165a77d95cdf",
-    "5e68767498c57eb6",
-    "6f6a359d1166bb27",
-    "ffd93c8a029ff016",
-    "190fbf0ebe040169",
-    "c85822de2e41cfaa",
-    "5062bc7a48e842f8",
-    "c42a31951201f9a0",
-    "35e51bb27a463294",
-    "f94e5d8bf4e1cf05",
-];
+/// The title's ray-tracing acceleration-structure builder (its compute
+/// shaders, named by `VICTORY_HOOK_BVH`: comma-separated 16-digit shader
+/// hashes, kept outside the repository like the other hooks): about 2,000
+/// dispatches a world frame, dropped until 640b830 read their root constants
+/// as root views. Unset: none is known, so `VICTORY_BVH_BUILDS=0` leaves out
+/// only the ray activation.
+fn bvh_builder() -> &'static [String] {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("VICTORY_HOOK_BVH")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    })
+}
 
 /// Whether the builder's dispatches run: `VICTORY_BVH_BUILDS=0` leaves them
 /// out (every build, not only diagnostics), to measure or rule out their
@@ -490,7 +490,7 @@ pub(crate) fn is_left_out(this: This) -> bool {
         SAID.call_once(|| tracing::info!("the screen probes' ray activation left out (VICTORY_BVH_BUILDS=0)"));
         return true;
     }
-    shaders.iter().any(|s| BVH_BUILDER.contains(&s.hash.as_str()))
+    shaders.iter().any(|s| bvh_builder().iter().any(|h| *h == s.hash))
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
