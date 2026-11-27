@@ -38,6 +38,8 @@ reviews:
     # The author may not approve their own pull request by command.
     allow_author_approval: false
     max_merge_risk: high
+    # Minor findings are advice: only major and critical ones hold approval.
+    min_blocking_severity: major
     overrides:
       # Always the maintainer's: CI, the policy check, build config,
       # dependencies, tools/ and this file. Renames match both paths.
