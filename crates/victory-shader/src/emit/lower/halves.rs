@@ -1091,7 +1091,7 @@ pub(super) fn solo_blocks(x: &Parts, threads: [u32; 3], id_vgprs: u8) -> Vec<boo
 }
 
 /// A console wave64 compute program made for host waves of 32 lanes
-/// ([`Options::narrow_waves`](super::Options)): each host wave holds half a
+/// ([`Options::narrow_waves`](crate::emit::Options)): each host wave holds half a
 /// console wave (lanes 0-31 or 32-63), told by the thread ids it holds.
 /// Wave operations within a half are the host's; what the console takes
 /// over the whole wave is taken per half and passed between the halves
@@ -1243,7 +1243,7 @@ pub(crate) fn count_wide(why: Why) {
     *KEPT_WIDE_WHY.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
 }
 
-/// How many translations [`Options::narrow_waves`](super::Options) left
+/// How many translations [`Options::narrow_waves`](crate::emit::Options) left
 /// at the console's wave size (a host of 32-lane waves does not run them),
 /// and why the last one.
 pub fn kept_wide() -> (u64, Option<&'static str>) {
