@@ -1605,7 +1605,6 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
         // Blocks the title has just written are left open by this
         // submission's refreshes and copied again by the next one's
         // (`crate::watch::rest_ms`), unless its shaders write title memory at
@@ -1614,7 +1613,10 @@ impl Host {
         // since its copy took it (`Shadow::copy_back_page`), which a page
         // left open cannot say. Ranges shaders write through views settle
         // their own pages (`Shadow::writing`).
-        batch.rest = crate::watch::rest_ms() != 0 && !runs.iter().any(|list| list.writes_memory());
+        let mut batch = Batch {
+            rest: crate::watch::rest_ms() != 0 && !runs.iter().any(|list| list.writes_memory()),
+            ..Default::default()
+        };
         #[cfg(feature = "diagnostics")]
         if crate::watch::rest_ms() != 0 {
             use crate::copystat::{C, add};
@@ -3103,6 +3105,9 @@ struct Batch {
 /// measured).
 const JOIN: usize = crate::watch::PAGE;
 
+/// One copy's refresh result: (from, to, bytes copied, microseconds).
+type Refresh = (usize, usize, usize, u64);
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         // Nothing to copy: a world submission asks for every copy its heaps'
@@ -3172,11 +3177,11 @@ impl Batch {
         // Several copies' refreshes on helper threads at once, each copy's
         // ranges in order on one of them (`crate::shadow::parallel_copies`).
         let requested: usize = work.iter().flat_map(|(_, ranges)| ranges.iter()).map(|(from, to)| to - from).sum();
-        let done: Vec<Vec<(usize, usize, usize, u64)>> = if crate::shadow::parallel_copies()
+        let done: Vec<Vec<Refresh>> = if crate::shadow::parallel_copies()
             && work.len() >= 2
             && requested >= crate::shadow::PARALLEL_REFRESH_MIN_BYTES
         {
-            let results: Vec<Mutex<Vec<(usize, usize, usize, u64)>>> = (0..work.len()).map(|_| Mutex::default()).collect();
+            let results: Vec<Mutex<Vec<Refresh>>> = (0..work.len()).map(|_| Mutex::default()).collect();
             crate::texture::in_parallel(work.len(), |i| {
                 let (shadow, ranges) = &work[i];
                 let out: Vec<_> = ranges
@@ -4645,6 +4650,7 @@ mod batch {
             assert!(!copy.clean());
             batch.add(&copy, p, len);
             assert_eq!(batch.flush(), 0, "once per submission");
+            // SAFETY: a byte of the mapped pool.
             unsafe { ((p + 8) as *mut u8).write_volatile(8) };
         }
         let mut batch = Batch::default();

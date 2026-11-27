@@ -299,13 +299,17 @@ pub(super) struct ListState {
     inner: Mutex<ListInner>,
 }
 
+/// The recording closed last: its commands if it was recorded whole, and the
+/// states it changes.
+type Closed = Option<(Option<Arc<Vec<u8>>>, Arc<Vec<Change>>)>;
+
 #[derive(Default)]
 struct ListInner {
     /// Recorded from its reset on.
     whole: bool,
     bytes: Vec<u8>,
     changes: Vec<Change>,
-    closed: Option<(Option<Arc<Vec<u8>>>, Arc<Vec<Change>>)>,
+    closed: Closed,
 }
 
 impl ListState {
@@ -319,7 +323,7 @@ impl ListState {
     /// The recording closed last: its commands if it was recorded whole,
     /// and the states it changes. None if it was not seen closed since its
     /// reset.
-    pub(super) fn closed(&self) -> Option<(Option<Arc<Vec<u8>>>, Arc<Vec<Change>>)> {
+    pub(super) fn closed(&self) -> Closed {
         lock(&self.inner).closed.clone()
     }
 }
@@ -597,8 +601,8 @@ impl Recorder {
         };
         let subs = gpu::subresources(&desc);
         let is_buffer = desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0;
-        // SAFETY: a live buffer.
         let va = if is_buffer {
+            // SAFETY: a live buffer.
             unsafe { object.GetGPUVirtualAddress() }
         } else {
             0

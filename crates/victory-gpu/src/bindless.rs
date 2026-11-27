@@ -845,7 +845,7 @@ pub(crate) mod tests {
                 0 => None,
                 1..=4 => {
                     let (copy, from) = (&copies[k % 4], 0x3f00 * (k as u64 / 4 % 16));
-                    Some(Seen::Buffer(copy.clone(), copy.range().0 + from, 0x40 + 0x40 * (k as u64 / 64 % 4), k % 3 == 0))
+                    Some(Seen::Buffer(copy.clone(), copy.range().0 + from, 0x40 + 0x40 * (k as u64 / 64 % 4), k.is_multiple_of(3)))
                 }
                 5 | 6 => Some(Seen::Texture(0x7e57_0000_0000 + 0x100 * (k % 6))),
                 _ => Some(Seen::Left((2, 0, 0))),

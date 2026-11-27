@@ -2310,8 +2310,8 @@ impl State {
                 }
                 #[cfg(feature = "diagnostics")]
                 clamps.note_op(|| format!("hoisted clamp of indirect kind {kind} max {max} at {arguments:#x}"));
-                let from = counter.as_ref().map(|(s, at)| (s.base(), s.gpu(*at)));
-                crate::indirect::bound_before(&clamps, list, (args.base(), args.gpu(arguments)), (kind, stride, max), from)
+                let from = counter.as_ref().map(|(s, at)| (s.gpu_base(), s.gpu(*at)));
+                crate::indirect::bound_before(&clamps, list, (args.gpu_base(), args.gpu(arguments)), (kind, stride, max), from)
             });
         let inline = hoisted.is_none();
         let (clamped, clamped_at) = match hoisted {

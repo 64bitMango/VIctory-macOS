@@ -763,6 +763,12 @@ pub struct Prepared {
     picture: Option<Picture>,
 }
 
+/// A texture's flags, format and castable formats, as the rules would make them.
+type TextureRules = HashMap<u32, (i32, i32, Vec<i32>)>;
+
+/// Pipelines of the same shaders together: name, their containers, milliseconds, runs, per-frame.
+type ShaderGroup = (String, Vec<u32>, f64, u32, Option<f64>);
+
 /// The presented picture after a run.
 struct Picture {
     /// Against the recorded one: dB, whether its bytes are the same, the
@@ -778,10 +784,10 @@ struct Picture {
 /// greatest difference of a channel.
 fn differing(a: &[u8], b: &[u8]) -> (usize, u8) {
     let (mut n, mut most) = (0, 0);
-    for (x, y) in a.chunks_exact(3).zip(b.chunks_exact(3)) {
+    for (x, y) in a.as_chunks::<3>().0.iter().zip(b.as_chunks::<3>().0.iter()) {
         if x != y {
             n += 1;
-            most = most.max(x.iter().zip(y).map(|(p, q)| p.abs_diff(*q)).max().unwrap_or(0));
+            most = most.max(x.iter().zip(y.iter()).map(|(p, q)| p.abs_diff(*q)).max().unwrap_or(0));
         }
     }
     (n, most)
@@ -1106,7 +1112,7 @@ impl Player {
     /// and it has no castable formats; `no-castable`: no castable formats
     /// where every view has the texture's own format; `list`: notes on the
     /// textures of a million texels or more.
-    fn texture_rules(&self, rules: &[String]) -> (HashMap<u32, (i32, i32, Vec<i32>)>, Vec<String>) {
+    fn texture_rules(&self, rules: &[String]) -> (TextureRules, Vec<String>) {
         let mut out = HashMap::new();
         let mut notes = Vec::new();
         if rules.is_empty() {
@@ -1350,8 +1356,8 @@ impl Player {
             plain_made += u32::from(!castable.is_empty() && newer.is_none());
             match (result, made) {
                 (Ok(()), Some(res)) => {
-                    // SAFETY: a live resource.
                     let va = if is_buffer {
+                        // SAFETY: a live resource.
                         unsafe { res.GetGPUVirtualAddress() }
                     } else {
                         0
@@ -1627,7 +1633,7 @@ impl Player {
             }
         }
         let mut kinds: Vec<(&str, u32)> = kinds.into_iter().collect();
-        kinds.sort_by(|a, b| b.1.cmp(&a.1));
+        kinds.sort_by_key(|k| std::cmp::Reverse(k.1));
         let mut text = kinds
             .iter()
             .take(4)
@@ -2421,7 +2427,6 @@ impl Player {
                 });
             }
         });
-        drop(all);
         self.mapped = mapped;
         Ok(())
     }
@@ -4456,7 +4461,7 @@ impl Player {
             .categories
             .sort_by(|a, b| key(b.1, b.3).total_cmp(&key(a.1, a.3)));
         // Pipelines of the same shaders together.
-        let mut groups: Vec<(String, Vec<u32>, f64, u32, Option<f64>)> = Vec::new();
+        let mut groups: Vec<ShaderGroup> = Vec::new();
         let mut at: HashMap<String, usize> = HashMap::new();
         for (pso, ms, n, of_frame) in shaders {
             let key = if pso & COPY_TO != 0 {
