@@ -105,6 +105,7 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
+    pub(crate) depth_bounds: bool,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -276,9 +277,8 @@ fn create() -> windows::core::Result<Host> {
         let cpu_view_size =
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         tracing::info!("host D3D12 device ready");
-        // The depth bounds test, which host pipelines leave out so far
-        // (`pipeline::host`, subobject 21; the list's own call is not
-        // passed on): whether this host could run it.
+        // Whether this host supports the depth bounds test (`pipeline::host`,
+        // subobject 21, and `OMSetDepthBounds`).
         let mut options2 = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let asked = device
             .CheckFeatureSupport(
@@ -287,8 +287,9 @@ fn create() -> windows::core::Result<Host> {
                 size_of_val(&options2) as u32,
             )
             .is_ok();
+        let depth_bounds = asked && options2.DepthBoundsTestSupported.as_bool();
         tracing::info!(
-            supported = asked && options2.DepthBoundsTestSupported.as_bool(),
+            supported = depth_bounds,
             answered = asked,
             "host depth bounds test support (D3D12_OPTIONS2.DepthBoundsTestSupported)"
         );
@@ -323,6 +324,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
+            depth_bounds,
         })
     }
 }
@@ -918,6 +920,7 @@ pub(crate) mod tests {
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    pub(crate) list1: Option<ID3D12GraphicsCommandList1>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -1336,9 +1339,11 @@ impl Host {
             prelude.Close()?;
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
             name(&list, || list_name(id));
+            let list1 = list.cast::<ID3D12GraphicsCommandList1>().ok();
             Ok(HostList {
                 allocator,
                 list,
+                list1,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),

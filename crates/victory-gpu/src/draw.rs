@@ -430,12 +430,20 @@ impl State {
     }
 
     pub(crate) fn depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
-        use windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList1;
-        use windows::core::Interface;
         self.fixed.depth_bounds = Some((min, max));
-        if let Ok(l) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+        if crate::host::host().is_some_and(|h| !h.depth_bounds) {
+            return;
+        }
+        if let Some(l) = &list.list1 {
             // SAFETY: an open list.
             unsafe { l.OMSetDepthBounds(min, max) };
+        } else {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::warn!(
+                    "the host command list does not implement ID3D12GraphicsCommandList1: depth bounds ignored"
+                )
+            });
         }
     }
 
