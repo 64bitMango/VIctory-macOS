@@ -80,11 +80,13 @@ jobs:
                   reviewThreads(first: 100) { pageInfo { hasNextPage } nodes {
                     isResolved resolvedBy { login }
                     comments(first: 1) { nodes { author { login } } } } } } } }')
+            # Thread authors are named without "[bot]", resolvers with it.
             bot_login=${BOT%\[bot\]}
             if ! jq -e --arg bot "$bot_login" '.data.repository.pullRequest.reviewThreads
                 | (.pageInfo.hasNextPage | not) and all(.nodes[];
                     (.comments.nodes[0].author.login != $bot) or (.isResolved | not)
-                    or (.resolvedBy.login == $bot))' <<<"$threads" >/dev/null; then
+                    or (.resolvedBy.login == $bot) or (.resolvedBy.login == $bot + "[bot]"))' \
+                <<<"$threads" >/dev/null; then
               echo "#$n: a CodeRabbit thread was resolved by someone else"; continue
             fi
             read -r m_state _ <<<"$(verdict "$MAINTAINER")"
