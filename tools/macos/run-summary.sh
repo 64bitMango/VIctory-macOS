@@ -23,10 +23,15 @@ self_test() {
 wine: Unhandled exception 0xc0000005 in thread 41
 EOF
   out=$(summarise "$log")
+  sin=$(summarise - < "$log")
+  none=$(printf 'not a run log\n' | summarise -)
   rm -f "$log"
   chk() { printf '%s\n' "$out" | grep -q -- "$1" || { echo "self-test FAIL: missing '$1'"; ok=0; }; }
   chk '2.6 fps'; chk '2.8 fps'; chk '380.0 ms'
-  chk 'median 2.6 fps'
+  chk 'median 2.7 fps'
+  printf '%s\n' "$sin" | grep -q -- 'median 2.7 fps' || { echo "self-test FAIL: stdin"; ok=0; }
+  printf '%s\n' "$none" | grep -q -- 'no frame lines' || { echo "self-test FAIL: empty log"; ok=0; }
+  printf '%s\n' "$none" | grep -q -- 'how it ended' || { echo "self-test FAIL: empty log ends"; ok=0; }
   chk 'preparing, all of it per frame: 141.2 ms'
   chk 'heap sync time per frame'
   chk '12 clzero loops at load, 40 extrq/insertq'
@@ -41,7 +46,9 @@ EOF
 # and nothing needs an interval expression (some awks read those differently).
 summarise() {
   esc=$(printf '\033')
-  sed "s/${esc}\\\\[[0-9;]*m//g" "$1" | awk -v file="$1" '
+  file=$1
+  [ "$file" = "-" ] && { file="(stdin)"; shift; }
+  sed "s/${esc}\\\\[[0-9;]*m//g" "$@" | awk -v file="$file" '
 function norm(s) {
   gsub(/0x[0-9a-fA-F]+/, "H", s); gsub(/[0-9]+/, "N", s)
   return substr(s, 1, 160)
@@ -87,15 +94,20 @@ BEGIN {
   all[nlines_total++ % 2] = 0
 }
 END {
-  if (n == 0) {
-    print "no frame lines: not a run log?"
-    exit
+  if (n == 0) print "no frame lines: not a run log?"
+  else {
+    # Median fps over the frame lines: the middle sample, or the average of
+    # the two middle ones at an even count. The worst sample ms/frame
+    # value goes with it, not one derived from its fps.
+    for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++)
+      if (fps[j] < fps[i]) {
+        t = fps[i]; fps[i] = fps[j]; fps[j] = t
+        t = ms[i]; ms[i] = ms[j]; ms[j] = t
+      }
+    med = (n % 2 == 1) ? fps[(n + 1) / 2] : (fps[n / 2] + fps[n / 2 + 1]) / 2
+    printf "\n-- frame lines (every 5 s): %d of them, median %.1f fps, worst %.1f (%.1f ms), best %.1f\n",
+      n, med, fps[1], ms[1], fps[n]
   }
-  # Median fps over the frame lines.
-  for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++)
-    if (fps[j] < fps[i]) { t = fps[i]; fps[i] = fps[j]; fps[j] = t }
-  printf "\n-- frame lines (every 5 s): %d of them, median %.1f fps, worst %.1f (%.1f ms), best %.1f\n",
-    n, fps[int((n + 1) / 2)], fps[1], (fps[1] > 0 ? 1000 / fps[1] : 0), fps[n]
 
   print "\n-- the last of each periodic line (what a settled run logged)"
   m = split("preparing,heap sync,heap sync slots,prepare waste,copying back,lock waits,slot locks,amd only,host textures,video memory,unwaited", names, ",")
@@ -115,7 +127,7 @@ END {
   }
 
   print "\n-- how it ended"
-  if (nlines > 0) for (k = 0; k < nlines && k < 3; k++) print "  " ended[k]
+  if (nlines > 0) for (k = (nlines > 3 ? nlines - 3 : 0); k < nlines; k++) print "  " ended[k]
   else for (k = (tailn - 3 < 0 ? 0 : tailn - 3); k < tailn; k++) print "  " tail[k % 5]
 }' 2>/dev/null
 }
