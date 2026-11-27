@@ -412,6 +412,7 @@ mod copies {
     #[test]
     fn a_copy_back_over_a_title_write_is_found() {
         let Some((p, copy)) = pool(2) else { return };
+        // SAFETY: a byte of our pool.
         let title = |at: usize, v: u8| unsafe { ((p + at) as *mut u8).write_volatile(v) };
         // Another test's flight may be in the air (rule C1 then speaks of
         // this test's declarations): only C3 is looked at.
@@ -521,6 +522,7 @@ mod copies {
         let ((), found) = caught(|| copy.check_equal(p, p + 2 * PAGE, "test"));
         assert!(found.len() == 1 && found[0].contains("rule C4") && found[0].contains(&format!("{:#x}", p + PAGE + 77)), "{found:?}");
         // A page the title wrote is not "unchanged": nothing to find.
+        // SAFETY: a byte of our pool.
         unsafe { ((p + PAGE + 5) as *mut u8).write_volatile(1) };
         let ((), found) = caught(|| copy.check_equal(p, p + 2 * PAGE, "test"));
         assert!(found.is_empty(), "the tracker knows the page changed: {found:?}");

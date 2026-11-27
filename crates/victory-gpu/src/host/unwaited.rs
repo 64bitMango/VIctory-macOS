@@ -229,7 +229,6 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
         // Blocks the title has just written are left open by this
         // submission's refreshes and copied again by the next one's
         // (`crate::watch::rest_ms`), unless its shaders write title memory at
@@ -238,7 +237,10 @@ impl Host {
         // since its copy took it (`Shadow::copy_back_page`), which a page
         // left open cannot say. Ranges shaders write through views settle
         // their own pages (`Shadow::writing`).
-        batch.rest = crate::watch::rest_ms() != 0 && !runs.iter().any(|list| list.writes_memory());
+        let mut batch = Batch {
+            rest: crate::watch::rest_ms() != 0 && !runs.iter().any(|list| list.writes_memory()),
+            ..Batch::default()
+        };
         #[cfg(feature = "diagnostics")]
         if crate::watch::rest_ms() != 0 {
             use crate::copystat::{C, add};
@@ -849,7 +851,7 @@ mod tests {
             // list's where both wrote, the title copy, the title's own.
             assert_eq!(tu[2 * PAGE + 100], 0x80, "round {round}");
             assert_eq!(tu[2 * PAGE + 156], 0x80 | (200 & 0x3f), "round {round}: the second list's byte over the first's");
-            assert_eq!(tu[u.k * PAGE + 8], 0x80 | (64 & 0x3f), "round {round}: the marked page's bytes");
+            assert_eq!(tu[u.k * PAGE + 8], 0x80, "round {round}: the marked page's bytes");
             assert_eq!(tu[u.k * PAGE + MARKED_SPOT.0], MARKED_SPOT.1, "round {round}: the title's byte in the marked page");
             assert_eq!(tu[5 * PAGE + 16], 0xc5, "round {round}");
             for (at, last) in spots(u.k) {

@@ -82,6 +82,9 @@ impl<T> Paged<T> {
 /// to put there, and the microseconds it waited, since last asked.
 pub(crate) static WAITS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// One page: a lock around its slots, none made yet.
+type Page<T> = std::sync::Mutex<Option<Box<[Option<T>]>>>;
+
 /// A [`Paged`] table for several threads at once: each page under a lock
 /// of its own, so threads at slots of different pages do not wait for each
 /// other (a host heap's one table of what its slots hold was taken for
@@ -89,7 +92,7 @@ pub(crate) static WAITS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync:
 /// thread: 8,000 waits a frame). With `one` (`VICTORY_KEPT_PAGES=0`) every
 /// use takes one lock first, as the one table did.
 pub(crate) struct Pages<T> {
-    pages: Box<[std::sync::Mutex<Option<Box<[Option<T>]>>>]>,
+    pages: Box<[Page<T>]>,
     len: usize,
     one: Option<std::sync::Mutex<()>>,
 }

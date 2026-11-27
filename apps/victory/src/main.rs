@@ -125,7 +125,7 @@ enum Command {
     },
     /// Run a captured frame's GPU work again without the title, with what
     /// it costs and experiments on it (docs/replay.md).
-    Replay(replay::Replay),
+    Replay(Box<replay::Replay>),
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -225,7 +225,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Replay(options) => replay::run(options),
+        Command::Replay(options) => replay::run(*options),
         Command::Config => show_config(),
     }
 }
