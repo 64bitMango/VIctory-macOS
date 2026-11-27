@@ -40,6 +40,9 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     pub(crate) key: String,
     used: AtomicBool,
+    /// Microseconds draws waited for it, over all frames
+    /// ([`super::wait_each`]).
+    waited_us: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -65,6 +68,7 @@ impl Pending {
             taken: AtomicBool::new(false),
             made: OnceLock::new(),
             used: AtomicBool::new(false),
+            waited_us: AtomicU64::new(0),
         }
     }
 
@@ -225,6 +229,11 @@ fn wait(p: &Pending, frame: u64) {
         WAITED_US.store(0, Ordering::Relaxed);
     }
     let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    // `VICTORY_PIPELINE_WAIT_EACH_MS`: no more than its own budget.
+    let left = left.min(super::wait_each::left(&p.waited_us));
+    if left.is_zero() {
+        return;
+    }
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -238,7 +247,9 @@ fn wait(p: &Pending, frame: u64) {
             .unwrap_or_else(|e| e.into_inner())
             .0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    let waited = started.elapsed().as_micros() as u64;
+    WAITED_US.fetch_add(waited, Ordering::Relaxed);
+    p.waited_us.fetch_add(waited, Ordering::Relaxed);
 }
 
 /// Pipelines for the workers: those draws wait for, then those started

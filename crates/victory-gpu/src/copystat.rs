@@ -499,13 +499,14 @@ pub(crate) fn page_faults() -> u64 {
 
 /// What else logs a line with the counters: called with the frames they are
 /// over ([`also_log`]).
-static MORE: std::sync::OnceLock<fn(f64)> = std::sync::OnceLock::new();
+static MORE: Mutex<Vec<fn(f64)>> = Mutex::new(Vec::new());
 
 /// Has `more` log its own per-frame line whenever the copy statistics are
 /// logged, given the frames since it was last called: for counters kept
-/// where this crate cannot see them (the loader's emulated instructions).
+/// where this crate cannot see them (the loader's emulated instructions,
+/// the runtime's views of physical pages). Several may.
 pub fn also_log(more: fn(f64)) {
-    let _ = MORE.set(more);
+    MORE.lock().unwrap_or_else(|e| e.into_inner()).push(more);
 }
 
 /// Logs the counters per frame over `frames` frames, and the ranges that
@@ -794,7 +795,8 @@ pub(crate) fn log(frames: f64) {
         c[C::RestingSubmissions as usize],
         c[C::ExactSubmissions as usize],
     );
-    if let Some(more) = MORE.get() {
+    let more = MORE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for more in more {
         more(frames);
     }
     tracing::info!(

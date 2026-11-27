@@ -53,6 +53,8 @@ use crate::resource::{MEMORY, Resources, USER_DATA};
 /// [`super::Parts`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Extra {
+    /// Permit early depth testing for opaque pixel programs whose only side effect is read tracking.
+    pub early_depth: bool,
     /// The threads of a compute group past a dispatch's counts of threads
     /// leave at once (see the module).
     pub thread_counts: bool,

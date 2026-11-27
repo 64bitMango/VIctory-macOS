@@ -82,7 +82,7 @@ fn decide(var: Option<&str>, default: bool) -> bool {
 
 /// Whether x86-64 code here runs under Rosetta: Wine on macOS, whose
 /// x86-64 Wine only runs that way on the Apple silicon Macs D3DMetal needs.
-fn rosetta() -> bool {
+pub(crate) fn rosetta() -> bool {
     use std::ffi::{CStr, c_char};
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     type HostVersion = unsafe extern "C" fn(*mut *const c_char, *mut *const c_char);
@@ -1383,6 +1383,24 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             }
         }
     }
+}
+
+/// Shaders wrote zero-copy title memory `[at, at + len)` directly
+/// (`crate::alias`): its pages count as changed in every tracker holding
+/// them (textures' staging, other copies), and in the pages showing the
+/// same memory elsewhere, so those take the GPU's bytes at their next use.
+/// Nothing to do, without a lookup past one, where no tracker holds the
+/// range (from upstream #204).
+pub(crate) fn notify_written(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let mut g = guards();
+    if g.holders.range(first..last).next().is_none() && g.alias_of.range(first..last).next().is_none() {
+        return;
+    }
+    changed(&mut g, first, last, false);
 }
 
 /// What shaders wrote into host copies of `[at, at + len)` is dropped:

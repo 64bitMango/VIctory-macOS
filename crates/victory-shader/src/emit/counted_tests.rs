@@ -104,6 +104,7 @@ fn program(body: &[u32], wave64: bool, threads: [u32; 3], narrow: bool, fences: 
         lower::Extra {
             thread_counts: true,
             atomic_fences: fences,
+            ..Default::default()
         },
     )
     .expect("lower");

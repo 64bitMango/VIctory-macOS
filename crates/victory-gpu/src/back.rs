@@ -975,7 +975,7 @@ mod tests {
                 }
                 let differs = match saved {
                     None => {
-                        let differs = host_wanted[from..to] != title_wanted[from..to];
+                        let differs = !crate::fastcmp::eq(&host_wanted[from..to], &title_wanted[from..to]);
                         title_wanted[from..to].copy_from_slice(&host_wanted[from..to]);
                         differs
                     }

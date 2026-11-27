@@ -20,6 +20,8 @@
 #[cfg(any(windows, test))]
 mod back;
 #[cfg(windows)]
+mod alias;
+#[cfg(windows)]
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
@@ -32,6 +34,10 @@ pub mod console;
 mod contend;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod fastcmp;
+#[cfg(windows)]
+mod alias_direct;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -108,6 +114,8 @@ mod watch;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::{CountingAlloc, also_log as also_log_per_frame};
+#[cfg(windows)]
+pub use alias::{alias_region, aliased_now, enabled as alias_buffers, unalias_region, unalias_within};
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]

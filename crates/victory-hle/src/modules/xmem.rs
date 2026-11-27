@@ -32,6 +32,8 @@ use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
 
+mod census;
+
 const MIB: usize = 1 << 20;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
@@ -166,6 +168,27 @@ pub extern "system" fn XMemVirtualAlloc(
                 %error,
                 "XMemVirtualAlloc refused"
             );
+        }
+    }
+    // Zero-copy title buffers (`VICTORY_ALIAS_BUFFERS=1`; from upstream
+    // #204): read-write memory committed whole pages at a time is aliased
+    // onto a host buffer, so the GPU side needs no copy of it.
+    if !at.is_null() && victory_gpu::alias_buffers() {
+        // A fresh reservation: regions left over its memory were freed
+        // without a word (`VirtualFree`), and are stale.
+        if kind & MEM_RESERVE != 0 {
+            victory_gpu::unalias_within(at as usize, size);
+        }
+        if kind & MEM_COMMIT != 0
+            && kind & MEM_RESERVE_PLACEHOLDER == 0
+            && protect == PAGE_READWRITE
+            && (at as usize).is_multiple_of(PAGE)
+            && size >= PAGE
+            && size.is_multiple_of(PAGE)
+        {
+            // A commit in a reservation made before may cover pages
+            // committed already, whose bytes stay.
+            victory_gpu::alias_region(at as usize, size, kind & MEM_RESERVE == 0);
         }
     }
     if base.is_null() {
@@ -334,6 +357,9 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            if victory_gpu::alias_buffers() {
+                victory_gpu::unalias_region(address as usize);
+            }
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -934,6 +960,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         shown.push(base + k * PAGE);
     }
     physical.views.insert(base, (len, slice));
+    census::mapped();
     true
 }
 
@@ -1033,6 +1060,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             }
         }
         victory_gpu::title_memory_remapped(at, size);
+        census::unmapped();
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(

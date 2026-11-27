@@ -4617,6 +4617,42 @@ mod batch {
     use std::sync::Arc;
 
 
+    /// A zero-copy region (`crate::alias`) is never refreshed: a batch
+    /// asked for it, alone or beside a plain copy, copies none of it, by
+    /// one thread and by several.
+    #[test]
+    fn a_zero_copy_region_is_left_out_of_refreshes() {
+        for parallel in [false, true] {
+            let Some((p, aliased)) = crate::shadow::tests::fake_alias(4) else {
+                return; // no host GPU here
+            };
+            let len = 4 * PAGE;
+            let q = crate::watch::tests::pool(4);
+            crate::shadow::register(q, q as u64, len as u64);
+            let plain = crate::shadow::find(q as u64, len as u64).expect("a plain copy");
+            // SAFETY: our pools.
+            unsafe {
+                std::ptr::write_bytes(p as *mut u8, 0x33, len);
+                std::ptr::write_bytes(q as *mut u8, 0x44, len);
+            }
+            aliased.write_host(p as u64, &vec![0x55; len]);
+            crate::shadow::tests::PARALLEL.with(|c| c.set(parallel));
+            let mut batch = Batch::default();
+            batch.add(&aliased, p, len);
+            assert!(batch.refreshes.is_empty(), "not even queued");
+            batch.add(&plain, q, len);
+            batch.add(&aliased, p + PAGE, PAGE);
+            assert_eq!(batch.flush(), len, "the plain copy alone");
+            crate::shadow::tests::PARALLEL.with(|c| c.set(false));
+            assert_eq!(plain.read_host(q as u64, 1)[0], 0x4444_4444);
+            assert_eq!(aliased.read_host((p + PAGE) as u64, 1)[0], 0x5555_5555, "the region's buffer untouched");
+            crate::shadow::unregister(q, q as u64);
+            drop(plain);
+            crate::watch::tests::free(q);
+            crate::shadow::tests::unfake_alias(p, aliased);
+        }
+    }
+
     /// A submission that may leave blocks resting copies a block the title
     /// has just written and leaves it marked, so the next submission copies
     /// it again; one that may not (its shaders write title memory at

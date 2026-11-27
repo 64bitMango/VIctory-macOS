@@ -65,6 +65,10 @@ pub(crate) struct Shadow {
     /// with nothing committed, and whether too many were found to remember:
     /// see [`Shadow::copy`].
     gaps: Mutex<(Vec<(usize, usize)>, bool)>,
+    /// The title's memory `[start, start + len)` is `buffer`'s own pages
+    /// (`mach_vm_remap`, `crate::alias`): zero-copy, so nothing is ever
+    /// copied either way, and nothing tracks it for the copy.
+    aliased: bool,
 }
 
 /// Whether a snapshot takes only the bytes no segment of its copy holds
@@ -245,6 +249,10 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        if self.aliased {
+            crate::watch::notify_written(from, to - from);
+            return 0;
+        }
         if let Some(t) = &self.tracked
             && t.changed(page / PAGE)
         {
@@ -306,11 +314,43 @@ impl Shadow {
             asked: [0, 1].map(|i| AtomicU64::new(NOW[i].load(Relaxed))),
             flights: AtomicU64::new(0),
             gaps: Mutex::default(),
+            aliased: false,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
         }
         shadow
+    }
+
+    /// A zero-copy copy (`crate::alias`): title memory `[start, start +
+    /// len)` is `buffer`'s pages (`data`, at host GPU address `gpu`). Not
+    /// tracked and without write marks: shaders' writes land in title
+    /// memory as they happen, and the title's are the GPU's at once (from
+    /// upstream #204).
+    pub(crate) fn new_aliased(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
+        Arc::new(Shadow {
+            buffer,
+            data,
+            gpu,
+            start,
+            len,
+            tracked: None,
+            pending: Mutex::default(),
+            before: Mutex::default(),
+            marks: None,
+            base: 0,
+            slice: None,
+            asked: [0, 1].map(|i| AtomicU64::new(NOW[i].load(Relaxed))),
+            flights: AtomicU64::new(0),
+            gaps: Mutex::default(),
+            aliased: true,
+        })
+    }
+
+    /// Whether it is a zero-copy copy ([`Shadow::new_aliased`]).
+    #[cfg(test)]
+    pub(crate) fn is_aliased(&self) -> bool {
+        self.aliased
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a
@@ -366,6 +406,10 @@ impl Shadow {
     /// a title write there before the copy-back keeps the page's bytes from
     /// before it ([`crate::watch::Tracked::arm`]).
     pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
+        // Zero-copy: shaders write title memory itself; nothing to keep.
+        if self.aliased {
+            return;
+        }
         // From here to the copy-back, "changed" must mean "the title wrote it
         // since the copy took it": pages a refresh left open while they
         // rested are taken for good first.
@@ -433,6 +477,14 @@ impl Shadow {
     }
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+        // Zero-copy: what shaders wrote is in title memory already (withheld
+        // too: it cannot be kept out); the trackers holding it are told.
+        if self.aliased {
+            let (from, to) = self.inside(address, len);
+            let start = self.start as usize;
+            crate::watch::notify_written(start + from, to - from);
+            return 0;
+        }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
         let mut written = 0;
@@ -472,7 +524,7 @@ impl Shadow {
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
                 laps.count(Stage::Pieces, 1);
                 laps.count(Stage::Bytes, n);
-                let differs = host != old;
+                let differs = !crate::fastcmp::eq(host, old);
                 if differs {
                     // The comparing since the last changed piece.
                     laps.lap(Stage::CompareUs);
@@ -554,6 +606,16 @@ impl Shadow {
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
     pub(crate) fn copy_back_marked(&self, pages: &[usize]) -> usize {
+        if self.aliased {
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            for &page in pages {
+                let (from, to) = (page.max(start), (page + PAGE).min(end));
+                if from < to {
+                    crate::watch::notify_written(from, to - from);
+                }
+            }
+            return 0;
+        }
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -591,7 +653,7 @@ impl Shadow {
                 // The title's bytes are the copy's from before: what differs
                 // is the shaders'.
                 None => {
-                    let differs = *host != title[..];
+                    let differs = !crate::fastcmp::eq(host, &title[..]);
                     if differs {
                         title.copy_from_slice(host);
                     }
@@ -656,6 +718,10 @@ impl Shadow {
     /// Whether the title wrote none of the copy's memory since the copy took
     /// it (tracked memory only): [`Shadow::update`] would copy nothing.
     pub(crate) fn clean(&self) -> bool {
+        // Zero-copy: always current.
+        if self.aliased {
+            return true;
+        }
         self.tracked.as_ref().is_some_and(crate::watch::Tracked::clean)
     }
 
@@ -696,7 +762,7 @@ impl Shadow {
     /// they compute: see [`Shadow::copy_back_page`]); or only the ones left
     /// so before, guarded now (`Take::Rested`).
     pub(crate) fn update_as(&self, address: usize, len: usize, how: Take) -> usize {
-        if self.clean() {
+        if self.aliased || self.clean() {
             return 0;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -874,6 +940,12 @@ impl Shadow {
     /// the host heap commits. Zeros are written each time (shaders may have
     /// written the copy there).
     fn copy(&self, from: usize, to: usize) -> usize {
+        // Zero-copy: the copy is title memory (copying it onto itself is
+        // never asked for, and would be a racing write).
+        if self.aliased {
+            debug_assert!(false, "a refresh of a zero-copy copy");
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         crate::unwaited::not_beside("C1", "a host copy is refreshed from title memory", || {
@@ -1512,7 +1584,8 @@ pub(crate) fn copy_back_declared(back: &[(Arc<Shadow>, usize, usize, bool)]) -> 
     for (shadow, address, len, goes_back) in back {
         let (address, len) = (*address, *len);
         if *goes_back {
-            if at_once.is_none() {
+            // The batch leaves zero-copy copies out: told here.
+            if at_once.is_none() || shadow.aliased {
                 written += shadow.copy_back(address, len);
             }
         } else {
@@ -1559,7 +1632,9 @@ fn declared_at_once(back: &[(Arc<Shadow>, usize, usize, bool)]) -> Option<usize>
     // Per copy, in the order first declared: its ranges that go back.
     let mut copies: Vec<(&Shadow, Vec<(usize, usize)>)> = Vec::new();
     let mut index: crate::quick::Map<usize, usize> = Default::default();
-    for (shadow, address, len, _) in back.iter().filter(|b| b.3) {
+    // Zero-copy copies hold no snapshot and copy nothing back
+    // ([`copy_back_declared`] tells their trackers).
+    for (shadow, address, len, _) in back.iter().filter(|b| b.3 && !b.0.aliased) {
         let i = *index.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
             copies.push((shadow, Vec::new()));
             copies.len() - 1
@@ -1644,6 +1719,10 @@ fn marked_at_once(marked: &[(Arc<Shadow>, Vec<usize>)]) -> Option<usize> {
     let making = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarksPrepUs);
     let mut pieces: Vec<Piece> = Vec::new();
     for (k, (copy, pages)) in marked.iter().enumerate() {
+        if copy.aliased {
+            copy.copy_back_marked(pages);
+            continue;
+        }
         let Some(t) = &copy.tracked else {
             continue;
         };
@@ -1858,11 +1937,83 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     }
 }
 
+/// Zero-copy title regions (`crate::alias`), by start address, the longest
+/// one's bytes, and how many there are (none: every lookup goes on at
+/// once, as without them). From upstream #204.
+static ALIASED: std::sync::RwLock<BTreeMap<u64, Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
+static ALIASED_SPAN: AtomicU64 = AtomicU64::new(0);
+static ALIASED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn aliased_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<u64, Arc<Shadow>>> {
+    ALIASED.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The starts of the zero-copy regions overlapping `[start, end)`.
+fn aliased_overlapping(map: &BTreeMap<u64, Arc<Shadow>>, start: u64, end: u64) -> Vec<u64> {
+    let lowest = start.saturating_sub(ALIASED_SPAN.load(Relaxed));
+    map.range(lowest..end).filter(|(s, sh)| **s + sh.len > start).map(|(s, _)| *s).collect()
+}
+
+/// Whether a zero-copy region overlaps `[start, end)`.
+pub(crate) fn has_aliased_overlap(start: u64, end: u64) -> bool {
+    if ALIASED_COUNT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
+    !aliased_overlapping(&aliased_read(), start, end).is_empty()
+}
+
+/// A zero-copy region is there: lookups inside it find it first.
+pub(crate) fn register_aliased(shadow: Arc<Shadow>) {
+    ALIASED_SPAN.fetch_max(shadow.len, Relaxed);
+    let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
+    if map.insert(shadow.start, shadow).is_none() {
+        ALIASED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+    drop(map);
+    changed();
+}
+
+/// The zero-copy region at `start` goes (lists holding it keep its buffer).
+/// Returns it, if there was one.
+pub(crate) fn unregister_aliased(start: u64) -> Option<Arc<Shadow>> {
+    let removed = ALIASED.write().unwrap_or_else(|e| e.into_inner()).remove(&start);
+    if removed.is_some() {
+        ALIASED_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        changed();
+    }
+    removed
+}
+
+/// Every zero-copy region overlapping `[start, end)` goes. Returns them.
+pub(crate) fn unregister_aliased_within(start: u64, end: u64) -> Vec<Arc<Shadow>> {
+    if ALIASED_COUNT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
+    let starts = aliased_overlapping(&aliased_read(), start, end);
+    starts.into_iter().filter_map(unregister_aliased).collect()
+}
+
+/// The zero-copy region holding all of `[address, end)`.
+fn find_aliased(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    if ALIASED_COUNT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return None;
+    }
+    let map = aliased_read();
+    let lowest = end.saturating_sub(ALIASED_SPAN.load(Relaxed));
+    if lowest > address {
+        return None;
+    }
+    map.range(lowest..=address).next_back().filter(|(_, s)| s.start + s.len >= end).map(|(_, s)| s.clone())
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
-/// len)`, made on first use.
+/// len)`, made on first use. Inside a zero-copy region, that region's.
 #[track_caller]
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    if let Some(shadow) = find_aliased(address, end) {
+        return Some(shadow);
+    }
     // The copy already made, or no buffer there: found with the buffers
     // shared. A copy to make is made below with them held alone, the
     // buffer looked up again.
@@ -2376,10 +2527,14 @@ impl Arena {
     }
 }
 
-/// Every host copy of title memory made so far (buffers and windows).
+/// Every host copy of title memory made so far (buffers and windows, and
+/// the zero-copy regions).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
     let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
     all.extend(LOOSE.write().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    if ALIASED_COUNT.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        all.extend(aliased_read().values().cloned());
+    }
     all
 }
 
@@ -2397,6 +2552,7 @@ pub(crate) fn near(va: u64) -> String {
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
     );
+    all.extend(aliased_read().values().map(|s| (s.gpu, s.start, s.len)));
     let below = all.iter().filter(|c| c.0 <= va).max();
     let above = all.iter().filter(|c| c.0 > va).min();
     let mut text = match below {
@@ -3890,5 +4046,132 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    /// A zero-copy region over a pool of `pages` fresh pages, registered,
+    /// whose host buffer is NOT remapped onto the pool: any refresh would
+    /// show as the title's bytes in the buffer, and any copy-back as the
+    /// buffer's in title memory. None without a host GPU.
+    pub(crate) fn fake_alias(pages: usize) -> Option<(usize, Arc<Shadow>)> {
+        let len = pages * PAGE;
+        let p = crate::watch::tests::pool(pages);
+        let Some((buffer, data)) = host().and_then(|h| h.shared_buffer(len as u64)) else {
+            crate::watch::tests::free(p);
+            return None;
+        };
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let copy = Shadow::new_aliased(buffer, data, gpu, p as u64, len as u64);
+        register_aliased(copy.clone());
+        Some((p, copy))
+    }
+
+    /// Ends [`fake_alias`].
+    pub(crate) fn unfake_alias(p: usize, copy: Arc<Shadow>) {
+        assert!(unregister_aliased(p as u64).is_some_and(|c| Arc::ptr_eq(&c, &copy)));
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    fn fill(at: usize, len: usize, byte: u8) {
+        // SAFETY: (callers) bytes of a pool of theirs.
+        unsafe { std::ptr::write_bytes(at as *mut u8, byte, len) };
+    }
+
+    fn byte_at(at: usize) -> u8 {
+        // SAFETY: (callers) a byte of a pool of theirs.
+        unsafe { (at as *const u8).read_volatile() }
+    }
+
+    /// A zero-copy region is found before the buffers inside it and is
+    /// one of all the copies; once it goes, the buffer's own copy is found
+    /// again.
+    #[test]
+    fn a_zero_copy_region_is_found_before_the_buffers_in_it() {
+        let Some((p, aliased)) = fake_alias(2) else {
+            return; // no host GPU here
+        };
+        let len = 2 * PAGE;
+        register(p + 1, p as u64, len as u64);
+        let hit = find(p as u64 + 0x100, 64).expect("the zero-copy region");
+        assert!(hit.is_aliased() && Arc::ptr_eq(&hit, &aliased));
+        assert!(find(p as u64 + PAGE as u64, PAGE as u64).is_some_and(|c| Arc::ptr_eq(&c, &aliased)));
+        assert!(all().iter().any(|c| Arc::ptr_eq(c, &aliased)));
+        assert!(has_aliased_overlap(p as u64 + len as u64 - 1, p as u64 + len as u64 + PAGE as u64));
+        assert!(!has_aliased_overlap(p as u64 + len as u64, p as u64 + 2 * len as u64));
+        unfake_alias(p, aliased);
+        let own = find(p as u64 + 0x100, 64).expect("the buffer's own copy");
+        assert!(!own.is_aliased());
+        assert!(!all().iter().any(|c| c.is_aliased() && c.range().0 == p as u64));
+        unregister(p + 1, p as u64);
+    }
+
+    /// Nothing is refreshed into a zero-copy region and nothing of it goes
+    /// back (its buffer is title memory: either would be a second write),
+    /// by every way a submission refreshes and copies back, while a plain
+    /// copy in the same copy-back still takes its shaders' write back.
+    #[test]
+    fn a_zero_copy_region_is_neither_refreshed_nor_copied_back() {
+        for one_by_one in [false, true] {
+            let Some((p, aliased)) = fake_alias(2) else {
+                return; // no host GPU here
+            };
+            let len = 2 * PAGE;
+            let q = crate::watch::tests::pool(2);
+            register(q, q as u64, len as u64);
+            let plain = find(q as u64, len as u64).expect("a plain copy");
+            assert!(!plain.is_aliased());
+            fill(p, len, 0x11);
+            aliased.write_host(p as u64, &vec![0x22; len]);
+            let held = |at: usize| aliased.read_host(at as u64 & !3, 1)[0].to_le_bytes()[at % 4];
+
+            // Refreshes: always current, nothing copied.
+            assert!(aliased.clean());
+            assert_eq!(aliased.update(p, len), 0);
+            assert_eq!(aliased.update_as(p, len, Take::Resting), 0);
+            assert_eq!(held(p + 8), 0x22, "no refresh reached the buffer");
+
+            // Declared writes keep nothing and are pending nowhere.
+            plain.update(q, len);
+            aliased.writing(p, len, false);
+            aliased.writing(p, PAGE, true);
+            assert!(aliased.pending.lock().unwrap().iter().next().is_none());
+            assert!(aliased.before.lock().unwrap().0.is_empty());
+            plain.writing(q, len, false);
+            plain.write_host((q + 10) as u64, &[0xaa]);
+
+            let written = copying_back(one_by_one, 0, || {
+                copy_back_declared(&[(aliased.clone(), p, len, true), (plain.clone(), q, len, true)])
+            });
+            assert!(written >= 1, "the plain copy's write goes back");
+            assert_eq!(byte_at(q + 10), 0xaa, "the plain copy's shader write reaches title memory");
+            assert_eq!(byte_at(p + 8), 0x11, "nothing of the zero-copy region was written back");
+            assert_eq!(aliased.copy_back_marked(&[p, p + PAGE]), 0);
+            assert_eq!(aliased.copy_back_page(p), 0);
+            copy_back_declared(&[(aliased.clone(), p, PAGE, false)]);
+            assert_eq!(byte_at(p + 8), 0x11);
+            assert_eq!(held(p + 8), 0x22);
+
+            unregister(q, q as u64);
+            drop(plain);
+            crate::watch::tests::free(q);
+            unfake_alias(p, aliased);
+        }
+    }
+
+    /// A fresh reservation drops the zero-copy regions left over its
+    /// memory (the title freed them unseen).
+    #[test]
+    fn stale_zero_copy_regions_go_for_a_new_reservation() {
+        let Some((p, aliased)) = fake_alias(2) else {
+            return; // no host GPU here
+        };
+        let gone = unregister_aliased_within(p as u64 + PAGE as u64, p as u64 + PAGE as u64 + 1);
+        assert!(gone.len() == 1 && Arc::ptr_eq(&gone[0], &aliased));
+        assert!(!has_aliased_overlap(p as u64, p as u64 + 2 * PAGE as u64));
+        assert!(find(p as u64, 64).is_none_or(|c| !c.is_aliased()));
+        drop(gone);
+        drop(aliased);
+        crate::watch::tests::free(p);
     }
 }

@@ -23,6 +23,8 @@ use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::{HwStage, RootType};
 
+mod limit_exits;
+
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
@@ -315,7 +317,7 @@ fn warn_kept_wide() {
 /// made for dispatches counted in threads: their own cache entries, one
 /// per combination.
 fn options_build(o: &victory_shader::emit::Options) -> &'static [u8; 32] {
-    static BUILDS: [OnceLock<[u8; 32]>; 2048] = [const { OnceLock::new() }; 2048];
+    static BUILDS: [OnceLock<[u8; 32]>; 4096] = [const { OnceLock::new() }; 4096];
     let i = usize::from(o.atomic_locks)
         | usize::from(o.bias_as_gradients) << 1
         | usize::from(o.mesh_stores_last) << 2
@@ -326,10 +328,14 @@ fn options_build(o: &victory_shader::emit::Options) -> &'static [u8; 32] {
         | usize::from(o.no_wave_walk) << 7
         | usize::from(o.uav_size_level0) << 8
         | usize::from(o.atomic_locks && o.atomic_lock_rounds) << 9
-        | usize::from(o.atomic_locks && o.atomic_lock_rounds && o.atomic_umax) << 10;
+        | usize::from(o.atomic_locks && o.atomic_lock_rounds && o.atomic_umax) << 10
+        | usize::from(o.early_depth) << 11;
     BUILDS[i].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
+        if o.early_depth {
+            h.update(b"early depth");
+        }
         if o.atomic_locks {
             h.update(b"atomic locks");
         }
@@ -411,6 +417,7 @@ pub fn host_shader_keeping(
     // leave the texels untouched (`emit`, "Atomic locks").
     let options = victory_shader::emit::Options {
         view_marks: true,
+        early_depth: std::env::var("VICTORY_EARLY_DEPTH").as_deref() == Ok("1"),
         atomic_locks: atomic_locks(),
         atomic_lock_rounds: atomic_lock_rounds(),
         atomic_umax: atomic_umax(),
@@ -435,7 +442,8 @@ pub fn host_shader_keeping(
         }
         r
     };
-    let build = if options.atomic_locks
+    let build = if options.early_depth
+        || options.atomic_locks
         || options.bias_as_gradients
         || options.mesh_stores_last
         || options.mesh_pack_outputs
@@ -481,6 +489,16 @@ pub fn host_shader_keeping(
         &patched
     } else {
         build
+    };
+    // `VICTORY_LIMIT_EXITS=1`: entries of their own only for the programs
+    // whose translation it changes.
+    let exits;
+    let build = match limit_exits::build(CACHE.get(), build, container, &translate) {
+        Some(b) => {
+            exits = b;
+            &exits
+        }
+        None => build,
     };
     match CACHE.get() {
         Some(cache) => cached(cache, build, container, translate),

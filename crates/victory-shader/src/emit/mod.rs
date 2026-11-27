@@ -243,6 +243,9 @@ mod flow_tests;
 mod halves_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+pub mod limit_exits;
+#[cfg(test)]
+mod loop_limit_tests;
 mod lower;
 mod rect;
 pub use bitcode::census;
@@ -497,6 +500,8 @@ pub struct UserData {
 /// How a translation is made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Options {
+    /// Permit early depth testing for opaque pixel programs whose only side effect is read tracking.
+    pub early_depth: bool,
     /// Writes through buffer views mark the pages they write (module notes,
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
@@ -1156,6 +1161,7 @@ fn emit_keeping(
     // round their buffer atomics (`lower::fence`).
     let builder = lower::by_address(p, res);
     let extra = lower::Extra {
+        early_depth: options.early_depth,
         thread_counts: options.thread_counts && builder,
         atomic_fences: options.atomic_fences
             && native.stage == HwStage::Cs

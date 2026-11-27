@@ -23,6 +23,7 @@ use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 mod bvh;
 mod counted;
 mod fence;
+mod forced_exits;
 pub(crate) use counted::{Extra, by_address};
 pub(crate) use fence::writes_root_views;
 
@@ -85,6 +86,8 @@ pub(crate) struct Lowered {
     /// Group barriers written.
     #[cfg(test)]
     pub barriers: usize,
+    #[cfg(test)]
+    pub early_depth_stencil: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -331,6 +334,8 @@ struct Lower<'a> {
     writes_uavs: bool,
     /// [`Lowered::heap`], [`Lowered::heap_writes`].
     heap: [bool; 2],
+    uav_handle: bool,
+    has_discard: bool,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -415,6 +420,12 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Loop headers whose limit is kept at an exit branch
+    /// ([`Self::find_forced_exits`]): their back edge only counts.
+    counted_only: HashSet<usize>,
+    /// Per IR block whose closing branch keeps a loop's limit: the loop's
+    /// header, and the successor that leaves the loop.
+    forced_exits: HashMap<usize, (usize, usize)>,
     /// The program tests rays against tree nodes (`image_bvh*`): its loops
     /// are cut at [`super::trace_loop_limit`] when that is set.
     traces: bool,
@@ -924,6 +935,8 @@ impl<'a> Lower<'a> {
             tail: vec![None; p.blocks.len()],
             writes_uavs,
             heap: [false; 2],
+            uav_handle: false,
+            has_discard: false,
             src0: None,
             console_lanes,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -971,6 +984,8 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            counted_only: HashSet::new(),
+            forced_exits: HashMap::new(),
             traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             round16: round16(p),
             mode16: Some(0),
@@ -2058,6 +2073,7 @@ impl<'a> Lower<'a> {
                 self.counters.insert(b, (phi, Vec::new()));
             }
         }
+        self.find_forced_exits(&order);
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
@@ -2105,6 +2121,7 @@ impl<'a> Lower<'a> {
                         .map_err(|w| unsupported(offset, w))?;
                     self.s
                         .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+                    self.has_discard = true;
                 }
                 if self.split_barriers.contains(&(b, i)) {
                     self.group_barrier();
@@ -2138,6 +2155,23 @@ impl<'a> Lower<'a> {
         let memory_writes = self.s.memory_dirty.is_some();
         let view_addresses = self.s.view_addresses.is_some();
         let cmp_samplers = self.s.cmp_samplers;
+        // Re-enable hardware Early-Z / TBDR HSR on opaque pixel shaders whose
+        // only UAV is VIctory's own read-mark bitmap (`mark_view_read`):
+        // without ForceEarlyDepthStencil, the injected UAV forces late-Z and
+        // shades occluded pixels behind closer geometry.
+        if self.extra.early_depth
+            && self.s.pixel
+            && self.s.view_writes.is_some()
+            && self.s.root_uavs.is_empty()
+            && self.s.memory_dirty.is_none()
+            && !self.uav_handle
+            && !self.pops
+            && (self.s.flags & (flags::ROVS | flags::STENCIL_REF)) == 0
+            && !self.has_discard
+            && !self.s.outputs.iter().any(|o| matches!(o.kind, 14 | 17..=20))
+        {
+            self.s.flags |= flags::EARLY_DEPTH_STENCIL;
+        }
         let idle_distances = match self.s.mesh {
             Some(_) => (0..self.s.outputs.len())
                 .filter(|&id| matches!(self.s.outputs[id].kind, 6 | 7))
@@ -2191,6 +2225,8 @@ impl<'a> Lower<'a> {
             exchanges: self.halves.as_ref().map_or(0, |h| h.sites),
             #[cfg(test)]
             barriers: self.s.m.written_calls("dx.op.barrier"),
+            #[cfg(test)]
+            early_depth_stencil: self.s.flags & flags::EARLY_DEPTH_STENCIL != 0,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -7186,6 +7222,7 @@ impl<'a> Lower<'a> {
         } else {
             props
         };
+        self.uav_handle |= !sampler && props.0 & 0x1000 != 0;
         // A descriptor from the resource heap itself: the host cannot tell
         // which slots the program reads, or writes through unordered access.
         if !sampler && self.is_heap_direct(src) {
@@ -12232,6 +12269,11 @@ impl<'a> Lower<'a> {
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let term = match self.x.st.exits[b] {
+            // The loop's limit is kept at one of its exits (`VICTORY_LIMIT_EXITS`).
+            LaneExit::Jump(t) if self.counted_only.contains(&t) && self.rpo[t] <= self.rpo[b] => {
+                self.count_up(t);
+                Term::Br(self.block[t].expect("reachable"))
+            }
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
                 let abort = self.abort_block();
@@ -12281,6 +12323,9 @@ impl<'a> Lower<'a> {
                 } else if back(self, not_taken) {
                     let stop = self.count_iteration(not_taken, pred::IUGE);
                     self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                } else if let Some((header, out)) = self.forced_exits.get(&b).copied() {
+                    // A loop's limit at its exit: past it the lane leaves here.
+                    self.forced_exit_cond(cond, header, out, taken)
                 } else {
                     cond
                 };
@@ -12347,10 +12392,7 @@ impl<'a> Lower<'a> {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = match super::trace_loop_limit() {
-            n if n > 0 && self.traces => n.min(super::loop_limit()),
-            _ => super::loop_limit(),
-        };
+        let limit = self.iteration_limit();
         let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)
@@ -12358,6 +12400,14 @@ impl<'a> Lower<'a> {
             .1
             .push((next, c));
         self.s.m.cmp(c, p, next, limit)
+    }
+
+    /// The iteration limit of this program's loops.
+    fn iteration_limit(&self) -> u32 {
+        match super::trace_loop_limit() {
+            n if n > 0 && self.traces => n.min(super::loop_limit()),
+            _ => super::loop_limit(),
+        }
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.

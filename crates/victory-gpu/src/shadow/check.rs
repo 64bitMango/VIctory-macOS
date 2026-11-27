@@ -148,7 +148,7 @@ impl Shadow {
                 // Read a second time before it is called a violation: a page
                 // mapped anew between its guard and the read is told to the
                 // trackers a moment later.
-                let differs = |now: &[u8]| now != host && self.check_stands(page);
+                let differs = |now: &[u8]| !crate::fastcmp::eq(now, host) && self.check_stands(page);
                 let now = if differs(&now) {
                     std::thread::yield_now();
                     title(page, PAGE).unwrap_or(now)

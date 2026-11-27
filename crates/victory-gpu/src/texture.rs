@@ -311,8 +311,19 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         once!(?da, ?db, "an aliased texture not copied: its layouts differ on the host");
         return;
     }
-    let Some(buffer) = host.default_buffer(total) else { return };
-    list.keep(&buffer);
+    // `VICTORY_ALIAS_DIRECT=1`: formats that cast copy straight, part by
+    // part, without the buffer (`crate::alias_direct`).
+    let direct = crate::alias_direct::direct(da.Format, db.Format)
+        && n == count(&da)
+        && n == count(&db)
+        && (0..n as usize).all(|i| fa[i].Footprint.Width == fb[i].Footprint.Width && fa[i].Footprint.Height == fb[i].Footprint.Height);
+    let buffer = if direct {
+        None
+    } else {
+        let Some(buffer) = host.default_buffer(total) else { return };
+        list.keep(&buffer);
+        Some(buffer)
+    };
     crate::texture::host_writes(list, to);
     crate::list::ensure_state(list, from, COPY_SOURCE);
     crate::list::ensure_state(list, to, COPY_DEST);
@@ -331,6 +342,15 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     let l = &list.list;
     // SAFETY: an open list; live resources in the states named.
     unsafe {
+        let Some(buffer) = buffer else {
+            for i in 0..n {
+                l.CopyTextureRegion(&sub(&b, i), 0, 0, 0, &sub(&a, i), None);
+            }
+            ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| tracing::info!(a = da.Format.0, b = db.Format.0, "aliased textures copied straight (VICTORY_ALIAS_DIRECT)"));
+            return;
+        };
         for i in 0..n {
             l.CopyTextureRegion(&place(&buffer, fa[i as usize]), 0, 0, 0, &sub(&a, i), None);
         }
