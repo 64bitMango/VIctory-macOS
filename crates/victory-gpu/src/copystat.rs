@@ -379,11 +379,14 @@ pub(crate) fn snapshot(start: u64, len: u64, bytes: u64) {
         .or_default() += bytes;
 }
 
+/// The counters per host copy, by its title start and length.
+type Refreshes = HashMap<(u64, u64), [u64; 6]>;
+
 /// Refresh batches per host copy (its title start and length): ranges
 /// asked (each an asking of its tracker), nanoseconds, bytes copied, and
 /// the ranges added by a list's own steps, by heaps' hulls, by
 /// title-memory tables.
-static REFRESHED: Mutex<Option<HashMap<(u64, u64), [u64; 6]>>> = Mutex::new(None);
+static REFRESHED: Mutex<Option<Refreshes>> = Mutex::new(None);
 
 /// Adds `n` to field `field` of [`REFRESHED`] for the copy of `[start,
 /// start + len)`.

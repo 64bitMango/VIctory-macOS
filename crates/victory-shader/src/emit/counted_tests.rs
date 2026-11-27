@@ -262,7 +262,8 @@ fn lanes_counted_over_a_wave_are_those_below_the_count() {
     started.extend(add);
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
-    let programs: [(&str, &Vec<u32>, fn(u32) -> u32); 2] =
+    type Program<'a> = (&'a str, &'a Vec<u32>, fn(u32) -> u32);
+    let programs: [Program; 2] =
         [("even lanes", &evens, even), ("lanes on entry", &started, |n| n)];
     for (what, body, of) in programs {
         for (threads, groups) in [(64u32, 2u32), (256, 1)] {
@@ -396,7 +397,7 @@ fn fences_round_atomics_change_no_result() {
             let runs = if count == 0 { 128 } else { count };
             for (i, &word) in out.iter().enumerate() {
                 let i = i as u32;
-                let want = if i % 2 == 0 { u32::from(i < runs) + u32::from(i + 64 < runs) } else { 0 };
+                let want = if i.is_multiple_of(2) { u32::from(i < runs) + u32::from(i + 64 < runs) } else { 0 };
                 assert_eq!(word, want, "wave64 {wave64}, count {count}, thread {i}");
             }
         }

@@ -200,13 +200,17 @@ impl NativeProgram {
     }
 }
 
+/// One entry of [`diagnostic_patches`]: container length, code length,
+/// offset, cleared bits, set bits.
+type Patch = (usize, usize, usize, u32, u32);
+
 /// Diagnostics: `VICTORY_SHADER_PATCH=<container bytes>:<code bytes>:<code
 /// offset>:<bits to clear>:<bits to set>,...` (all hexadecimal) changes one
 /// word of the machine code of the programs of that size before they are
 /// translated, to see what a part of a shader does to the picture. Each
 /// entry: container length, code length, offset, cleared bits, set bits.
-pub fn diagnostic_patches() -> &'static [(usize, usize, usize, u32, u32)] {
-    static PATCHES: std::sync::OnceLock<Vec<(usize, usize, usize, u32, u32)>> = std::sync::OnceLock::new();
+pub fn diagnostic_patches() -> &'static [Patch] {
+    static PATCHES: std::sync::OnceLock<Vec<Patch>> = std::sync::OnceLock::new();
     PATCHES.get_or_init(|| {
         let list = std::env::var("VICTORY_SHADER_PATCH").unwrap_or_default();
         list.split(',')
