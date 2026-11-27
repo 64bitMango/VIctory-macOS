@@ -748,6 +748,17 @@ impl HostPipeline {
         let Some(g) = g else {
             return refuse("graphics state not kept (plain description)", shaders);
         };
+        let use_depth_bounds = if g.depth_bounds && !host.depth_bounds {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::warn!(
+                    "a pipeline enables the depth bounds test, which this host does not support: its draws pass at every depth"
+                )
+            });
+            false
+        } else {
+            g.depth_bounds
+        };
         let state = g.describe();
         if mesh.is_some() {
             let name = super::library::name(
@@ -758,7 +769,7 @@ impl HostPipeline {
             );
             #[cfg(feature = "diagnostics")]
             tracing::info!(?shaders, pipeline = %name, %state, "preparing host graphics pipeline");
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, use_depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -830,7 +841,7 @@ impl HostPipeline {
         #[cfg(feature = "diagnostics")]
         tracing::info!(?shaders, pipeline = %name, %state, "preparing host graphics pipeline");
         let started = std::time::Instant::now();
-        let made = if g.depth_bounds {
+        let made = if use_depth_bounds {
             graphics_pipeline_with_depth_bounds(&host.device, &root, code(0), code(1), gs_code, g, &name)
         } else {
             super::library::pipeline(
@@ -975,6 +986,7 @@ fn mesh_pipeline(
     ms: D3D12_SHADER_BYTECODE,
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
+    use_depth_bounds: bool,
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
     fn build<D>(
@@ -1046,7 +1058,7 @@ fn mesh_pipeline(
             || unsafe { device.CreatePipelineState(&desc) },
         )
     }
-    if g.depth_bounds {
+    if use_depth_bounds {
         build(
             device,
             root,
@@ -1267,5 +1279,91 @@ mod tests {
         unsafe { g.read(11, (&raw const sub0).cast()) };
         assert!(!g.depth_bounds);
         assert!(!depth_stencil1(&g).DepthBoundsTestEnable.as_bool());
+    }
+
+    #[test]
+    fn depth_bounds_pipeline_builds_on_host_device() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::core::s;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const SOURCE: &str = r#"
+float4 vs(uint id : SV_VertexID) : SV_Position { return float4(0, 0, 0.5, 1); }
+uint ps() : SV_Target { return 1; }
+"#;
+        let blob = |entry: PCSTR, target: PCSTR| {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: static strings and source slice outlive the call.
+            unsafe {
+                D3DCompile(
+                    SOURCE.as_ptr().cast(),
+                    SOURCE.len(),
+                    s!("depth_bounds"),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )
+            }
+            .unwrap();
+            code.unwrap()
+        };
+        let (vs, ps) = (blob(s!("vs"), s!("vs_5_1")), blob(s!("ps"), s!("ps_5_1")));
+        // SAFETY: the blobs own their bytecode buffers.
+        let code = |b: &ID3DBlob| unsafe {
+            D3D12_SHADER_BYTECODE {
+                pShaderBytecode: b.GetBufferPointer(),
+                BytecodeLength: b.GetBufferSize(),
+            }
+        };
+        let root = crate::compute::root_signature(&host.device, &[]).unwrap();
+        let mut g = GraphicsState::default();
+        g.depth_bounds = true;
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R32_UINT;
+        g.depth_format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+
+        if host.depth_bounds {
+            let empty_gs = D3D12_SHADER_BYTECODE::default();
+            graphics_pipeline_with_depth_bounds(
+                &host.device,
+                &root,
+                code(&vs),
+                code(&ps),
+                empty_gs,
+                &g,
+                "test_depth_bounds",
+            )
+            .expect("depth-bounds graphics pipeline should build when supported");
+        } else {
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                // SAFETY: borrowed for the call.
+                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                VS: code(&vs),
+                PS: code(&ps),
+                BlendState: g.blend,
+                SampleMask: g.sample_mask,
+                RasterizerState: g.rasterizer,
+                DepthStencilState: g.depth,
+                IBStripCutValue: g.strip_cut,
+                PrimitiveTopologyType: host_topology(&g),
+                NumRenderTargets: g.targets.NumRenderTargets,
+                RTVFormats: g.targets.RTFormats,
+                DSVFormat: g.depth_format,
+                SampleDesc: g.samples,
+                ..Default::default()
+            };
+            // SAFETY: complete pipeline description.
+            let _: ID3D12PipelineState =
+                unsafe { host.device.CreateGraphicsPipelineState(&desc) }
+                    .expect("fallback graphics pipeline should build when unsupported");
+        }
     }
 }
