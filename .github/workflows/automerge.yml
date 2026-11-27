@@ -12,16 +12,13 @@
 # - it touches CI, the policy check, build config, dependencies or tools/
 #   (a renamed file by its old path or its new one), which always need the
 #   maintainer (CodeRabbit's own config withholds approval for them too).
-#
-# While the repository has fewer than 10 stars CodeRabbit reviews only when
-# asked, so this asks it once for each head commit it has not reviewed.
+
 name: Auto-merge
 
 on:
   workflow_run:
     workflows: [CI, Review relay]
-    # requested: as soon as CI starts, to ask for a review early.
-    types: [requested, completed]
+    types: [completed]
   schedule:
     - cron: "17 * * * *"
   workflow_dispatch:
@@ -59,7 +56,6 @@ jobs:
               (.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED"))]
               | last // {} | "\(.state // "none") \(.commit_id // "")"' <<<"$reviews"
           }
-          stars=$(gh api "repos/$REPO" --jq .stargazers_count)
           for n in $(gh pr list -R "$REPO" --base main --state open --limit 100 \
               --json number,isDraft --jq '.[] | select(.isDraft | not) | .number'); do
             pr=$(gh api "repos/$REPO/pulls/$n")
@@ -70,18 +66,6 @@ jobs:
             reviews=$(gh api --paginate "repos/$REPO/pulls/$n/reviews" \
               --jq '.[] | {login: .user.login, type: .user.type, state, commit_id}' | jq -s .)
             read -r g_state g_sha <<<"$(verdict "$BOT")"
-            reviewed=$(jq --arg who "$BOT" --arg sha "$sha" \
-              'any(.[]; .login == $who and .commit_id == $sha)' <<<"$reviews")
-            if [ "$stars" -lt 10 ] && [ "$reviewed" != true ]; then
-              mark="<!-- review-requested:$sha -->"
-              asked=$(gh api --paginate "repos/$REPO/issues/$n/comments" \
-                --jq ".[] | select(.body | contains(\"$mark\")) | .id" | head -1)
-              if [ -z "$asked" ]; then
-                gh api "repos/$REPO/issues/$n/comments" \
-                  -f body="@coderabbitai review $mark" >/dev/null
-                echo "#$n: asked CodeRabbit to review $sha"
-              fi
-            fi
             if [ "$g_state" != APPROVED ] || [ "$g_sha" != "$sha" ]; then
               echo "#$n: CodeRabbit has not approved $sha ($g_state)"; continue
             fi

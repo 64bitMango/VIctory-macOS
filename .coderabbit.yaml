@@ -8,10 +8,13 @@ reviews:
   poem: false
   in_progress_fortune: false
   review_status: true
+  # One review when a pull request opens. After pushing fixes the author asks
+  # for a follow-up with `@coderabbitai review`: it looks only at the new
+  # commits, resolves the threads they fix, and then approves.
   auto_review:
     enabled: true
     drafts: false
-    auto_incremental_review: true
+    auto_incremental_review: false
   path_filters:
     - "!Cargo.lock"
   auto_approvals:
