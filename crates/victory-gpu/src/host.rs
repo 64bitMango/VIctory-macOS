@@ -3105,6 +3105,9 @@ struct Batch {
 /// measured).
 const JOIN: usize = crate::watch::PAGE;
 
+/// One copy's refresh result: (from, to, bytes copied, microseconds).
+type Refresh = (usize, usize, usize, u64);
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         // Nothing to copy: a world submission asks for every copy its heaps'
@@ -3174,11 +3177,11 @@ impl Batch {
         // Several copies' refreshes on helper threads at once, each copy's
         // ranges in order on one of them (`crate::shadow::parallel_copies`).
         let requested: usize = work.iter().flat_map(|(_, ranges)| ranges.iter()).map(|(from, to)| to - from).sum();
-        let done: Vec<Vec<(usize, usize, usize, u64)>> = if crate::shadow::parallel_copies()
+        let done: Vec<Vec<Refresh>> = if crate::shadow::parallel_copies()
             && work.len() >= 2
             && requested >= crate::shadow::PARALLEL_REFRESH_MIN_BYTES
         {
-            let results: Vec<Mutex<Vec<(usize, usize, usize, u64)>>> = (0..work.len()).map(|_| Mutex::default()).collect();
+            let results: Vec<Mutex<Vec<Refresh>>> = (0..work.len()).map(|_| Mutex::default()).collect();
             crate::texture::in_parallel(work.len(), |i| {
                 let (shadow, ranges) = &work[i];
                 let out: Vec<_> = ranges
