@@ -26,13 +26,13 @@ reviews:
   sequence_diagrams: false
   estimate_code_review_effort: false
   changed_files_summary: false
-  # One review when a pull request opens. After pushing fixes the author asks
-  # for a follow-up with `@coderabbitai review`: it looks only at the new
-  # commits, resolves the threads they fix, and then approves.
+  # One full review when a pull request opens. Each later push gets a
+  # follow-up on its own: it looks only at the new commits, resolves the
+  # threads they fix, and approves once none is left.
   auto_review:
     enabled: true
     drafts: false
-    auto_incremental_review: false
+    auto_incremental_review: true
   path_filters:
     - "!Cargo.lock"
   auto_approvals:
