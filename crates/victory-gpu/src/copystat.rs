@@ -383,7 +383,9 @@ pub(crate) fn snapshot(start: u64, len: u64, bytes: u64) {
 /// asked (each an asking of its tracker), nanoseconds, bytes copied, and
 /// the ranges added by a list's own steps, by heaps' hulls, by
 /// title-memory tables.
-static REFRESHED: Mutex<Option<HashMap<(u64, u64), [u64; 6]>>> = Mutex::new(None);
+type Refreshed = HashMap<(u64, u64), [u64; 6]>;
+
+static REFRESHED: Mutex<Option<Refreshed>> = Mutex::new(None);
 
 /// Adds `n` to field `field` of [`REFRESHED`] for the copy of `[start,
 /// start + len)`.

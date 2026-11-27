@@ -88,8 +88,12 @@ pub(crate) static WAITS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync:
 /// every slot made, by the title's recording threads and the submitting
 /// thread: 8,000 waits a frame). With `one` (`VICTORY_KEPT_PAGES=0`) every
 /// use takes one lock first, as the one table did.
+type Page<T> = Box<[Option<T>]>;
+
+type PageLocks<T> = Box<[std::sync::Mutex<Option<Page<T>>>]>;
+
 pub(crate) struct Pages<T> {
-    pages: Box<[std::sync::Mutex<Option<Box<[Option<T>]>>>]>,
+    pages: PageLocks<T>,
     len: usize,
     one: Option<std::sync::Mutex<()>>,
 }
