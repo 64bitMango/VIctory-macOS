@@ -713,6 +713,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if packed_apart(&to, &from) {
+                return;
+            }
             if crate::texture::title_written(&from) {
                 crate::texture::upload(list, src, &from);
             }
@@ -736,6 +739,30 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
     copy_resource(this, dst, src);
+}
+
+/// The format of host texture `t`.
+#[cfg(windows)]
+fn host_format(t: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u32 {
+    // SAFETY: a live resource.
+    unsafe { t.GetDesc() }.Format.0 as u32
+}
+
+/// Whether one of two host textures is packed 16-bit and the other one of
+/// them made R8G8B8A8_UNORM (`crate::packed`): the host copies neither way
+/// between them, so such a copy is left out (logged once).
+/// shortcut: no title is known to copy between them; convert through a
+/// buffer if one does.
+#[cfg(windows)]
+fn packed_apart(a: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, b: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> bool {
+    use crate::packed::{RGBA8_UNORM, is_packed};
+    let (a, b) = (host_format(a), host_format(b));
+    let apart = (a == RGBA8_UNORM && is_packed(b)) || (b == RGBA8_UNORM && is_packed(a));
+    if apart {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(a, b, "a copy between a packed 16-bit texture and one kept as R8G8B8A8 left out"));
+    }
+    apart
 }
 
 /// A copy location as titles pass it, laid out as the host's: a resource,
@@ -790,12 +817,38 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
+            // A packed 16-bit texture made R8G8B8A8_UNORM (`crate::packed`):
+            // the title's texels widened into a footprint of that format.
+            let wide = (crate::packed::is_packed(src.footprint.format) && host_format(&to) == crate::packed::RGBA8_UNORM).then(|| {
+                let mut f = src.footprint;
+                f.format = crate::packed::RGBA8_UNORM;
+                f.row_pitch = crate::packed::wide_pitch(f.width);
+                f
+            });
+            let size = match wide {
+                Some(f) => f.bytes(),
+                None => Some(bytes),
+            };
+            let Some((buffer, staging)) = size.and_then(|size| list.upload(host, size)) else {
                 return;
             };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
+            match wide {
+                Some(f) => {
+                    let (format, pitch, lines) = (src.footprint.format, src.footprint.row_pitch as usize, (f.height * f.depth) as usize);
+                    let (data, staging, size) = (data as usize, staging as usize, size.unwrap_or(0) as usize);
+                    list.defer_host(move || {
+                        let mut packed = vec![0u8; bytes as usize];
+                        crate::host::copy_mapped(packed.as_mut_ptr(), data as *const u8, packed.len(), false);
+                        // SAFETY: the list's mapped upload buffer, `size` bytes, alive until it is reset.
+                        let to = unsafe { std::slice::from_raw_parts_mut(staging as *mut u8, size) };
+                        crate::packed::widen_lines(format, &packed, pitch, to, f.row_pitch as usize, f.width as usize, lines);
+                    });
+                    from.footprint = f;
+                }
+                // The list owns this mapped D3D12 upload buffer. Wine can report
+                // its address as MEM_FREE, so use the host-upload path.
+                None => list.defer_fill(staging, data, bytes as usize),
+            }
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
             #[cfg(feature = "diagnostics")]
@@ -808,6 +861,9 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if packed_apart(&to, &texture) {
+                return;
+            }
             if crate::texture::title_written(&texture) {
                 crate::texture::upload(list, src.resource, &texture);
             }
@@ -926,7 +982,21 @@ pub(crate) fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u
     let (Some(rows), Some(len)) = (dst.footprint.rows(at, size), dst.footprint.bytes()) else {
         refused!("a region outside its footprint");
     };
-    let (Some(title), Some((buffer, data))) = (buffer_range(dst.resource, dst.footprint.offset, len), list.readback(host, len)) else {
+    // A packed 16-bit texture made R8G8B8A8_UNORM (`crate::packed`): read
+    // back in that format, its rows narrowed into the title's.
+    let wide = (crate::packed::is_packed(dst.footprint.format) && desc.Format.0 as u32 == crate::packed::RGBA8_UNORM).then(|| {
+        let mut f = dst.footprint;
+        f.format = crate::packed::RGBA8_UNORM;
+        f.row_pitch = crate::packed::wide_pitch(f.width);
+        f
+    });
+    let wide_rows = match wide.map(|f| (f.rows(at, size), f.bytes())) {
+        None => None,
+        Some((Some(r), Some(n))) => Some((r, n)),
+        Some(_) => refused!("a region outside its footprint"),
+    };
+    let read_len = wide_rows.as_ref().map_or(len, |w| w.1);
+    let (Some(title), Some((buffer, data))) = (buffer_range(dst.resource, dst.footprint.offset, len), list.readback(host, read_len)) else {
         return;
     };
     if crate::texture::title_written(&texture) {
@@ -935,6 +1005,9 @@ pub(crate) fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u
     ensure_state(list, src.resource, COPY_SOURCE);
     let (mut to, mut from) = (*dst, *src);
     to.resource = buffer.as_raw().cast_const().cast();
+    if let Some(f) = wide {
+        to.footprint = f;
+    }
     to.footprint.offset = 0;
     from.resource = texture.as_raw().cast_const().cast();
     #[cfg(feature = "diagnostics")]
@@ -975,6 +1048,22 @@ pub(crate) fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u
         )
     };
     let (data, title) = (data as usize, title as usize);
+    if let Some((wide_rows, _)) = wide_rows {
+        let format = dst.footprint.format;
+        list.defer_after(move || {
+            let mut packed = Vec::new();
+            for (&(at, n), &(wide_at, wide_n)) in rows.iter().zip(&wide_rows) {
+                let (at, n) = (at as usize, n as usize);
+                // SAFETY: the readback memory spans the wide footprint, which holds the row.
+                let wide = unsafe { std::slice::from_raw_parts((data + wide_at as usize) as *const u8, wide_n as usize) };
+                packed.resize(n, 0);
+                crate::packed::narrow(format, wide, &mut packed);
+                let _writing = crate::watch::writing(title + at, n);
+                crate::host::write_mapped((title + at) as *mut u8, packed.as_ptr(), n);
+            }
+        });
+        return;
+    }
     list.defer_after(move || {
         for &(at, n) in &rows {
             let (at, n) = (at as usize, n as usize);

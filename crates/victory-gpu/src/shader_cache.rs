@@ -158,6 +158,55 @@ fn no_wave_walk() -> bool {
     *OFF.get_or_init(|| crate::switch::off("VICTORY_WAVE_WALK"))
 }
 
+/// Whether the program in `container` gets the level-0 size query on
+/// writable images (`emit::Options::uav_size_level0`): with
+/// `VICTORY_UAV_SIZE_LEVEL0=1` every program does; with a list of 16-digit
+/// shader hashes (as the log prints them, commas between) only those do.
+/// D3DMetal answers the undefined level a size query on a writable image
+/// leaves (as DXC does) with a size of 0, so a program that computes with
+/// that size goes wrong (sun shadows with edges in 16x16 tiles). Level 0
+/// in every program also changed other pictures in the halfwave50 fork
+/// (speckles on skin), hence the list. Off by default; each setting has
+/// cache entries of its own. Read once, here.
+fn uav_size_level0_for(container: &[u8]) -> bool {
+    let (all, only) = uav_size_rule();
+    *all || (!only.is_empty() && only.iter().any(|h| *h == blake3::hash(container).to_hex()[..16]))
+}
+
+fn uav_size_rule() -> &'static (bool, Vec<String>) {
+    static RULE: OnceLock<(bool, Vec<String>)> = OnceLock::new();
+    RULE.get_or_init(|| {
+        let rule = uav_size(std::env::var("VICTORY_UAV_SIZE_LEVEL0").ok().as_deref());
+        if rule.0 {
+            tracing::info!("size queries on writable images ask for level 0 (VICTORY_UAV_SIZE_LEVEL0=0 turns it off)");
+        } else if !rule.1.is_empty() {
+            tracing::info!(
+                programs = ?rule.1,
+                "VICTORY_UAV_SIZE_LEVEL0: size queries on writable images ask for level 0 in these programs only"
+            );
+        }
+        rule
+    })
+}
+
+/// `VICTORY_UAV_SIZE_LEVEL0`'s rule: every program by default (unset, empty,
+/// `1` or anything unrecognised); `0` is none; a list of 16-digit shader
+/// hashes is those programs only. On by default since an in-game check:
+/// without it faces rendered black and hair edges blocky, as D3DMetal
+/// answers a size query on an undefined level with 0x0.
+fn uav_size(value: Option<&str>) -> (bool, Vec<String>) {
+    let value = value.unwrap_or_default().trim();
+    if value == "0" {
+        return (false, Vec::new());
+    }
+    let hashes: Vec<String> = value.split(',').map(|h| h.trim().to_ascii_lowercase()).collect();
+    if !value.is_empty() && hashes.iter().all(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit())) {
+        (false, hashes)
+    } else {
+        (true, Vec::new())
+    }
+}
+
 /// The console float rules translations leave to the host's
 /// (`emit::Options::relax`): `safe` while `VICTORY_RELAX_FLOAT` is unset,
 /// otherwise those it names (`exact`: none), as a comma-separated list of `denormals`, `signed_zeros`, `legacy_mul`,
@@ -244,7 +293,7 @@ fn warn_kept_wide() {
 /// made for dispatches counted in threads: their own cache entries, one
 /// per combination.
 fn options_build(o: &victory_shader::emit::Options) -> &'static [u8; 32] {
-    static BUILDS: [OnceLock<[u8; 32]>; 256] = [const { OnceLock::new() }; 256];
+    static BUILDS: [OnceLock<[u8; 32]>; 512] = [const { OnceLock::new() }; 512];
     let i = usize::from(o.atomic_locks)
         | usize::from(o.bias_as_gradients) << 1
         | usize::from(o.mesh_stores_last) << 2
@@ -252,7 +301,8 @@ fn options_build(o: &victory_shader::emit::Options) -> &'static [u8; 32] {
         | usize::from(o.narrow_waves) << 4
         | usize::from(o.thread_counts) << 5
         | usize::from(o.atomic_fences) << 6
-        | usize::from(o.no_wave_walk) << 7;
+        | usize::from(o.no_wave_walk) << 7
+        | usize::from(o.uav_size_level0) << 8;
     BUILDS[i].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -279,6 +329,9 @@ fn options_build(o: &victory_shader::emit::Options) -> &'static [u8; 32] {
         }
         if o.no_wave_walk {
             h.update(b"no wave walk");
+        }
+        if o.uav_size_level0 {
+            h.update(b"uav size level 0");
         }
         *h.finalize().as_bytes()
     })
@@ -339,6 +392,7 @@ pub fn host_shader_keeping(
         thread_counts: crate::threads::cut(),
         atomic_fences: atomic_fences(),
         no_wave_walk: no_wave_walk(),
+        uav_size_level0: uav_size_level0_for(container),
         relax: relax(),
     };
     let translate = |c: &[u8]| {
@@ -357,6 +411,7 @@ pub fn host_shader_keeping(
         || options.thread_counts
         || options.atomic_fences
         || options.no_wave_walk
+        || options.uav_size_level0
     {
         options_build(&options)
     } else {
@@ -654,6 +709,28 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_size_query_switch_is_all_programs_or_a_list_of_hashes() {
+        assert_eq!(uav_size(None), (true, vec![]));
+        assert_eq!(uav_size(Some("")), (true, vec![]));
+        assert_eq!(uav_size(Some("0")), (false, vec![]));
+        assert_eq!(uav_size(Some("1")), (true, vec![]));
+        assert_eq!(uav_size(Some("yes")), (true, vec![]));
+        let two = vec!["0123456789abcdef".to_owned(), "fedcba9876543210".to_owned()];
+        assert_eq!(uav_size(Some("0123456789ABCDEF, fedcba9876543210")), (false, two));
+        // A list with a wrong entry is no list: nothing is turned on.
+        assert_eq!(uav_size(Some("0123456789abcdef,1")), (true, vec![]));
+    }
+
+    /// Translations with the level-0 size query have cache entries of
+    /// their own.
+    #[test]
+    fn the_size_query_switch_keys_the_cache() {
+        let plain = victory_shader::emit::Options { narrow_waves: true, ..Default::default() };
+        let level0 = victory_shader::emit::Options { uav_size_level0: true, ..plain };
+        assert_ne!(options_build(&plain), options_build(&level0));
+    }
 
     fn shader() -> HostShader {
         HostShader {

@@ -54,6 +54,8 @@ pub mod list;
 #[cfg(windows)]
 mod memory;
 pub mod object;
+// Plain std, so its tests run everywhere.
+mod packed;
 pub mod pipeline;
 #[cfg(windows)]
 mod placement;
@@ -64,6 +66,10 @@ pub mod queue;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod ranges;
+// Write marks at the source (#14): the maps and the fallback are plain std,
+// so their tests run everywhere.
+#[cfg(any(windows, test))]
+pub mod write_marks;
 #[cfg(windows)]
 mod readout;
 // The capture format is plain std: read, and tested, everywhere.

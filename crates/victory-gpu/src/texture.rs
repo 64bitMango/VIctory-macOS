@@ -45,6 +45,8 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
+    /// The title's format (a packed 16-bit one is widened, `crate::packed`).
+    format: u32,
     /// Mips per array slice.
     mips: u32,
     memory: *const u8,
@@ -720,10 +722,21 @@ impl Staging {
             // keeping the slice strictly inside the mapped staging buffer even when
             // GetCopyableFootprints does not pad the final row of the last subresource.
             let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
-            if let Err(e) =
+            // A packed 16-bit texture made R8G8B8A8_UNORM (`crate::packed`):
+            // detiled in its own 2-byte texels, then widened.
+            let format = self.format;
+            let detiled = if f.Format.0 as u32 == crate::packed::RGBA8_UNORM && crate::packed::is_packed(format) {
+                let own = 2 * f.Width as usize;
+                let lines = rows as usize * f.Depth as usize;
+                let mut packed = vec![0u8; own * lines];
+                self.layout
+                    .detile(tiled, mip, slice, &mut packed, own, own * rows as usize)
+                    .map(|()| crate::packed::widen_lines(format, &packed, own, linear, pitch, f.Width as usize, lines))
+            } else {
                 self.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+            };
+            if let Err(e) = detiled {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return None;
             }
@@ -909,6 +922,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         footprints,
         rows,
         layout,
+        format: crate::resource::pc_format(desc.format),
         mips: u32::from(d.MipLevels),
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),

@@ -587,16 +587,25 @@ impl Module {
         }
     }
 
-    /// Whether `v` is zero bits wherever it is made: the integer or float
-    /// constant, or a bitcast, select or phi of nothing else.
-    fn always_zero(&self, v: V) -> bool {
+    /// Whether `v`, as a 32-bit float, is a constant not below zero (and
+    /// not NaN) wherever it is made: such constants (integers by their
+    /// bits), or a bitcast, select or phi of nothing else. A clip or cull
+    /// distance that is one at every vertex removes nothing.
+    fn never_negative(&self, v: V) -> bool {
         let (mut seen, mut work) = (std::collections::HashSet::new(), vec![v]);
         while let Some(v) = work.pop() {
             match v {
-                V::Const(i) => match self.consts[i as usize].1 {
-                    Const::Int(0) | Const::Float(0) => {}
-                    _ => return false,
-                },
+                V::Const(i) => {
+                    let bits = match self.consts[i as usize].1 {
+                        Const::Int(n) => n as u32,
+                        Const::Float(bits) => bits,
+                        _ => return false,
+                    };
+                    // +0.0 to +infinity, and -0.0.
+                    if bits & 0x7FFF_FFFF > 0x7F80_0000 || bits > 0x8000_0000 {
+                        return false;
+                    }
+                }
                 V::Inst(i) if seen.insert(i) => match &self.insts[i as usize].op {
                     Op::Cast(Cast::Bitcast, x) => work.push(*x),
                     Op::Select(_, a, b) => work.extend([*a, *b]),
@@ -614,8 +623,8 @@ impl Module {
 
     /// The channels of signature element `id` that calls of the functions
     /// named from `prefix` (output stores: opcode, element, row, channel,
-    /// value) store, and those of them that take something other than
-    /// zero bits in some store.
+    /// value) store, and those of them that take something other than a
+    /// constant not below zero ([`Module::never_negative`]) in some store.
     pub fn stored_channels(&self, prefix: &str, id: u32) -> (u8, u8) {
         let (mut stored, mut live) = (0u8, 0u8);
         for i in self.blocks.iter().flat_map(|b| &b.body) {
@@ -633,7 +642,7 @@ impl Module {
                 return (0xFF, 0xFF);
             };
             stored |= 1 << ch;
-            if !args.get(4).is_some_and(|&x| self.always_zero(x)) {
+            if !args.get(4).is_some_and(|&x| self.never_negative(x)) {
                 live |= 1 << ch;
             }
         }

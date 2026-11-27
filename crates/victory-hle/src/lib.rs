@@ -19,6 +19,9 @@ pub mod runtime;
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
 pub use victory_gpu::console;
+/// Write marks' switch, cells and launcher hand-over (`VICTORY_WRITE_MARKS`).
+#[cfg(windows)]
+pub use victory_gpu::write_marks;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;
@@ -54,6 +57,15 @@ impl ImportResolver for HleResolver {
         }
         match self.host.resolve(dll, symbol) {
             Some(address) => Resolution::Found {
+                // Write marks (`VICTORY_WRITE_MARKS=1`): the C runtime's
+                // `memcpy` and `memmove` mark the view records they copy
+                // into the title's view heap.
+                #[cfg(windows)]
+                address: match symbol {
+                    ImportSymbol::Name { name, .. } => victory_gpu::write_marks::import(name, address),
+                    _ => address,
+                },
+                #[cfg(not(windows))]
                 address,
                 provenance: Provenance::Host,
             },

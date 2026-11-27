@@ -92,6 +92,7 @@ fn program(body: &[u32], wave64: bool, threads: [u32; 3], narrow: bool, fences: 
             atomic_locks: false,
             bias_as_gradients: false,
             narrow_waves: narrow,
+            uav_size_level0: false,
             relax: Default::default(),
             view_marks: false,
         },

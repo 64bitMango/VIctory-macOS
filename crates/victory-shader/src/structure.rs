@@ -467,6 +467,12 @@ pub struct Structured {
     paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: Map<Value, Value>,
+    /// Wave64 masks of [`Structured::other`]: the high dword's value by the
+    /// low dword's, as their uses read the pair (none where two uses pair
+    /// one low dword with different high ones). The two dwords of such a
+    /// mask may be written by different instructions (an `s_mov_b32` each),
+    /// so the write of the low one does not name the high one.
+    pub other_highs: Map<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
@@ -958,7 +964,18 @@ impl<'a> Lanes<'a> {
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
+        let mut other_highs: Map<Value, Value> = Map::default();
+        let mut twice: Vec<Value> = Vec::new();
+        for &(lo, hi) in self.other.keys().filter(|(lo, hi)| lo != hi) {
+            if other_highs.insert(lo, hi).is_some_and(|old| old != hi) {
+                twice.push(lo);
+            }
+        }
+        for lo in twice {
+            other_highs.remove(&lo);
+        }
         Ok(Structured {
+            other_highs,
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             other: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
@@ -1619,6 +1636,96 @@ mod tests {
     fn build(words: &[u32], wave64: bool) -> Program {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         ir::build(&code, wave64, 256).unwrap()
+    }
+
+    /// The header phi of the loop that reads `s[2:3]` (or `s2`) as a mask.
+    fn header(p: &Program) -> &ir::Phi {
+        let at = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.iter().any(|i| i.name() == "v_cndmask_b32"))
+            .expect("the loop");
+        let phi = p.blocks[at].phis.iter().find(|phi| phi.reg == Reg::S(2));
+        phi.expect("the mask's join")
+    }
+
+    /// A mask the loop leaves alone, parked in two lanes of a VGPR and read
+    /// back before the back edge: nothing but the join at the loop's header
+    /// reads the two lane reads, and the join takes them in as the mask it
+    /// holds itself (`Lanes::phi_args`; the case of halfwave50 802a683).
+    #[test]
+    fn a_join_takes_in_a_mask_read_back_from_the_lanes_it_was_parked_in() {
+        let cnd = 258 | (259 << 9) | (2 << 18);
+        let p = build(
+            &[
+                0xD4C2_0002,
+                0x0002_0080, // 0: v_cmp_eq_u32 s[2:3], 0, v0
+                0xBE84_0380, // 8: s_mov_b32 s4, 0
+                0xD501_0001,
+                cnd, // 12: v_cndmask_b32 v1, v2, v3, s[2:3]
+                0xD761_0005,
+                0x0001_0002, // 20: v_writelane_b32 v5, s2, 0
+                0xD761_0005,
+                0x0001_0203, // 28: v_writelane_b32 v5, s3, 1
+                0xBE82_0480, // 36: s_mov_b64 s[2:3], 0
+                0xD760_0002,
+                0x0001_0105, // 40: v_readlane_b32 s2, v5, 0
+                0xD760_0003,
+                0x0001_0305, // 48: v_readlane_b32 s3, v5, 1
+                0x8004_8104, // 56: s_add_u32 s4, s4, 1
+                0xBF0A_8404, // 60: s_cmp_lt_u32 s4, 4
+                0xBF85_FFF2, // 64: s_cbranch_scc1 -> 12
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let phi = header(&p);
+        let own = s.masks[&phi.value];
+        let back = phi.args[1];
+        assert_eq!(s.restored.get(&back), Some(&phi.value));
+        assert_eq!(s.masks.get(&back), Some(&own));
+        assert!(!s.other.contains_key(&back));
+    }
+
+    /// The same through the join of a branch inside the loop, one of whose
+    /// edges brings a copy of the mask and the other the mask; and with a
+    /// copy of another mask, a join of two masks, which is a mask too.
+    #[test]
+    fn a_join_takes_in_a_join_all_of_whose_edges_bring_one_mask() {
+        let cnd = 258 | (259 << 9) | (2 << 18);
+        let program = |copied: u32| {
+            build(
+                &[
+                    0xD4C2_0002,
+                    0x0002_0080, // 0: v_cmp_eq_u32 s2, 0, v0
+                    0xD4C1_0007,
+                    0x0002_0080, // 8: v_cmp_lt_u32 s7, 0, v0
+                    0xBE84_0380, // 16: s_mov_b32 s4, 0
+                    0xD501_0001,
+                    cnd,         // 20: v_cndmask_b32 v1, v2, v3, s2
+                    0xBE86_0302, // 28: s_mov_b32 s6, s2
+                    0xBF06_8104, // 32: s_cmp_eq_u32 s4, 1
+                    0xBF85_0001, // 36: s_cbranch_scc1 -> 44
+                    copied,      // 40: s_mov_b32 s2, s6 (or s7)
+                    0x8004_8104, // 44: s_add_u32 s4, s4, 1
+                    0xBF0A_8404, // 48: s_cmp_lt_u32 s4, 4
+                    0xBF85_FFF7, // 52: s_cbranch_scc1 -> 20
+                    S_ENDPGM,
+                ],
+                false,
+            )
+        };
+        let p = program(0xBE82_0306);
+        let s = structure(&p).unwrap();
+        let phi = header(&p);
+        let back = phi.args[1];
+        assert!(p.blocks.iter().any(|b| b.phis.iter().any(|x| x.value == back)));
+        assert_eq!(s.masks.get(&back), Some(&s.masks[&phi.value]));
+        let p = program(0xBE82_0307);
+        let s = structure(&p).unwrap();
+        let back = header(&p).args[1];
+        assert!(s.masks.contains_key(&back) && !s.other.contains_key(&back));
     }
 
     fn guarded(s: &Structured) -> usize {

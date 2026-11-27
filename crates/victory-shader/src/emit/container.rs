@@ -131,32 +131,39 @@ pub(crate) const METAL_MESH_BYTES: u32 = 32768;
 
 /// Bytes of one output record (vertex or primitive) of a mesh shader as
 /// Metal counts them, the record being the struct D3DMetal (4.0b3) makes of
-/// the signature: the clip and cull distances as a float array, the
-/// position, then one field per other element in element order (the
-/// distances again among them), each of `cols` 32-bit components and
-/// aligned to its own size: 4, 8, 12 (a 3-vector packs at a multiple of
-/// 12, not 16) or 16 bytes, with no padding at the end. Every field counts,
-/// whether the pixel shader reads it or not. Measured with Metal's own
-/// messages (mesh pipelines of chosen output structs) and D3DMetal's
-/// conversions of the title's meshes: the 34816 and 35840 bytes Metal
-/// reported at 128 vertices are records of 272 and 280 bytes as this
-/// counts them, and the meshes it counts within the limit build.
+/// the signature: the position first (16 bytes) wherever its element is;
+/// 16 bytes more if there is any clip distance element, however many
+/// distances (cull distances add nothing there); then one field per other
+/// element in element order (the clip and cull distances among them), each
+/// of `cols` 32-bit components and aligned to its own size: 4, 8, 12 (a
+/// 3-vector packs at a multiple of 12, not 16) or 16 bytes, with no padding
+/// at the end. Elements without a register are not outputs. Every field
+/// counts, whether the pixel shader reads it or not. Component types,
+/// interpolation modes, registers and names change nothing.
+///
+/// Measured: halfwave50's probe of D3DMetal 4.0 beta 3 (202 signatures,
+/// its `emit::mesh_size`, b50fd5b; `mesh_size_tests` holds its table), and
+/// Metal's own messages for the title's meshes here: the 34816 and 35840
+/// bytes Metal reported at 128 vertices are records of 272 and 280 bytes.
+/// The earlier count here (the distances as an array of 4 bytes each
+/// before the position) agreed for up to four clip distances without cull
+/// distances, and counted cull distances and more than four distances too
+/// much.
 pub(crate) fn metal_record<'a>(elements: impl IntoIterator<Item = &'a SigElement>) -> u32 {
-    let elements: Vec<&SigElement> = elements.into_iter().collect();
-    let distances: u32 = elements
-        .iter()
-        .filter(|e| matches!(e.kind, 6 | 7))
-        .map(|e| u32::from(e.cols))
-        .sum();
-    let (position, rest): (Vec<&SigElement>, Vec<&SigElement>) =
-        elements.into_iter().partition(|e| e.kind == 3);
-    position.into_iter().chain(rest).fold(4 * distances, |at, e| {
+    let elements: Vec<&SigElement> = elements.into_iter().filter(|e| e.row.is_some()).collect();
+    let has = |kind: u8| elements.iter().any(|e| e.kind == kind);
+    let fixed = 16 * (u32::from(has(3)) + u32::from(has(6)));
+    elements.iter().filter(|e| e.kind != 3).fold(fixed, |at, e| {
         let size = 4 * u32::from(e.cols.max(1));
         at.div_ceil(size) * size + size
     })
 }
 
-/// Metal's size of a mesh shader's output (see [`metal_record`]).
+/// Metal's size of a mesh shader's output (see [`metal_record`]): the
+/// vertex record times the declared vertices rounded up to a multiple of 4,
+/// plus the primitive record times the declared primitives (measured by
+/// halfwave50's probe: `P f4*16` at 125 to 128 vertices is 34816 bytes, at
+/// 129 to 132 35904).
 pub(crate) fn metal_mesh_bytes(
     vertices: &[SigElement],
     primitives: &[SigElement],
@@ -168,7 +175,7 @@ pub(crate) fn metal_mesh_bytes(
     } else {
         max_primitives * metal_record(primitives)
     };
-    max_vertices * metal_record(vertices) + prims
+    max_vertices.next_multiple_of(4) * metal_record(vertices) + prims
 }
 
 /// An order of mesh output elements whose Metal record ([`metal_record`])
@@ -201,7 +208,9 @@ pub(crate) fn metal_packed_order(elements: &[SigElement]) -> Vec<usize> {
 /// Mesh output `elements` without the clip and cull distances at the end
 /// of their order (clip then cull, by index, as the console's distance
 /// vectors carry them) whose channels `idle` names (element, channels):
-/// distances that are +0.0 at every vertex, which clip and cull nothing.
+/// distances that are a constant not below zero (+0.0, 1.0) at every
+/// vertex, which clip and cull nothing (after halfwave50 2beb020, whose
+/// `idle_clip` takes any such constant, where this took +0.0 alone).
 /// Only from the end, so that the others keep their places in the vectors;
 /// an element left without channels goes. `None` when there are none.
 pub(crate) fn without_idle_distances(
@@ -692,7 +701,7 @@ mod tests {
         }
     }
 
-    /// One of the title's meshes (da22b2adfd4f76d3): Metal counted 34816
+    /// One of the title's meshes: Metal counted 34816
     /// bytes; in the packed order it is 30720, the sum of its components.
     #[test]
     fn packed_order_fits_a_title_mesh_under_metals_limit() {
@@ -744,20 +753,19 @@ mod tests {
         assert_eq!(sorted, (0..els.len()).collect::<Vec<_>>());
     }
 
-    /// The vertex outputs of a title shader (1c451759513efb4c) and of
-    /// a title shader (78683826ba8dd8a6): four clip
+    /// The vertex outputs of two of the title's mesh shaders: four clip
     /// distances, of which the last three are +0.0 at every vertex.
-    fn transform_lit() -> Vec<SigElement> {
+    fn four_distances() -> Vec<SigElement> {
         let mut spec = vec![("SV_Position", 3, 4), ("SV_ClipDistance", 6, 4)];
         let cols = [4, 4, 4, 1, 2, 1, 4, 3, 1, 3, 3, 3, 3, 3, 3, 2, 4, 3, 3];
         spec.extend(cols.map(|c| ("TEXCOORD", 0, c)));
         outputs(&spec)
     }
 
-    /// The vertex outputs of the DeferredPedDecal meshes (ac82b7984c664350,
-    /// 36a9c81f635373e5): one clip distance; element 4 is TEXCOORD3, of
+    /// The vertex outputs of two other meshes of the title (the decal meshes
+    /// below): one clip distance; element 4 is TEXCOORD3, of
     /// which a title shader reads the last channel only.
-    fn ped_decal() -> Vec<SigElement> {
+    fn one_distance() -> Vec<SigElement> {
         let mut spec = vec![("SV_Position", 3, 4)];
         let cols = [4, 4, 4, 4, 3, 1, 3, 1, 3, 1, 4, 3, 1, 3, 1, 4, 4, 3, 1, 4];
         spec.extend(cols.map(|c| ("TEXCOORD", 0, c)));
@@ -779,22 +787,21 @@ mod tests {
     /// TEXCOORD3 as narrow as its pixel shader reads it.
     #[test]
     fn title_meshes_over_metals_limit_packed_fit_without_what_nothing_reads() {
-        // TransformLit and MirrorReflectionTransformLit with pixel shaders
-        // that read every output (43fba4644854c38e, 5f7ce6c17312f149).
-        let els = transform_lit();
+        // The first two meshes with pixel shaders that read every output.
+        let els = four_distances();
         assert_eq!(packed_bytes(&els), 33792);
         let fewer = without_idle_distances(&els, &[(1, 0b1110)]).unwrap();
         assert_eq!((fewer.len(), fewer[1].cols), (els.len(), 1));
         assert_eq!(packed_bytes(&fewer), 32256);
-        // TransformLit without TEXCOORD16 (element 10), which
-        // 64d9a8c65c927eaf does not read.
+        // The first mesh without TEXCOORD16 (element 10), which
+        // its pixel shader there does not read.
         let mut kept = els.clone();
         kept.remove(10);
         assert_eq!(packed_bytes(&kept), 33280);
         let fewer = without_idle_distances(&kept, &[(1, 0b1110)]).unwrap();
         assert_eq!(packed_bytes(&fewer), 31744);
-        // The DeferredPedDecal meshes: their one distance is live.
-        let mut els = ped_decal();
+        // The decal meshes: their one distance is live.
+        let mut els = one_distance();
         assert_eq!(packed_bytes(&els), 33280);
         assert_eq!(without_idle_distances(&els, &[(21, 0)]), None);
         (els[4].col, els[4].cols) = (3, 1);

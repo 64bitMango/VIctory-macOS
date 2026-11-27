@@ -3786,6 +3786,7 @@ impl Meter {
                 crate::frame::log();
                 log_gpu_times(copy_frames);
                 crate::copystat::log(copy_frames);
+                crate::write_marks::line(copy_frames);
                 crate::bindless::log(copy_frames);
                 crate::shadow::log_views(copy_frames);
                 crate::shadow::log_idle();

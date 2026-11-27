@@ -213,6 +213,8 @@ mod container;
 mod counted_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(test)]
+mod mesh_size_tests;
 #[cfg(all(test, windows))]
 mod flow_tests;
 #[cfg(test)]
@@ -502,7 +504,7 @@ pub struct Options {
     /// the stages, so the pixel shaders stay as they are. Meshes within
     /// the limit are made as without it. A mesh over the limit even so
     /// leaves out the clip and cull distances at the end of the console's
-    /// distance vectors that it gives +0.0 at every vertex
+    /// distance vectors that it gives a constant not below zero at every vertex
     /// (`container::without_idle_distances`): they clip nothing, and
     /// Metal counts each twice.
     pub mesh_pack_outputs: bool,
@@ -532,6 +534,13 @@ pub struct Options {
     /// taken by the whole wave (`widened`), and keeps `WaveSize(64)` as
     /// before. Off (the walk made) by default.
     pub no_wave_walk: bool,
+    /// A size query on a writable image (`getDimensions`) asks for level 0,
+    /// where DXC (and the default here) leaves the level undefined. A
+    /// writable view has one level, so it is the same query, but D3DMetal
+    /// answers the undefined level with a size of 0 (a program computing
+    /// with that size went wrong: sun shadows with edges in 16x16 tiles).
+    /// Off by default; the shader cache keys on it.
+    pub uav_size_level0: bool,
     /// Console float rules left to the host's (all off: the console's).
     pub relax: Relax,
 }
@@ -1103,6 +1112,7 @@ fn emit_keeping(
         atomic_locks: options.atomic_locks,
         bias_as_gradients: options.bias_as_gradients,
         narrow_waves: options.narrow_waves,
+        uav_size_level0: options.uav_size_level0,
         relax: options.relax,
     };
     // The structure builder's programs and their like are made for
@@ -2596,7 +2606,7 @@ mod tests {
     }
 
     /// Outputs for [`param_mesh_of`] with 14 rows that Metal counts over
-    /// its limit even packed, as it does the title's TransformLit meshes
+    /// its limit even packed, as it does two of the title's meshes
     /// (264 bytes a vertex): [`param_elements`] for 13 rows, two scalars
     /// (`TEXCOORD28`, `TEXCOORD29`) in the fourteenth, and four clip
     /// distances.
@@ -2782,8 +2792,9 @@ mod tests {
     }
 
     /// A mesh Metal counts over its limit even packed leaves out the clip
-    /// distances it gives +0.0 at every vertex, from the end of the
-    /// distance vector; the live ones stay, and so do all of them without
+    /// distances it gives a constant not below zero at every vertex (+0.0,
+    /// 1.0), from the end of the distance vector; the live ones stay (one
+    /// that varies, even if never negative), and so do all of them without
     /// packing or within the limit.
     #[test]
     fn idle_clip_distances_are_left_out_only_over_metals_limit() {
@@ -2793,8 +2804,8 @@ mod tests {
             ..Options::default()
         };
         let clip = |ms: &HostShader| element(&ms.dxil, FourCC::OSG1, "SV_ClipDistance0");
-        // v7 (1.0), then v8 (0) three times.
-        let idle = Some(0x0808_0807);
+        // v2 (0 or 1, not a constant), then v8 (0) three times.
+        let idle = Some(0x0808_0802);
         let plain = param_mesh_of(&els, 14, idle, Options::default(), None).unwrap();
         assert_eq!(clip(&plain), Some((15, 0, 4)));
         let bytes = |dxil: &[u8]| {
@@ -2812,15 +2823,18 @@ mod tests {
         assert_eq!(bytes(&ours.dxil), 128 * 252);
         assert!(!mesh_over_metal_limit(&ours.dxil));
         // The second distance live: only the two after it go.
-        let two = param_mesh_of(&els, 14, Some(0x0808_0708), pack, None).unwrap();
+        let two = param_mesh_of(&els, 14, Some(0x0808_0208), pack, None).unwrap();
         assert_eq!(clip(&two), Some((15, 0, 2)));
         // All live: all stay, and Metal refuses the pipeline.
-        let live = param_mesh_of(&els, 14, Some(0x0707_0707), pack, None).unwrap();
+        let live = param_mesh_of(&els, 14, Some(0x0202_0202), pack, None).unwrap();
         assert_eq!(clip(&live), Some((15, 0, 4)));
         assert!(mesh_over_metal_limit(&live.dxil));
         // None live: the element goes.
         let none = param_mesh_of(&els, 14, Some(0x0808_0808), pack, None).unwrap();
         assert_eq!(clip(&none), None);
+        // A constant above zero clips nothing either: v7 (1.0) and v6 (0.5).
+        let positive = param_mesh_of(&els, 14, Some(0x0806_0807), pack, None).unwrap();
+        assert_eq!(clip(&positive), None);
         // Within the limit packed (13 rows: 256 bytes a vertex) they all
         // stay.
         let mut small = param_elements(13);
@@ -2861,7 +2875,7 @@ mod tests {
         let wine = super::host::under_wine();
         let mesh = |options, kept| param_mesh(PARAM_ROWS, options, kept).unwrap();
         let distances = |options| {
-            param_mesh_of(&distance_elements(), 14, Some(0x0808_0807), options, None).unwrap()
+            param_mesh_of(&distance_elements(), 14, Some(0x0808_0802), options, None).unwrap()
         };
         let mut ran = 0;
         for (label, warp) in [("hardware", false), ("warp", true)] {

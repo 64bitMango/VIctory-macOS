@@ -91,7 +91,7 @@ pub(crate) struct ResourceDesc {
     height: u32,
     depth_or_array_size: u16,
     mip_levels: u16,
-    format: u32,
+    pub(crate) format: u32,
     sample_count: u32,
     sample_quality: u32,
     layout: u32,
@@ -242,6 +242,66 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// Whether the host GPU lacks render-target or typed unordered-access
+/// support for the packed 16-bit `format` (`crate::packed`), asked once per
+/// format (D3DMetal has no typed unordered store for either).
+#[cfg(windows)]
+fn host_lacks_target(format: u32) -> bool {
+    use std::sync::OnceLock;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static LACKS: [OnceLock<bool>; 2] = [OnceLock::new(), OnceLock::new()];
+    let Some(i) = crate::packed::PACKED_16.iter().position(|&f| f == format) else {
+        return false;
+    };
+    *LACKS[i].get_or_init(|| {
+        let Some(host) = crate::host::host() else {
+            return false;
+        };
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: DXGI_FORMAT(format as i32),
+            ..Default::default()
+        };
+        // SAFETY: the structure the feature names, ours.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+            )
+        };
+        let needed = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0
+            | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+        let lacks = asked.is_err() || support.Support1.0 & needed != needed;
+        if lacks {
+            tracing::info!(
+                format,
+                "packed 16-bit render targets and unordered textures are R8G8B8A8_UNORM on this GPU"
+            );
+        }
+        lacks
+    })
+}
+
+#[cfg(not(windows))]
+fn host_lacks_target(_: u32) -> bool {
+    false
+}
+
+/// The format a render target or unordered-access texture of `format` is
+/// made in on the host, and that render target views and pipelines name:
+/// R8G8B8A8_UNORM for a packed 16-bit format the GPU cannot render to or
+/// write typed (`crate::packed`); else the format as the host has it.
+/// Textures only sampled keep theirs.
+pub(crate) fn target_format(format: u32) -> u32 {
+    let format = pc_format(format);
+    if crate::packed::is_packed(format) && host_lacks_target(format) {
+        crate::packed::RGBA8_UNORM
+    } else {
+        format
+    }
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -290,7 +350,9 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     let host = host_resource(this)?;
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    (format != own).then_some(own)
+    // (A packed 16-bit texture made R8G8B8A8_UNORM, `crate::packed`, takes
+    // its defaults.)
+    (format != own && format != target_format(own)).then_some(own)
 }
 
 /// Without a host device there is no host copy, so no view needs to
@@ -1161,7 +1223,11 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    d.format = pc_format(d.format);
+    d.format = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+        target_format(d.format)
+    } else {
+        pc_format(d.format)
+    };
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -1176,6 +1242,8 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     Some(d)
 }
 
+#[cfg(windows)]
+const RENDER_TARGET: u32 = 1;
 const DEPTH: u32 = 2;
 #[cfg(windows)]
 const UNORDERED: u32 = 4;
@@ -1320,6 +1388,7 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
     let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
     d.flags & USES & !flags == 0
         && (family(d.format) == family(own)
+            || target_format(d.format) == own
             || t.castable.iter().any(|&c| family(c) == family(d.format)))
 }
 
@@ -1352,7 +1421,11 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = pc_format(value[0]);
+        value[0] = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+            target_format(value[0])
+        } else {
+            pc_format(value[0])
+        };
         value
     });
     let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());

@@ -115,6 +115,9 @@ pub(crate) struct Parts<'a> {
     pub bias_as_gradients: bool,
     /// See [`Options::narrow_waves`](super::Options).
     pub narrow_waves: bool,
+    /// A size query on a writable image asks for level 0, not an undefined
+    /// level ([`Options::uav_size_level0`](super::Options)).
+    pub uav_size_level0: bool,
     /// See [`Options::relax`](super::Options).
     pub relax: super::Relax,
 }
@@ -3720,7 +3723,10 @@ impl<'a> Lower<'a> {
             .iter()
             .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
         let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
+        // A pair written one dword at a time (an `s_mov_b32` each): the
+        // high dword its uses read with this low one.
         inst.write(pick(reg)?)
+            .or_else(|| self.x.st.other_highs.get(&lo).copied())
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
@@ -5794,7 +5800,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let mip = if image.is_some() && !uav {
+        let mip = if image.is_some() && (!uav || self.x.uav_size_level0) {
             self.s.m.i32(0)
         } else {
             self.s.m.undef(i32t)
@@ -10395,7 +10401,9 @@ impl<'a> Lower<'a> {
             // in the first address: DXIL's dimensions; a channel DXIL leaves
             // out reads 1 (UAVs: one level).
             let h = self.handle(site, src, false, props)?;
-            let mip = if uav {
+            let mip = if uav && self.x.uav_size_level0 {
+                self.s.m.i32(0)
+            } else if uav {
                 self.s.m.undef(self.s.t.i32)
             } else {
                 addr_val(self, 0)?
@@ -14140,6 +14148,7 @@ mod tests {
             atomic_locks: false,
             bias_as_gradients: false,
             narrow_waves: false,
+            uav_size_level0: false,
             relax: Default::default(),
             view_marks: false,
         })
@@ -14208,6 +14217,7 @@ mod tests {
             atomic_locks: false,
             bias_as_gradients: false,
             narrow_waves: false,
+            uav_size_level0: false,
             relax: Default::default(),
             view_marks: false,
         })
@@ -14410,6 +14420,7 @@ mod tests {
             atomic_locks: false,
             bias_as_gradients: false,
             narrow_waves: false,
+            uav_size_level0: false,
             relax: Default::default(),
             view_marks: false,
         })
@@ -15404,6 +15415,7 @@ mod tests {
             atomic_locks: false,
             bias_as_gradients: false,
             narrow_waves,
+            uav_size_level0: false,
             relax,
             view_marks: false,
             psv: None,
@@ -15476,7 +15488,7 @@ mod tests {
 
     #[test]
     fn a_divergent_write_syncs_at_the_join_before_the_read() {
-        // 34d88edf583f3778's shape: lanes with v0 = 0 write, all read.
+        // One program's shape: lanes with v0 = 0 write, all read.
         let mut w = vec![V_LSHLREV_V1_2_V0, SAVE_EXEC, CMPX_V0_EQ_0, skip(2)];
         w.extend(DS_WRITE_V1_V0);
         w.push(RESTORE_EXEC);
@@ -15525,7 +15537,7 @@ mod tests {
 
     #[test]
     fn atomics_of_one_kind_accumulate_in_divergent_code() {
-        // 196bf6114ff3a131's shape: some lanes add to a dword, more than
+        // Another program's shape: some lanes add to a dword, more than
         // once; every lane reads the total after the join.
         const DS_ADD_V1_V0: [u32; 2] = [0xD800_0000, 0x0000_0001]; // ds_add_u32 v1, v0
         const DS_OR_V1_V0: [u32; 2] = [0xD828_0000, 0x0000_0001]; // ds_or_b32 v1, v0
@@ -15573,7 +15585,7 @@ mod tests {
     const DS_WRITE_V1_V2: [u32; 2] = [0xD834_0000, 0x0000_0201]; // ds_write_b32 v1, v2
     const DS_WRITE_V1_V3: [u32; 2] = [0xD834_0000, 0x0000_0301]; // ds_write_b32 v1, v3
     /// `WaveActiveSum(v16)` as the console compiler expands it
-    /// (bad01f53f53248e5 at 0x1eb4): the sum in s12.
+    /// (a title program at 0x1eb4): the sum in s12.
     const WAVE_SUM_V16_S12: [u32; 18] = [
         0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
         0xD501_0002,
@@ -15670,7 +15682,7 @@ mod tests {
 
     #[test]
     fn quad_permutes_stay_in_a_half() {
-        // f0c91b4d2578f5bf's kind: a quad never straddles lanes 31 and 32.
+        // A program's kind: a quad never straddles lanes 31 and 32.
         let mut w = vec![V_LSHLREV_V1_2_V0];
         w.extend(QUAD_PERM_V2_V0);
         w.extend(DS_WRITE_V1_V2);
@@ -15752,7 +15764,7 @@ mod tests {
         assert_eq!(halves(&w, 256), (Some(64), 0));
     }
 
-    /// The console compiler's once-per-wave block (191ecaed66eea3b1 at
+    /// The console compiler's once-per-wave block (a title program at
     /// 0x34): the lane whose number is the first set bit of EXEC takes its
     /// own v0, and after it every lane reads that lane's. `test`: the
     /// compare that leaves the one lane.
@@ -15888,7 +15900,7 @@ mod tests {
     #[test]
     fn a_count_the_group_shares_is_one_all_waves_join_alike() {
         // 25 passes, each a count of the lanes with a bit of their id
-        // (eae3498e6553afa8 at 0xf48), after `if (id & 1) return;`: the
+        // (a title program at 0xf48), after `if (id & 1) return;`: the
         // mask is exchanged each pass by the threads still running, which
         // meet to store, to read, and to take back what they stored (a
         // half's threads may all have ended by the next pass).
@@ -15940,7 +15952,7 @@ mod tests {
     #[test]
     fn a_skip_of_wave_operations_one_wave_takes_is_sunk_below_them() {
         // `if (WaveActiveCountBits(id & 1 == 0) != 0) v2 = WaveActiveSum(id)`
-        // (0c028454b58543f0 at 0x6e8): in a group of several console waves
+        // (a title program at 0x6e8): in a group of several console waves
         // each takes the skip or not by its own count, so every lane runs
         // the sum and the skip is taken after it; the group meets there.
         let program = |write: bool| {
@@ -15972,7 +15984,7 @@ mod tests {
     #[test]
     fn the_thread_whose_flat_id_is_zero_runs_alone() {
         // `if (id.y * 8 + id.x == 0)` with the flat id made as a shift and
-        // a sum (0c028454b58543f0 at 0x40, 0x820): one thread of the group.
+        // a sum (a title program at 0x40, 0x820): one thread of the group.
         let program = |first: [u32; 2]| {
             let mut w = first.to_vec();
             w.extend([0xD4C2_0000, 0x0002_0480]); // v_cmp_eq_u32 s[0:1], 0, v2
@@ -16029,7 +16041,7 @@ mod tests {
     #[test]
     fn the_first_lane_of_a_mask_is_read_by_the_halves_that_hold_it() {
         // `if (id & 1) return;` then `v_readlane_b32` at `s_ff1_i32_b64` of
-        // the lanes left (0a5ecfee6b79e13b at 0x90): the mask's number,
+        // the lanes left (a title program at 0x90): the mask's number,
         // then each half's lanes of it and its first one's value.
         let program = |mask: u32, skip_to_end: bool| {
             let mut w = vec![V_LSHLREV_V1_2_V0, 0x3604_0081]; // v_and_b32 v2, 1, v0
@@ -16063,7 +16075,7 @@ mod tests {
 
     #[test]
     fn a_far_jump_to_the_end_ends_the_lanes_too() {
-        // 20b78ee12ecdb57d at 0x168: the end is out of a branch's reach, so
+        // A title program at 0x168: the end is out of a branch's reach, so
         // the lanes left branch over a far jump to it.
         let mut w = vec![V_LSHLREV_V1_2_V0, V_AND_V1_1_V0];
         w.extend(CMP_S0_V1_EQ_0);
@@ -16111,7 +16123,7 @@ mod tests {
 
     #[test]
     fn a_wave_sum_one_thread_takes_alone_needs_no_exchange() {
-        // bad01f53f53248e5's shape: `if (all(GroupThreadID == 0))` around
+        // A program's shape: `if (all(GroupThreadID == 0))` around
         // the wave operations; the one lane's value is the wave's.
         let mut w = vec![V_LSHLREV_V1_2_V0, V_MOV_V16_V0];
         w.extend(CMP_S0_V0_EQ_0);
@@ -16151,7 +16163,7 @@ mod tests {
     }
 
     /// `if (id & 3) { slot = counter.add(count of such lanes) + count below }`
-    /// as the console compiler expands it (058b0f6379a8e312 at 0x84): the
+    /// as the console compiler expands it (a title program at 0x84): the
     /// first lane left adds the count, every lane reads that lane's old
     /// value. `skip`: the two `s_cbranch_execz`, or what stands for them.
     fn allocation(skip: fn(u32) -> u32, first: fn(u32) -> u32) -> Vec<u32> {

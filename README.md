@@ -78,8 +78,11 @@ tools/macos/victory.sh run --execute <the application's executable>
 - **Upscaler (without the DLL):** the application's own console upscaler now translates and works as a fallback. It has not been compared with the PC upscaler for speed yet.
 - **Presentation:** when two planes are presented, plane 0 (the scene) is shown with plane 1 (the interface) blended over it. `VICTORY_PRESENT_PLANE=<n>` and `VICTORY_PRESENT_COMPOSITE=0|1` override this.
 - **Memory:** the descriptor-view leak is fixed. Constant buffer views and views of placed memory are kept inside the descriptor (on by default; `VICTORY_VIEW_INLINE=0` turns it off), so long sessions no longer grow the heap by about 0.28 GB a minute.
+- **Picture:** faces rendering black and blocky hair edges are fixed: size queries on writable textures ask for level 0 (on by default; `VICTORY_UAV_SIZE_LEVEL0=0` turns it off). Packed 16-bit formats are kept as R8G8B8A8 where the GPU cannot write them typed, which brings back missing sunlight.
+- **Heap sync:** two cuts are on by default: slots whose record became zeros or other bytes are left as they are (`VICTORY_STALE_LEFT`), and the records of draws' tables are left to the draws that read them (`VICTORY_TABLES_TO_DRAWS`); `=0` turns either off. In our measurements the heap sync fell from about 35 to about 19 ms a frame. Write marks (`VICTORY_WRITE_MARKS=1`) are available but off and experimental.
+- **Current speed:** Series S profile with the PC upscaler, diagnostics build, M5 Pro: about 201 to 209 ms a frame (about 4.8 to 5 fps median). Still not playable.
 
-Known issues: blocky dark patches on hair with the PC upscaler; the console upscaler's spin-waits are capped at 16,384 tries.
+Known issues: the console upscaler's spin-waits are capped at 16,384 tries.
 
 ## Running the tests
 

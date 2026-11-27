@@ -27,6 +27,9 @@ pub(crate) mod amd_only;
 #[cfg(windows)]
 mod crash;
 pub mod masked;
+// Write marks at the source (#14); its tests of the bytes run anywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub mod mark_stores;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;

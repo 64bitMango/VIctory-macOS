@@ -124,6 +124,24 @@ pub fn run(
         let n = victory_loader::masked::patch(image.base() as u64, image.info(), &original, wanted);
         println!("masked stores  {n} patched to plain stores");
     }
+    // Write marks (VICTORY_WRITE_MARKS=1, #14): the title's stores of
+    // descriptor records into its view heap mark their slots. Patched before
+    // any of its code runs; a site of another form is left alone.
+    #[cfg(windows)]
+    if execute && victory_hle::write_marks::on() {
+        use victory_loader::mark_stores::{Outcome, SITES, patch};
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped, none of its code has run, and the
+        // cells are a static.
+        let done = unsafe { patch(image.base(), size, victory_hle::write_marks::cells_address(), &SITES) };
+        let patched = done.iter().filter(|d| matches!(d, Outcome::Patched { .. })).count();
+        println!(
+            "write marks    {patched} of {} descriptor record stores patched{}",
+            SITES.len(),
+            if patched == SITES.len() { "" } else { " (not all: heap syncs read changed pages as before)" }
+        );
+        victory_hle::write_marks::hooked(image.base(), size, patched, SITES.len());
+    }
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
     } else {

@@ -1543,6 +1543,8 @@ unsafe extern "system" fn on_write(info: *mut windows_sys::Win32::System::Diagno
         // Every tracker holding it is marked: it rests from now, and
         // other threads' faults on it need no lock.
         note_opened(at / PAGE);
+        // Write marks' fallback: who opened a block of the marked heap.
+        crate::write_marks::faulted(at, r.ExceptionAddress as usize);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardFaults, 1);
         return EXCEPTION_CONTINUE_EXECUTION;

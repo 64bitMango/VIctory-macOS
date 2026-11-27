@@ -307,6 +307,8 @@ fn mirror(handle: u64) {
     let Some(index) = heap.index(handle) else {
         return;
     };
+    // Write marks: a heap sync looks at the record again with the title's own.
+    crate::write_marks::mark(handle);
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),
@@ -332,6 +334,8 @@ pub(crate) fn sync_heaps() {
     // Shared: title threads write views meanwhile (`SHADER_HEAPS`).
     let heaps = heaps();
     let _syncing = crate::contend::syncing();
+    let began = std::time::Instant::now();
+    let frame = crate::frame::current();
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -341,42 +345,203 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
+        // The slots to make, then made together: on several threads where
+        // there are enough (`host::HostHeap::make_runs`).
+        let mut runs = Vec::new();
+        due_in_heap(host, start, step, heap.desc.count, Some(written), frame, &mut runs);
+        host.make_runs(&runs, start, step);
+    }
+    use crate::write_marks::{S_SYNC_NS, S_SYNCS, STATS};
+    STATS[S_SYNCS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    STATS[S_SYNC_NS].fetch_add(began.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the 64 KiB page at `page` has memory (the title unmaps heap pages
+/// too): asked of the kernel, which fails where a read in place would fault.
+#[cfg(windows)]
+fn page_there(page: usize) -> bool {
+    #[cfg(feature = "diagnostics")]
+    let _probing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncProbeUs);
+    crate::host::read_into(page as *const u8, &mut [0u8; 4])
+}
+
+/// Of the heap of `count` slots of `step` bytes at `start` behind `host`,
+/// the slots one heap sync in `frame` is to make, by run, added to `runs`:
+/// the slots whose wait for a draw is over (`VICTORY_TABLES_TO_DRAWS`); then
+/// those its write marks name and a few pages the fallback reads whole when
+/// the heap is marked (`crate::write_marks`), else those of every page the
+/// write watch `written` says changed. What the fallback found is returned.
+#[cfg(windows)]
+pub(crate) fn due_in_heap(
+    host: &host::HostHeap,
+    start: u64,
+    step: u64,
+    count: u32,
+    written: Option<&crate::watch::Tracked>,
+    frame: u64,
+    runs: &mut Vec<host::Run>,
+) -> crate::write_marks::Checked {
+    use crate::write_marks::{self as marks, STATS};
+    use host::Look;
+    use std::sync::atomic::Ordering::Relaxed;
+    let page_size = crate::watch::PAGE;
+    let end = start + u64::from(count) * step;
+    // The page of slot `i`, and the first slot of the next page.
+    let page_of = |i: u32| (start + u64::from(i) * step) as usize & !(page_size - 1);
+    let next_page = |i: u32| ((page_of(i) + page_size) as u64 - start).div_ceil(step).min(u64::from(count)) as u32;
+    // Pages asked about in this sync, the last one remembered (the runs come
+    // in order). Asked at the heap's first byte on a page it starts in: the
+    // page before it may be no memory of the title's.
+    let mut probed: Option<(usize, bool)> = None;
+    let mut there = |page: usize| match probed {
+        Some((p, ok)) if p == page => ok,
+        _ => {
+            let ok = page_there(page.max(start as usize));
+            probed = Some((page, ok));
+            ok
+        }
+    };
+    // Slots `first..last` by page, those on pages that are there.
+    let mut by_page = |first: u32, last: u32, look: Look, runs: &mut Vec<host::Run>| {
+        let mut i = first;
+        while i < last {
+            let to = next_page(i).min(last).max(i + 1);
+            if there(page_of(i)) {
+                host.due_runs(i, to, start, step, frame, look, runs);
+            }
+            i = to;
+        }
+    };
+    // Constant and placed views whose wait for a draw is over.
+    let waited = host.waited_out(frame);
+    let mut k = 0;
+    while k < waited.len() {
+        let first = waited[k];
+        let mut last = first + 1;
+        while waited.get(k + (last - first) as usize) == Some(&last) {
+            last += 1;
+        }
+        k += (last - first) as usize;
+        by_page(first, last.min(count), Look::Waited, runs);
+    }
+    let mut checked = marks::Checked::default();
+    let Some(maps) = marks::maps_for(start) else {
         // (Pages the title has just written are left open and looked at
         // again at the next sync: `crate::watch::rest_ms`. A slot is made
         // again only if its record changed, so a page told twice costs the
         // look.)
+        let Some(written) = written else {
+            return checked;
+        };
         #[cfg(feature = "diagnostics")]
         let taking = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncTakeUs);
         let changed = written.take_resting(start as usize, usize::MAX);
         #[cfg(feature = "diagnostics")]
         drop(taking);
-        // The slots to make of every page, then made together: on several
-        // threads where there are enough (`host::HostHeap::make_runs`).
-        let mut runs = Vec::new();
         for (from, to) in changed {
-            // By page: one with nothing mapped (the title unmaps heap pages
-            // too) holds no records.
-            let page_size = crate::watch::PAGE;
+            // By page: one with nothing mapped holds no records.
             for page in (from & !(page_size - 1)..to).step_by(page_size) {
                 let (page, end) = (page.max(from), (page + page_size).min(to));
-                #[cfg(feature = "diagnostics")]
-                let probing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncProbeUs);
-                if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
+                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
+                let last = last.min(u64::from(count));
+                if first >= last || !there(page & !(page_size - 1)) {
                     continue;
                 }
                 #[cfg(feature = "diagnostics")]
-                drop(probing);
-                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(
-                    crate::copystat::C::SyncSlots,
-                    last.min(u64::from(heap.desc.count)).saturating_sub(first),
-                );
-                host.due_runs(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step, &mut runs);
+                crate::copystat::add(crate::copystat::C::SyncSlots, last - first);
+                host.due_runs(first as u32, last as u32, start, step, frame, Look::Fresh, runs);
             }
         }
-        host.make_runs(&runs, start, step);
+        return checked;
+    };
+    // Write marks: the slots marked since the last sync, in place of the
+    // changed pages.
+    let taking = std::time::Instant::now();
+    let taken = maps.take();
+    STATS[marks::S_TAKE_NS].fetch_add(taking.elapsed().as_nanos() as u64, Relaxed);
+    STATS[marks::S_TAKEN].fetch_add(taken.iter().map(|&(_, n)| u64::from(n)).sum(), Relaxed);
+    for &(first, n) in &taken {
+        by_page(first, (first + n).min(count), Look::Fresh, runs);
     }
+    // The fallback: the watch asked every few frames, a few of the pages it
+    // told read whole, but for the slots taken above (each slot in one part
+    // only: the two are made together).
+    let pages = {
+        let mut fallback = marks::FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(written) = written
+            && fallback.ask_due(frame, marks::check_every(), marks::check_budget())
+        {
+            let asking = std::time::Instant::now();
+            let changed = written.take_resting(start as usize, end as usize);
+            STATS[marks::S_ASK_NS].fetch_add(asking.elapsed().as_nanos() as u64, Relaxed);
+            fallback.add(&changed, page_size);
+        }
+        fallback.pages(frame, marks::check_budget(), page_size)
+    };
+    // Slots `first..last` read whole (but for those taken by marks): what
+    // is to make is made, a view record no mark told of counted in `into`.
+    let look_whole = |first: u32, last: u32, into: &mut marks::Checked, runs: &mut Vec<host::Run>| {
+        for (a, b) in marks::without(first, last, &taken) {
+            let mut found = Vec::new();
+            host.due_runs(a, b, start, step, frame, Look::Check, &mut found);
+            for &(i, record) in found.iter().flatten() {
+                let view = record[0] == VIEW_TAG && views_current(&[record])[0];
+                let key = u64::from(record[2]) << 32 | u64::from(record[1]);
+                if view && host.left_as(i, key) {
+                    // Taken by its mark and left to the draws or to wait
+                    // (`VICTORY_TABLES_TO_DRAWS`), now made: told of.
+                    continue;
+                }
+                into.found(maps, i, start + u64::from(i) * step, view, host.made_key(i) != 0);
+            }
+            runs.extend(found);
+        }
+    };
+    let mut read_whole = Vec::new();
+    for page in pages {
+        let (from, to) = ((page as u64).max(start), (page as u64 + page_size as u64).min(end));
+        if from >= to || !there(page) {
+            continue;
+        }
+        checked.pages += 1;
+        read_whole.push(page);
+        let (first, last) = (((from - start) / step) as u32, (to - start).div_ceil(step).min(u64::from(count)) as u32);
+        look_whole(first, last, &mut checked, runs);
+    }
+    // Once a frame, the tail of every 64 KiB block: the last records an
+    // allocation of the title's places before the block's footer, where
+    // most records no mark told of were found (offset 0xffa0; their writer
+    // is not known).
+    if marks::tail_due(frame) {
+        let mut tail = marks::Checked::default();
+        let first_end = (start as usize & !(page_size - 1)) + page_size;
+        for block_end in (first_end..=end as usize).step_by(page_size) {
+            let page = block_end - page_size;
+            let at = (block_end - marks::TAIL_BYTES) as u64;
+            if at < start || read_whole.contains(&page) || !page_there(at as usize) {
+                continue;
+            }
+            tail.pages += 1;
+            let first = ((at - start) / step) as u32;
+            look_whole(first, (first + marks::TAIL_SLOTS).min(count), &mut tail, runs);
+        }
+        checked.tail_blocks = tail.pages;
+        checked.tail_unmarked = tail.unmarked;
+        checked.pending += tail.pending;
+        checked.other += tail.other;
+    }
+    for (stat, n) in [
+        (marks::S_PAGES, checked.pages),
+        (marks::S_UNMARKED, checked.unmarked),
+        (marks::S_UNMARKED_REWROTE, checked.unmarked_rewrote),
+        (marks::S_PENDING, checked.pending),
+        (marks::S_OTHER, checked.other),
+        (marks::S_TAIL_BLOCKS, checked.tail_blocks),
+        (marks::S_TAIL_UNMARKED, checked.tail_unmarked),
+    ] {
+        STATS[stat].fetch_add(n, Relaxed);
+    }
+    checked
 }
 
 /// Makes the views of slots `slots` that were left null (textures the title
@@ -513,6 +678,7 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = heaps_alone();
         unregister_heap(&mut heaps, at);
+        crate::write_marks::let_go(self.start);
     }
 }
 
@@ -577,7 +743,9 @@ impl RtvRecord {
                 0,
             ]
         };
-        words[0] = crate::resource::pc_format(words[0]);
+        // Render target and depth views: a packed 16-bit target may be
+        // R8G8B8A8_UNORM on this GPU (`crate::packed`).
+        words[0] = crate::resource::target_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }
@@ -744,7 +912,7 @@ fn entries() -> Entries {
     Entries { views: crate::contend::read(&VIEWS, crate::contend::Lock::Views), _index }
 }
 
-const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 // A record is the tag and two words, `i` and `generation` (the host keeps
 // them as one 64-bit key per slot). The top two bits of `generation` say
@@ -1417,6 +1585,11 @@ pub(crate) extern "system" fn create_heap(
     if visible && result == crate::object::S_OK {
         let mut heaps = heaps_alone();
         register_heap(&mut heaps, (start, start + size), at);
+        // Write marks (`VICTORY_WRITE_MARKS`): the title's own stores tell
+        // this heap's slots.
+        if placed && desc.kind == VIEWS_KIND {
+            crate::write_marks::adopt(start, desc.count);
+        }
     }
     result
 }
@@ -1953,6 +2126,54 @@ pub(crate) mod tests {
                 VIEWS.read().unwrap().list.len(),
             );
         }
+    }
+
+    /// `VICTORY_TABLES_TO_DRAWS=1` works without write marks: a sync over
+    /// the changed pages of a placed view heap leaves a new record at a slot
+    /// a draw read through a table to the draws, and a new placed view
+    /// elsewhere waits for one; both are counted.
+    #[cfg(windows)]
+    #[test]
+    fn draws_table_records_are_left_to_the_draws_without_write_marks() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let memory = crate::watch::tests::pool(1);
+        let desc = HeapDesc { kind: VIEWS_KIND, count: 1024, flags: SHADER_VISIBLE, nodes: 1 };
+        let mut h = std::ptr::null();
+        let placement = Placement { address: memory as u64, size: 1024 * 32 };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        host::tests::TABLES_TO_DRAWS.with(|on| on.set(true));
+        let made = heap(h).host();
+        host::tests::TABLES_TO_DRAWS.with(|on| on.set(false));
+        if let Some(host) = made {
+            assert!(crate::write_marks::maps_for(memory as u64).is_none(), "no write marks");
+            let texture = vec![0u8; 1 << 16];
+            let address = texture.as_ptr() as u64;
+            let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+            let mut view = [0u32; 16];
+            view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+            (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+            let at = |i: u64| memory as u64 + i * 32;
+            create_placed_srv(std::ptr::null(), &words, &view, at(1));
+            assert!(host.made(1));
+            sync_heaps();
+            let frame = crate::frame::current();
+            host.note_tabled(10, frame);
+            let [left, waited] = [crate::write_marks::S_TO_DRAWS, crate::write_marks::S_WAITING]
+                .map(|i| crate::write_marks::STATS[i].load(Relaxed));
+            for i in [10, 20] {
+                // SAFETY: slots of the heap, 32 bytes each; its page is guarded
+                // (our handler opens it).
+                unsafe { std::ptr::copy_nonoverlapping(at(1) as *const u8, at(i) as *mut u8, 32) };
+            }
+            sync_heaps();
+            assert!(!host.made(10), "left to the draws");
+            assert!(!host.made(20), "waiting for a draw");
+            assert!(crate::write_marks::STATS[crate::write_marks::S_TO_DRAWS].load(Relaxed) > left);
+            assert!(crate::write_marks::STATS[crate::write_marks::S_WAITING].load(Relaxed) > waited);
+            assert_eq!(host.waited_out(frame + 4), [20]);
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::watch::tests::free(memory);
     }
 
     /// A record the title copies into its shader-visible heap as bytes (no

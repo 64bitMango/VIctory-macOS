@@ -141,6 +141,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        uav_size_level0: false,
         relax: Default::default(),
         view_marks: false,
     })

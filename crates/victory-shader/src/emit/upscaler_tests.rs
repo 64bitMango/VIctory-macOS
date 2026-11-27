@@ -631,3 +631,95 @@ fn image_stores_of_some_channels_give_the_console_s_results() {
     }
     eprintln!("ran on the hardware device: image stores of some channels");
 }
+
+/// A writable image's size query (`image_get_resinfo` at level 0), its
+/// width and height then stored as floats into every texel of the same
+/// image, of 4x4 texels (one per thread).
+fn writable_size() -> Vec<u32> {
+    vec![
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3602_0083, // v_and_b32 v1, 3, v0
+        0x2C04_0082, // v_lshrrev_b32 v2, 2, v0
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xF038_1308,
+        0x0003_0403, // image_get_resinfo v[4:5], v3, s[12:19] dmask:0x3 dim:2D unorm
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E08_0D04, // v_cvt_f32_u32 v4, v4
+        0x7E0A_0D05, // v_cvt_f32_u32 v5, v5
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0x7E0E_0280, // v_mov_b32 v7, 0
+        0xF020_1F08,
+        0x0003_0401, // image_store v[4:7], v[1:2], s[12:19] dmask:0xf dim:2D unorm
+    ]
+}
+
+/// [`translated`], with the size query on a writable image at level 0 or
+/// at the undefined level DXC writes.
+fn translated_size(level0: bool) -> HostShader {
+    let bytes = dxbc::build(&[]);
+    let c = dxbc::Container::parse(&bytes).expect("container");
+    let options = Options {
+        narrow_waves: true,
+        uav_size_level0: level0,
+        ..Options::default()
+    };
+    super::translate_program(&c, &native_with(&writable_size(), false, 16, &[(0, 8)]), options, None)
+        .expect("translate")
+}
+
+/// The switch changes the translation (the level of the size query), and
+/// only it.
+#[test]
+fn a_writable_image_s_size_query_asks_for_level_0_with_the_switch() {
+    let t = text(&[writable_size(), vec![S_ENDPGM]].concat(), false);
+    assert_eq!(t[5], "image_get_resinfo v[4:5], v3, s[12:19] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm");
+    assert_eq!(t[11], "image_store v[4:7], v[1:2], s[12:19] dmask:0xf dim:SQ_RSRC_IMG_2D unorm");
+    assert_ne!(translated_size(true).dxil, translated_size(false).dxil);
+    assert_eq!(translated_size(true).dxil, translated_size(true).dxil);
+}
+
+/// On the hardware device: at level 0 the size query gives the image's
+/// size (4x4). What the undefined level gives is printed (D3DMetal: 0, the
+/// halfwave50 fork found).
+#[cfg(windows)]
+#[test]
+fn a_writable_image_s_size_at_level_0_is_its_size_on_the_device() {
+    use super::host::{Dispatch, Root, View};
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(host) = hardware() else { return };
+    let size = |level0: bool| -> Vec<f32> {
+        let shader = translated_size(level0);
+        if let Ok(mut v) =
+            super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("compute_pipeline failed: {e}"));
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(constants(&shader, [0; 3])))],
+                    views: &[View::TextureUav(4, 4)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        out[0][..64].iter().map(|&w| f32::from_bits(w)).collect()
+    };
+    let at0 = size(true);
+    for t in 0..16 {
+        assert_eq!(at0[4 * t..4 * t + 4], [4.0, 4.0, 0.0, 0.0], "texel {t}");
+    }
+    let undefined = size(false);
+    eprintln!("a writable image's size at the undefined level: {:?}", &undefined[..2]);
+}

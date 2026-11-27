@@ -191,6 +191,9 @@ pub(crate) enum C {
     SyncStaleNothing,
     NullKept,
     SyncTabled,
+    /// Heap syncs: slots whose record came to be zeros or other bytes left
+    /// as they were (`VICTORY_STALE_LEFT=1`).
+    SyncStaleLeft,
     /// Write faults that found their block open already (another thread's
     /// fault opened it) and took no lock; blocks an asking left open and
     /// told written because they rested (`crate::watch::rest_ms`); the
@@ -768,7 +771,7 @@ pub(crate) fn log(frames: f64) {
         ms(behind_s),
     );
     tracing::info!(
-        "  heap sync slots per frame: made under {:.0} holds of a run's lock; records naming no view: {:.0} views of released resources, {:.0} zeros, {:.0} other bytes, {:.0} at slots made null so in the two frames before too, {:.0} at slots that showed nothing already ({:.0} null views kept, VICTORY_NULL_ONCE); new records at slots a draw read through a table in the last eight frames: {:.0}",
+        "  heap sync slots per frame: made under {:.0} holds of a run's lock; records naming no view: {:.0} views of released resources, {:.0} zeros, {:.0} other bytes, {:.0} at slots made null so in the two frames before too, {:.0} at slots that showed nothing already ({:.0} null views kept, VICTORY_NULL_ONCE; {:.0} slots of zeros or other bytes left as they were, VICTORY_STALE_LEFT); new records at slots a draw read through a table in the last eight frames: {:.0}",
         c[C::SyncRuns as usize],
         c[C::SyncStaleReleased as usize],
         c[C::SyncStaleZeros as usize],
@@ -776,6 +779,7 @@ pub(crate) fn log(frames: f64) {
         c[C::SyncStaleAgain as usize],
         c[C::SyncStaleNothing as usize],
         c[C::NullKept as usize],
+        c[C::SyncStaleLeft as usize],
         c[C::SyncTabled as usize],
     );
     tracing::info!(

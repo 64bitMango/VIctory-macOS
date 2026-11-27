@@ -86,6 +86,18 @@ pub(crate) struct HostHeap {
     /// names no view.
     #[cfg(feature = "diagnostics")]
     noted: [Box<[std::sync::atomic::AtomicU32]>; 2],
+    /// With `VICTORY_TABLES_TO_DRAWS=1` ([`tables_to_draws`], as it was when
+    /// the heap was made), per title slot: the frame (plus 1) a draw last
+    /// read it through a table, made by the draw (`mirror` for a draw).
+    tabled: Option<Box<[std::sync::atomic::AtomicU32]>>,
+    /// With it, per title slot: the key of the record a sync last left to
+    /// the draws or to wait ([`HostHeap::left_as`]), so that the write
+    /// marks' fallback does not take it for a record no mark told of.
+    left: Option<Box<[AtomicU64]>>,
+    /// New constant and placed views a heap sync found, waiting for a draw
+    /// to read them through a table ([`HostHeap::due_runs`]), by the frame
+    /// they were found in.
+    waiting: Mutex<std::collections::VecDeque<(u64, Vec<u32>)>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -152,7 +164,6 @@ fn zeroed(n: usize) -> Box<[AtomicU64]> {
     unsafe { Box::from_raw(zeros as *mut [AtomicU64]) }
 }
 
-#[cfg(feature = "diagnostics")]
 fn zeroed32(n: usize) -> Box<[std::sync::atomic::AtomicU32]> {
     let zeros = Box::into_raw(vec![0u32; n].into_boxed_slice());
     // SAFETY: an `AtomicU32` is laid out as a `u32`.
@@ -235,6 +246,82 @@ fn null_once() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_NULL_ONCE"))
+}
+
+/// Whether a heap sync leaves a slot as it is when its record comes to name
+/// no view because the title wrote something other than a record of ours
+/// there, zeros or other bytes (on by default; `VICTORY_STALE_LEFT=0` turns it
+/// off). Measured: heap syncs 35.4 -> 23.4 ms a frame (median), no visible
+/// change in the picture (#14).
+/// Most slots a sync makes are such (32,000 of 47,000 a world frame, most
+/// of them bytes the title keeps in heap memory between its descriptors),
+/// and no draw reads one through a table. Left, the slot keeps the view
+/// and what it holds that it had: a draw that reads it through a table
+/// makes it null then ([`HostHeap::made_already`] finds it not made from
+/// its record), a title thread writing it makes it, and the title writing
+/// the record back that it was made from costs nothing. A record of ours
+/// that names no view (a view of a released resource) is still made null.
+/// shortcut: a shader that takes such a slot from the heap at an index
+/// from its data reads the view the slot had, not nothing; and what the
+/// slot views stays entered (`crate::bindless`), so its memory is kept
+/// current and its copy held until the slot is written again.
+fn stale_left() -> bool {
+    // Tests choose for themselves (off unless a test turns it on), whatever
+    // the default, so the tests of making such slots null still run.
+    #[cfg(test)]
+    {
+        tests::STALE_LEFT.with(|left| left.get())
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| !crate::switch::off("VICTORY_STALE_LEFT"))
+    }
+}
+
+/// Whether heap syncs leave the new records of draws' tables to the draws
+/// (`VICTORY_TABLES_TO_DRAWS=1`; off by default until measured). A slot a
+/// draw read through a table in the last [`TABLED_FRAMES`] frames is a
+/// table's: when its record changes, a sync passes it by, and the draw that
+/// reads it makes it (`made_already` finds it not made from its record).
+/// A new constant or placed view elsewhere waits [`WAIT_FRAMES`] frames for
+/// a draw to read it so, and is made by a sync after that if none did.
+/// After avatarmanz's "draws' own records left to the draws" (commit
+/// 1f1a4336 of that fork), in our heap sync.
+/// shortcut: a shader that takes such a slot from the heap at an index from
+/// its data meanwhile reads the view the slot had (a table's slot of an
+/// earlier frame, or a slot whose view waits).
+fn tables_to_draws() -> bool {
+    #[cfg(test)]
+    {
+        tests::TABLES_TO_DRAWS.with(|on| on.get())
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| !crate::switch::off("VICTORY_TABLES_TO_DRAWS"))
+    }
+}
+
+/// Frames for which a slot a draw read through a table is left to draws.
+const TABLED_FRAMES: u32 = 8;
+
+/// Frames a new constant or placed view waits for a draw.
+const WAIT_FRAMES: u64 = 4;
+
+/// How a heap sync looks at slots ([`HostHeap::due_runs`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Look {
+    /// Slots written since the last sync (changed pages, or write marks).
+    Fresh,
+    /// Slots whose wait for a draw is over ([`HostHeap::waited_out`]).
+    Waited,
+    /// Pages the write marks' fallback reads whole. As [`Look::Fresh`] for
+    /// draws' table records: a slot whose mark a sync took and left to the
+    /// draws (or to wait) is due still when the fallback reads its page,
+    /// and was counted as unmarked and made then, ~1,800 a frame in the
+    /// first A/B run with both switches (#14).
+    Check,
 }
 
 /// What a record that is neither ours nor zeros looks like (diagnostics):
@@ -490,6 +577,9 @@ impl HostHeap {
             by_run: [slot_locks(), sync_runs()],
             #[cfg(feature = "diagnostics")]
             noted: [zeroed32(count as usize), zeroed32(count as usize)],
+            tabled: (!sampler && tables_to_draws()).then(|| zeroed32(count as usize)),
+            left: (!sampler && tables_to_draws()).then(|| zeroed(count as usize)),
+            waiting: Mutex::default(),
             kept: Pages::new((count + extra) as usize, !kept_pages()),
             next: Mutex::new(DynamicSlots {
                 cursor: 0,
@@ -973,14 +1063,17 @@ impl HostHeap {
     #[cfg(test)]
     pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
         let mut runs = Vec::new();
-        self.due_runs(first, last, start, step, &mut runs);
+        self.due_runs(first, last, start, step, crate::frame::current(), Look::Fresh, &mut runs);
         self.make_runs(&runs, start, step);
     }
 
     /// Of slots `first..last`, whose records are at `start` + index ×
     /// `step`, those to make ([`due`]), by run, with the records read:
-    /// added to `runs`.
-    pub(crate) fn due_runs(&self, first: u32, last: u32, start: u64, step: u64, runs: &mut Vec<Run>) {
+    /// added to `runs`. A sync in `frame` looking as `look` says; with
+    /// [`tables_to_draws`] the new records of draws' tables are left to the
+    /// draws, and new constant and placed views wait for one.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn due_runs(&self, first: u32, last: u32, start: u64, step: u64, frame: u64, look: Look, runs: &mut Vec<Run>) {
         let at = |i: u32| start + u64::from(i) * step;
         #[cfg(feature = "diagnostics")]
         let looking = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncLookUs);
@@ -991,6 +1084,9 @@ impl HostHeap {
         // Why each is made (diagnostics).
         let mut why = [0u64; 3];
         let mut made = 0u64;
+        // Left to draws, and made after a wait; slots that wait.
+        let mut left = [0u64; 2];
+        let mut wait = Vec::new();
         for (i, (&record, current)) in (first..last).zip(records.iter().zip(current)) {
             let [_tag, view, generation] = record;
             let key = u64::from(generation) << 32 | u64::from(view);
@@ -998,6 +1094,29 @@ impl HostHeap {
             let Some(reason) = due(from, current.then_some(key)) else {
                 continue;
             };
+            if reason == Some(Due::Stale) && record[0] != VIEW_TAG && stale_left() {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::SyncStaleLeft, 1);
+                continue;
+            }
+            // (The fallback's look makes a record no sync left so: one no
+            // mark told of, counted by the caller.)
+            if self.tabled.is_some()
+                && matches!(reason, Some(Due::First | Due::Rewrote))
+                && (look != Look::Check || self.left_as(i, key))
+            {
+                if self.tabled_lately(i, frame) {
+                    self.note_left(i, key);
+                    left[0] += 1;
+                    continue;
+                }
+                if look != Look::Waited && matches!(generation >> super::KIND_SHIFT, super::CONSTANT | super::PLACED) {
+                    self.note_left(i, key);
+                    wait.push(i);
+                    continue;
+                }
+            }
+            left[1] += u64::from(look == Look::Waited);
             if let Some(reason) = reason {
                 why[reason as usize] += 1;
                 #[cfg(feature = "diagnostics")]
@@ -1019,7 +1138,62 @@ impl HostHeap {
             add(C::SyncStale, why[Due::Stale as usize]);
         }
         #[cfg(not(feature = "diagnostics"))]
-        let _ = (why, made);
+        let _ = why;
+        {
+            use crate::write_marks::{S_LOOKED, S_MADE, S_TO_DRAWS, S_WAITED_MADE, S_WAITING, STATS};
+            use std::sync::atomic::Ordering::Relaxed;
+            STATS[S_LOOKED].fetch_add(u64::from(last.saturating_sub(first)), Relaxed);
+            STATS[S_MADE].fetch_add(made, Relaxed);
+            STATS[S_TO_DRAWS].fetch_add(left[0], Relaxed);
+            STATS[S_WAITED_MADE].fetch_add(left[1], Relaxed);
+            STATS[S_WAITING].fetch_add(wait.len() as u64, Relaxed);
+        }
+        if !wait.is_empty() {
+            self.waiting.lock().unwrap_or_else(|e| e.into_inner()).push_back((frame, wait));
+        }
+    }
+
+    /// Whether a draw read title slot `index` through a table within the
+    /// last [`TABLED_FRAMES`] frames before `frame` (never without
+    /// [`tables_to_draws`]).
+    pub(crate) fn tabled_lately(&self, index: u32, frame: u64) -> bool {
+        let Some(read) = self.tabled.as_ref().and_then(|t| t.get(index as usize)).map(|t| t.load(Acquire)) else {
+            return false;
+        };
+        read != 0 && (frame as u32).wrapping_add(1).wrapping_sub(read) <= TABLED_FRAMES
+    }
+
+    /// Whether a sync left title slot `index` to the draws or to wait when
+    /// its record's key was `key` (the record it holds now).
+    pub(crate) fn left_as(&self, index: u32, key: u64) -> bool {
+        self.left.as_ref().and_then(|l| l.get(index as usize)).is_some_and(|l| l.load(std::sync::atomic::Ordering::Relaxed) == key)
+    }
+
+    fn note_left(&self, index: u32, key: u64) {
+        if let Some(l) = self.left.as_ref().and_then(|l| l.get(index as usize)) {
+            l.store(key, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A draw read title slot `index` through a table in `frame`.
+    pub(crate) fn note_tabled(&self, index: u32, frame: u64) {
+        if let Some(t) = self.tabled.as_ref().and_then(|t| t.get(index as usize)) {
+            t.store((frame as u32).wrapping_add(1).max(1), Release);
+        }
+    }
+
+    /// The slots whose wait for a draw is over in `frame` ([`HostHeap::due_runs`]),
+    /// each once, in order.
+    pub(crate) fn waited_out(&self, frame: u64) -> Vec<u32> {
+        let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        while waiting.front().is_some_and(|&(found, _)| found + WAIT_FRAMES <= frame) {
+            out.extend(waiting.pop_front().into_iter().flat_map(|(_, slots)| slots));
+        }
+        drop(waiting);
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// Makes the slots of `runs` ([`HostHeap::due_runs`]): on this thread
@@ -1287,6 +1461,9 @@ impl HostHeap {
         if for_draw && !crate::contend::in_sync() {
             self.noted[0][index as usize].store(crate::frame::current() as u32 + 1, Relaxed);
         }
+        if for_draw && self.tabled.is_some() && !crate::contend::in_sync() {
+            self.note_tabled(index, crate::frame::current());
+        }
         if self.by_run[0]
             && let Some(found) = self.made_already(index, handle, for_draw)
         {
@@ -1519,8 +1696,7 @@ impl HostHeap {
         self.made_from(index) != 0
     }
 
-    /// The record slot `index` was last made from, 0 for none (tests).
-    #[cfg(test)]
+    /// The record slot `index` was last made from, 0 for none.
     pub(crate) fn made_key(&self, index: u32) -> u64 {
         self.made_from(index)
     }
@@ -1747,7 +1923,13 @@ fn image_words(resource: &[u32; 14], desc: Option<&[u32; 10]>, unordered: bool) 
             let ty = [0, 0, 8, 12, 9, 13, 14, 15, 10, 11, 11].get(d[1] as usize).copied().unwrap_or(0);
             match (unordered, d[1]) {
                 (_, 6 | 7) => (ty, 0, 1),
-                (true, _) => (ty, d[4], 1),
+                // An unordered view's one level is its third word (its
+                // union starts at byte 8: `MipSlice` of every texture
+                // member, as `uav_desc` hands it to the host); a shader
+                // view's first level and count are words 4 and 5 (its union
+                // starts at byte 16). Word 4 of an unordered view is an
+                // array's size or a 3D view's depth.
+                (true, _) => (ty, d[2], 1),
                 (false, _) => (ty, d[4], if d[5] == u32::MAX { mips.saturating_sub(d[4]) } else { d[5] }),
             }
         }
@@ -2053,6 +2235,14 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
         return !typeless;
+    }
+    // A packed 16-bit texture made R8G8B8A8_UNORM on this GPU
+    // (`crate::packed`): views name the format it has.
+    if view != own && crate::resource::target_format(view) == own {
+        if let Some(format) = format {
+            *format = d.Format;
+        }
+        return true;
     }
     let cast = castable.contains(&view);
     if family(view) != family(own) && !cast {
@@ -2647,6 +2837,12 @@ pub(crate) mod tests {
         /// This thread leaves the null view of a slot that shows nothing (as
         /// `VICTORY_NULL_ONCE=1`).
         pub(crate) static NULL_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Heap syncs this thread runs leave slots whose record came to be
+        /// other bytes (as `VICTORY_STALE_LEFT=1`).
+        pub(crate) static STALE_LEFT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Heaps made on this thread leave draws' table records to the draws
+        /// (as `VICTORY_TABLES_TO_DRAWS=1`).
+        pub(crate) static TABLES_TO_DRAWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     const HEAP_IID: crate::object::Iid =
@@ -2736,6 +2932,328 @@ pub(crate) mod tests {
             assert!(!slots.made(SLOT), "made from nothing (leaving its null view: {once})");
             assert_eq!(slots.viewed.slots(), 0);
             NULL_ONCE.with(|n| n.set(false));
+        }
+    }
+
+    /// With `VICTORY_STALE_LEFT=1` a heap sync leaves a slot whose record
+    /// came to be other bytes or zeros as it is, made from the view it had:
+    /// the record written back costs nothing, and a draw reading the slot
+    /// through a table makes it null. A record of ours that names no view
+    /// is made null all the same. Without the switch the sync makes the
+    /// slot null.
+    #[test]
+    fn a_sync_leaves_slots_whose_record_came_to_be_other_bytes_with_the_switch() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        // A shader-visible sampler heap of 4 slots, in memory of its own.
+        let heap_desc: [u32; 8] = [1, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &HEAP_IID, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let start = title_heap.start;
+        let slots = title_heap.host().expect("a host sampler heap");
+        let sync = || slots.sync_slots(0, 1, start, 16);
+        let write = |bytes: [u32; 4]| {
+            // SAFETY: the heap's first slot, 16 bytes.
+            unsafe { (start as *mut [u32; 4]).write_unaligned(bytes) }
+        };
+        let sampler = [21, 7, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+        crate::descriptor::create_sampler(null, &sampler, start);
+        // SAFETY: the heap's first slot, 16 bytes.
+        let record = unsafe { (start as *const [u32; 4]).read_unaligned() };
+        let made = slots.made_key(0);
+        assert!(made != 0, "made when written");
+        let other = [0x3f80_0000, 0x4120_0000, 0xffff_ffff, 0x0006_c098];
+        STALE_LEFT.with(|left| left.set(true));
+        for bytes in [other, [0; 4]] {
+            write(bytes);
+            sync();
+            assert_eq!(slots.made_key(0), made, "left as made from the view ({bytes:x?})");
+            write(record);
+            sync();
+            assert_eq!(slots.made_key(0), made, "the record written back is made already");
+        }
+        write(other);
+        sync();
+        assert_eq!(slots.mirror(0, start, true), None, "a draw reads no view there");
+        assert_eq!(slots.made_key(0), 0, "and makes the slot null");
+        // A record of ours naming no view (an entry never given): null.
+        write(record);
+        sync();
+        assert_eq!(slots.made_key(0), made, "made again from the record");
+        write([record[0], u32::MAX >> 2, 1, 0]);
+        sync();
+        assert_eq!(slots.made_key(0), 0, "a record of ours naming no view is made null");
+        // Without the switch other bytes make the slot null.
+        STALE_LEFT.with(|left| left.set(false));
+        write(record);
+        sync();
+        assert_eq!(slots.made_key(0), made);
+        write(other);
+        sync();
+        assert_eq!(slots.made_key(0), 0, "made null without the switch");
+        crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(heap, 0x10)(heap);
+    }
+
+    /// A view heap of 1024 slots in memory of its own, with a placed
+    /// texture's view written by our call at slot `at`: the heap, its host
+    /// heap, and the record's 32 bytes. Placed texture views are made
+    /// cheaply by syncs (left null until read).
+    fn heap_with_a_placed_view(at: u32, memory: &[u8]) -> (crate::object::This, &'static crate::descriptor::Heap, [u8; 32]) {
+        heap_of_with_a_placed_view(1024, at, memory)
+    }
+
+    /// [`heap_with_a_placed_view`] of `count` slots.
+    fn heap_of_with_a_placed_view(count: u32, at: u32, memory: &[u8]) -> (crate::object::This, &'static crate::descriptor::Heap, [u8; 32]) {
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, count, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &HEAP_IID, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        let handle = title_heap.start + u64::from(at) * 32;
+        crate::descriptor::create_placed_srv(null, &words, &view, handle);
+        assert!(title_heap.host().expect("a host view heap").made(at), "made when written");
+        // SAFETY: a slot of the heap.
+        let record = unsafe { (handle as *const [u8; 32]).read_unaligned() };
+        (heap, title_heap, record)
+    }
+
+    /// Writes `record` into slot `index` of `heap` as bytes, as the title
+    /// copies records (no call, no mark).
+    fn copy_into(heap: &crate::descriptor::Heap, index: u32, record: &[u8; 32]) {
+        // SAFETY: a slot of the heap.
+        unsafe { ((heap.start + u64::from(index) * 32) as *mut [u8; 32]).write_unaligned(*record) };
+    }
+
+    fn slots_of(runs: &[Run]) -> Vec<u32> {
+        runs.iter().flatten().map(|&(i, _)| i).collect()
+    }
+
+    /// With write marks, a sync takes the marked slots alone; the fallback's
+    /// page read whole finds the view record nobody marked, makes it and
+    /// counts it, and leaves out the slots taken by their marks in the same
+    /// sync (made once, not counted as unmarked).
+    #[test]
+    fn write_marks_sync_marked_slots_and_the_fallback_counts_an_unmarked_record() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let _one = crate::write_marks::tests::ADOPTING.lock().unwrap_or_else(|e| e.into_inner());
+        let memory = vec![0u8; 1 << 16];
+        let (heap, title_heap, record) = heap_with_a_placed_view(10, &memory);
+        let slots = title_heap.host().expect("made");
+        let start = title_heap.start;
+        let maps = crate::write_marks::tests::adopt_for_test(start, 1024);
+        *crate::write_marks::FALLBACK.lock().unwrap() = crate::write_marks::Fallback::new();
+        let sync = |frame: u64| {
+            let mut runs = Vec::new();
+            let checked = crate::descriptor::due_in_heap(slots, start, 32, 1024, None, frame, &mut runs);
+            slots.make_runs(&runs, start, 32);
+            (slots_of(&runs), checked)
+        };
+        // Copied without a mark: not looked at.
+        copy_into(title_heap, 20, &record);
+        // Copied and marked, as a patched store does.
+        copy_into(title_heap, 30, &record);
+        maps.mark_at(start + 30 * 32);
+        let (made, checked) = sync(100);
+        assert_eq!(made, [30], "the marked slot alone");
+        assert_eq!((checked.pages, checked.unmarked, checked.tail_unmarked), (0, 0, 0));
+        assert!(slots.made(30) && !slots.made(20));
+        // The fallback reads the heap's page whole; another marked slot in it
+        // is taken by its mark, once.
+        copy_into(title_heap, 40, &record);
+        maps.mark_at(start + 40 * 32);
+        crate::write_marks::FALLBACK.lock().unwrap().add(&[(start as usize, start as usize + 1024 * 32)], crate::watch::PAGE);
+        let (made, checked) = sync(101);
+        assert_eq!(made, [40, 20], "the marked slot, then what the page read whole found");
+        // (The heap's 32 KiB may lie across two 64 KiB pages.)
+        assert!((1..=2).contains(&checked.pages), "{checked:?}");
+        assert_eq!((checked.unmarked, checked.pending, checked.other), (1, 0, 0));
+        assert!(slots.made(20) && slots.made(40));
+        // Nothing left: the page is not read again until the watch tells it.
+        let (made, checked) = sync(102);
+        assert!(made.is_empty());
+        assert_eq!(checked.pages, 0);
+        crate::write_marks::let_go(start);
+        crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(heap, 0x10)(heap);
+    }
+
+    /// With write marks, the two records before the end of each 64 KiB
+    /// block are read once a frame: one no mark told of there is made and
+    /// counted apart, one elsewhere waits for the fallback.
+    #[test]
+    fn write_marks_read_the_tail_of_every_block_once_a_frame() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let _one = crate::write_marks::tests::ADOPTING.lock().unwrap_or_else(|e| e.into_inner());
+        let memory = vec![0u8; 1 << 16];
+        // 4,096 slots: 128 KiB, over at least one block's end.
+        let (heap, title_heap, record) = heap_of_with_a_placed_view(4096, 1, &memory);
+        let slots = title_heap.host().expect("made");
+        let start = title_heap.start;
+        let _maps = crate::write_marks::tests::adopt_for_test(start, 4096);
+        *crate::write_marks::FALLBACK.lock().unwrap() = crate::write_marks::Fallback::new();
+        let block_end = (start as usize & !0xffff) + 0x1_0000;
+        let tail = ((block_end - 0x60) as u64 - start) as u32 / 32;
+        let sync = |frame: u64| {
+            let mut runs = Vec::new();
+            let checked = crate::descriptor::due_in_heap(slots, start, 32, 4096, None, frame, &mut runs);
+            slots.make_runs(&runs, start, 32);
+            (slots_of(&runs), checked)
+        };
+        let frame = 1_000_000 + crate::frame::current();
+        copy_into(title_heap, tail, &record);
+        copy_into(title_heap, tail + 1, &record);
+        copy_into(title_heap, tail - 10, &record);
+        let (made, checked) = sync(frame);
+        assert_eq!(made, [tail, tail + 1], "the block's tail alone");
+        assert!(checked.tail_blocks >= 1, "{checked:?}");
+        assert_eq!((checked.tail_unmarked, checked.unmarked), (2, 0));
+        assert!(!slots.made(tail - 10));
+        // Once a frame.
+        copy_into(title_heap, tail, &[0x5a; 32]);
+        copy_into(title_heap, tail, &record);
+        assert!(slots.made(tail));
+        let other = {
+            let mut r = record;
+            r[0] ^= 1; // no record of ours: nothing to make, but a look
+            r
+        };
+        copy_into(title_heap, tail + 1, &other);
+        let (_, checked) = sync(frame);
+        assert_eq!(checked.tail_blocks, 0, "not again in the same frame");
+        let (_, checked) = sync(frame + 1);
+        assert!(checked.tail_blocks >= 1);
+        crate::write_marks::let_go(start);
+        crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(heap, 0x10)(heap);
+    }
+
+    /// With write marks and `VICTORY_TABLES_TO_DRAWS=1` both, a marked slot
+    /// the sync left to the draws, or to wait, is not counted as unmarked
+    /// when the fallback reads its page in the next sync, nor made then.
+    #[test]
+    fn slots_left_to_draws_are_not_unmarked_records() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let _one = crate::write_marks::tests::ADOPTING.lock().unwrap_or_else(|e| e.into_inner());
+        TABLES_TO_DRAWS.with(|on| on.set(true));
+        let memory = vec![0u8; 1 << 16];
+        let (heap, title_heap, record) = heap_with_a_placed_view(10, &memory);
+        TABLES_TO_DRAWS.with(|on| on.set(false));
+        let slots = title_heap.host().expect("made");
+        let start = title_heap.start;
+        let maps = crate::write_marks::tests::adopt_for_test(start, 1024);
+        *crate::write_marks::FALLBACK.lock().unwrap() = crate::write_marks::Fallback::new();
+        let sync = |frame: u64| {
+            let mut runs = Vec::new();
+            let checked = crate::descriptor::due_in_heap(slots, start, 32, 1024, None, frame, &mut runs);
+            slots.make_runs(&runs, start, 32);
+            (slots_of(&runs), checked)
+        };
+        // A table's slot and another, written by marked stores.
+        slots.note_tabled(20, 100);
+        for i in [20, 30] {
+            copy_into(title_heap, i, &record);
+            maps.mark_at(start + u64::from(i) * 32);
+        }
+        let (made, _) = sync(101);
+        assert!(made.is_empty(), "one left to the draws, one waiting");
+        crate::write_marks::FALLBACK.lock().unwrap().add(&[(start as usize, start as usize + 1024 * 32)], crate::watch::PAGE);
+        let (made, checked) = sync(102);
+        assert!(made.is_empty(), "the fallback leaves them as they were left");
+        assert_eq!((checked.unmarked, checked.pending), (0, 0), "{checked:?}");
+        assert!(!slots.made(20) && !slots.made(30));
+        // An unmarked one is still found, counted and made.
+        copy_into(title_heap, 40, &record);
+        crate::write_marks::FALLBACK.lock().unwrap().add(&[(start as usize, start as usize + 1024 * 32)], crate::watch::PAGE);
+        let (made, checked) = sync(103);
+        assert_eq!(made, [40]);
+        assert_eq!((checked.unmarked, checked.unmarked_rewrote), (1, 0));
+        assert!(slots.made(40));
+        assert_eq!(slots.waited_out(200), [30]);
+        crate::write_marks::let_go(start);
+        crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(heap, 0x10)(heap);
+    }
+
+    /// With `VICTORY_TABLES_TO_DRAWS=1` a new record at a slot a draw read
+    /// through a table lately is left to the draws; a new placed view
+    /// elsewhere waits a few frames for a draw and is made after; the
+    /// fallback's look leaves nothing to draws. A draw's read notes the slot.
+    #[test]
+    fn draws_table_records_are_left_to_the_draws_with_the_switch() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        TABLES_TO_DRAWS.with(|on| on.set(true));
+        let memory = vec![0u8; 1 << 16];
+        let (heap, title_heap, record) = heap_with_a_placed_view(500, &memory);
+        TABLES_TO_DRAWS.with(|on| on.set(false));
+        let slots = title_heap.host().expect("made");
+        let start = title_heap.start;
+        let due = |first: u32, frame: u64, look: Look| {
+            let mut runs = Vec::new();
+            slots.due_runs(first, first + 1, start, 32, frame, look, &mut runs);
+            slots.make_runs(&runs, start, 32);
+            slots_of(&runs)
+        };
+        // A table's slot: left to the draws within eight frames.
+        slots.note_tabled(510, 10);
+        copy_into(title_heap, 510, &record);
+        assert!(due(510, 12, Look::Fresh).is_empty(), "left to the draw");
+        assert!(!slots.made(510));
+        assert!(slots.waited_out(100).is_empty(), "and not waiting");
+        // A draw reading it makes it.
+        assert!(slots.mirror(510, start + 510 * 32, true).is_some());
+        assert!(slots.made(510));
+        assert!(slots.tabled_lately(510, crate::frame::current()), "noted by the draw's read");
+        // Elsewhere: a placed view waits, and is made once its wait is over.
+        copy_into(title_heap, 520, &record);
+        assert!(due(520, 20, Look::Fresh).is_empty(), "waits for a draw");
+        assert!(slots.waited_out(23).is_empty());
+        let mut runs = Vec::new();
+        crate::descriptor::due_in_heap(slots, start, 32, 1024, None, 24, &mut runs);
+        slots.make_runs(&runs, start, 32);
+        assert_eq!(slots_of(&runs), [520], "made after its wait");
+        assert!(slots.made(520));
+        // Long after a draw read it, a table's slot is no table's any more.
+        slots.note_tabled(530, 10);
+        copy_into(title_heap, 530, &record);
+        assert!(due(530, 30, Look::Fresh).is_empty());
+        assert_eq!(slots.waited_out(34), [530], "waits as any other");
+        // The fallback's look leaves what a sync left as it was left, and
+        // makes a record no sync left so (no mark told of it).
+        slots.note_tabled(540, 40);
+        copy_into(title_heap, 540, &record);
+        assert!(due(540, 41, Look::Fresh).is_empty());
+        assert!(due(540, 42, Look::Check).is_empty(), "left as it was");
+        copy_into(title_heap, 550, &record);
+        assert!(due(550, 41, Look::Fresh).is_empty(), "waits");
+        assert!(due(550, 42, Look::Check).is_empty(), "waits still");
+        assert_eq!(slots.waited_out(45), [550]);
+        slots.note_tabled(560, 40);
+        copy_into(title_heap, 560, &record);
+        assert_eq!(due(560, 41, Look::Check), [560], "never left: made");
+        // Without the switch nothing is left.
+        let (other, other_heap, record) = heap_with_a_placed_view(500, &memory);
+        let plain = other_heap.host().expect("made");
+        plain.note_tabled(510, 10);
+        copy_into(other_heap, 510, &record);
+        let mut runs = Vec::new();
+        plain.due_runs(510, 511, other_heap.start, 32, 12, Look::Fresh, &mut runs);
+        assert_eq!(slots_of(&runs), [510]);
+        assert!(!plain.tabled_lately(510, 12));
+        for h in [heap, other] {
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(h, 0x10)(h);
         }
     }
 
@@ -3117,10 +3635,48 @@ pub(crate) mod tests {
         (view[4], view[5]) = (1, u32::MAX);
         assert_eq!(image_words(&texture, Some(&view), false)[3], 0xFAC | 1 << 12 | 9 << 16 | 9 << 28);
         // An unordered view of level 3: that level alone.
-        let uav = [0, 4, 0, 0, 3, 0, 0, 0, 0, 0];
+        let uav = [0, 4, 3, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(image_words(&texture, Some(&uav), true)[3], 0xFAC | 3 << 12 | 3 << 16 | 9 << 28);
+        // An unordered view of level 2 of six array slices: the level is
+        // not the slice count (word 4).
+        let uav = [0, 5, 2, 0, 6, 0, 0, 0, 0, 0];
+        assert_eq!(image_words(&array, Some(&uav), true)[3], 0xFAC | 2 << 12 | 2 << 16 | 13 << 28);
         // The array's own view: a 2D array, levels 0-10.
         let words = image_words(&array, None, false);
         assert_eq!(words[1..], [3 << 30, 255 | 599 << 14, 0xFAC | 10 << 16 | 13 << 28]);
+    }
+
+    /// The words `image_words` reads are where the host's view descriptions
+    /// have their levels: an unordered view's `MipSlice` in word 2, a shader
+    /// view's `MostDetailedMip` and `MipLevels` in words 4 and 5.
+    #[test]
+    fn view_description_words_hold_the_levels_where_image_words_reads_them() {
+        let words = |uav: &D3D12_UNORDERED_ACCESS_VIEW_DESC| -> [u32; 10] {
+            // SAFETY: 40 plain bytes.
+            unsafe { std::ptr::from_ref(uav).cast::<[u32; 10]>().read_unaligned() }
+        };
+        assert_eq!(size_of::<D3D12_UNORDERED_ACCESS_VIEW_DESC>(), 40);
+        assert_eq!(size_of::<D3D12_SHADER_RESOURCE_VIEW_DESC>(), 40);
+        let mut uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        uav.Anonymous.Texture2D = D3D12_TEX2D_UAV { MipSlice: 3, PlaneSlice: 0 };
+        assert_eq!(words(&uav)[1..5], [4, 3, 0, 0]);
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        uav.Anonymous.Texture2DArray =
+            D3D12_TEX2D_ARRAY_UAV { MipSlice: 2, FirstArraySlice: 1, ArraySize: 6, PlaneSlice: 0 };
+        assert_eq!(words(&uav)[1..5], [5, 2, 1, 6]);
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        uav.Anonymous.Texture3D = D3D12_TEX3D_UAV { MipSlice: 1, FirstWSlice: 0, WSize: 32 };
+        assert_eq!(words(&uav)[1..5], [8, 1, 0, 32]);
+        let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: 2, MipLevels: 3, ..Default::default() };
+        // SAFETY: 40 plain bytes.
+        let w = unsafe { std::ptr::from_ref(&srv).cast::<[u32; 10]>().read_unaligned() };
+        assert_eq!((w[1], w[4], w[5]), (4, 2, 3));
     }
 }
