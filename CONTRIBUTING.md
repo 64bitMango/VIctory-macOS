@@ -40,6 +40,7 @@ These are the open areas, roughly from most to least useful.
 3. Add or update a test when you change behaviour. GPU behaviour is best tested under Wine with D3DMetal, as in the second command above.
 4. Run `cargo fmt`, `cargo clippy` and both test runs.
 5. Open a pull request that says what changed, why, and how you tested it.
+6. CodeRabbit reviews it once. If no review appears within a few minutes, comment `@coderabbitai review` to ask for it. Push your fixes, then comment `@coderabbitai review`. It checks only the new commits and approves once its comments are resolved. With its approval and passing CI the pull request merges by itself, unless it changes CI, the policy check, build config, dependencies or `tools/`, which the maintainer reviews.
 
 ## Reporting a problem
 

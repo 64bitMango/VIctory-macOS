@@ -1,0 +1,121 @@
+# Merges a pull request once CodeRabbit has approved its latest commit and
+# CI has passed on it, so contributors do not wait for the maintainer.
+#
+# It runs from main (workflow_run and schedule always do), never checks out
+# or runs a pull request's code, and only reads the API. It skips a pull
+# request when:
+# - it is a draft, or is labelled do-not-merge or manual-review;
+# - CodeRabbit's latest verdict is not an approval of the head commit;
+# - someone other than CodeRabbit resolved one of its review threads;
+# - the maintainer's latest verdict is "changes requested";
+# - CI's `check` job has not passed on the head commit;
+# - it touches CI, the policy check, build config, dependencies or tools/
+#   (a renamed file by its old path or its new one), which always need the
+#   maintainer (CodeRabbit's own config withholds approval for them too).
+
+name: Auto-merge
+
+on:
+  workflow_run:
+    workflows: [CI, Review relay]
+    types: [completed]
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: automerge
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    if: github.repository == '64bitMango/VIctory-macOS'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      # Set the repository variable REVIEW_BOT if CodeRabbit reviews under
+      # another login.
+      BOT: ${{ vars.REVIEW_BOT || 'coderabbitai[bot]' }}
+      MAINTAINER: 64bitMango
+      PROTECTED: '^(\.github/|\.coderabbit\.ya?ml$|\.githooks/|\.cargo/|xtask/|tools/|setup\.sh$|rust-toolchain\.toml$|Cargo\.lock$|(.*/)?Cargo\.toml$)'
+    steps:
+      - name: Merge approved pull requests
+        shell: bash
+        run: |
+          set -euo pipefail
+          verdict() { # the latest approve/request-changes/dismiss by $1
+            jq -r --arg who "$1" '[.[] | select(.login == $who and
+              (.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED"))]
+              | last // {} | "\(.state // "none") \(.commit_id // "")"' <<<"$reviews"
+          }
+          for n in $(gh pr list -R "$REPO" --base main --state open --limit 100 \
+              --json number,isDraft --jq '.[] | select(.isDraft | not) | .number'); do
+            pr=$(gh api "repos/$REPO/pulls/$n")
+            sha=$(jq -r .head.sha <<<"$pr")
+            if jq -e '[.labels[].name] | any(. == "do-not-merge" or . == "manual-review")' <<<"$pr" >/dev/null; then
+              echo "#$n: labelled to wait for the maintainer"; continue
+            fi
+            reviews=$(gh api --paginate "repos/$REPO/pulls/$n/reviews" \
+              --jq '.[] | {login: .user.login, type: .user.type, state, commit_id}' | jq -s .)
+            read -r g_state g_sha <<<"$(verdict "$BOT")"
+            if [ "$g_state" != APPROVED ] || [ "$g_sha" != "$sha" ]; then
+              echo "#$n: CodeRabbit has not approved $sha ($g_state)"; continue
+            fi
+            if ! jq -e --arg who "$BOT" 'any(.[]; .login == $who and .type == "Bot")' <<<"$reviews" >/dev/null; then
+              echo "#$n: $BOT is not a bot account"; continue
+            fi
+            # Its threads, resolved by anyone but CodeRabbit (the author could
+            # resolve them to unlock its approval). Over 100 threads: wait.
+            threads=$(gh api graphql -F n="$n" -f owner="${REPO%/*}" -f name="${REPO#*/}" -f query='
+              query($owner: String!, $name: String!, $n: Int!) {
+                repository(owner: $owner, name: $name) { pullRequest(number: $n) {
+                  reviewThreads(first: 100) { pageInfo { hasNextPage } nodes {
+                    isResolved resolvedBy { login }
+                    comments(first: 1) { nodes { author { login } } } } } } } }')
+            # Thread authors are named without "[bot]", resolvers with it.
+            bot_login=${BOT%\[bot\]}
+            if ! jq -e --arg bot "$bot_login" '.data.repository.pullRequest.reviewThreads
+                | (.pageInfo.hasNextPage | not) and all(.nodes[];
+                    (.comments.nodes[0].author.login != $bot) or (.isResolved | not)
+                    or (.resolvedBy.login == $bot) or (.resolvedBy.login == $bot + "[bot]"))' \
+                <<<"$threads" >/dev/null; then
+              echo "#$n: a CodeRabbit thread was resolved by someone else"; continue
+            fi
+            read -r m_state _ <<<"$(verdict "$MAINTAINER")"
+            if [ "$m_state" = CHANGES_REQUESTED ]; then
+              echo "#$n: the maintainer requested changes"; continue
+            fi
+            ci=$(gh api "repos/$REPO/commits/$sha/check-runs?check_name=check&per_page=100" \
+              --jq '[.check_runs[] | select(.app.slug == "github-actions") | .conclusion]')
+            if ! jq -e 'length > 0 and all(. == "success")' <<<"$ci" >/dev/null; then
+              echo "#$n: CI has not passed on $sha ($ci)"; continue
+            fi
+            # The files API lists at most 3000 files: past that, some go unseen.
+            if [ "$(jq -r .changed_files <<<"$pr")" -gt 3000 ]; then
+              echo "#$n: too many files to check"; continue
+            fi
+            # Both paths of a renamed file: moving a protected file elsewhere
+            # changes it as much as editing it.
+            if ! files=$(gh api --paginate "repos/$REPO/pulls/$n/files" \
+                --jq '.[] | .filename, (.previous_filename // empty)'); then
+              echo "#$n: could not list its files"; continue
+            fi
+            touched=$(grep -E "$PROTECTED" <<<"$files" || true)
+            if [ -n "$touched" ]; then
+              echo "#$n: touches paths that need the maintainer:"; echo "$touched"; continue
+            fi
+            # Merging at $sha fails if a commit lands meanwhile.
+            if gh api -X PUT "repos/$REPO/pulls/$n/merge" -f merge_method=rebase -f sha="$sha" >/dev/null; then
+              echo "#$n: merged at $sha"
+            else
+              echo "#$n: merge refused (conflicts or rules); left open"
+            fi
+          done

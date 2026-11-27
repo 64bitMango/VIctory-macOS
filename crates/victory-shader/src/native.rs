@@ -200,6 +200,8 @@ impl NativeProgram {
     }
 }
 
+/// One entry of [`diagnostic_patches`]: container length, code length,
+/// offset, cleared bits, set bits.
 pub type DiagnosticPatch = (usize, usize, usize, u32, u32);
 
 /// Diagnostics: `VICTORY_SHADER_PATCH=<container bytes>:<code bytes>:<code
