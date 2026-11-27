@@ -173,20 +173,24 @@ pub(crate) fn segments(this: This) -> Vec<std::sync::Arc<crate::host::HostList>>
 
 /// Waits recorded after commands: the title list goes on in a new host
 /// list, which runs once the wait holds.
+#[cfg(windows)]
 static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Lists reset or released while a queue still held some of their host
 /// lists: D3D12 lets a list be reset as soon as it is submitted (Grand
 /// Theft Auto VI does, 0-21 times a world frame).
+#[cfg(windows)]
 static EARLY_RESETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Cuts and early resets since the last call (the frame line).
+#[cfg(windows)]
 pub(crate) fn take_cuts() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (CUTS.swap(0, Relaxed), EARLY_RESETS.swap(0, Relaxed))
 }
 
 /// Cuts for hoisted clamps since the last call (the frame-rate line).
+#[cfg(windows)]
 pub(crate) fn take_hoists() -> u64 {
     HOISTS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
@@ -229,6 +233,7 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
 
 /// Runs of indirect draws whose clamps went to the host list before
 /// ([`hoist`]): each cut the title list once more.
+#[cfg(windows)]
 static HOISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Before an indirect draw (`crate::indirect::hoisting`): unless the clamps
@@ -507,6 +512,8 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    #[cfg(not(windows))]
+    let _ = this;
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         end_hoist(this);
@@ -606,6 +613,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
 
 /// An unordered access barrier on every resource: earlier shader writes
 /// finish before later work reads or writes.
+#[cfg(windows)]
 const UAV_BARRIER: Barrier = Barrier {
     kind: 2,
     flags: 0,
@@ -616,6 +624,8 @@ const UAV_BARRIER: Barrier = Barrier {
 
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
+    #[cfg(not(windows))]
+    let _ = (this, count, barriers);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
@@ -919,10 +929,12 @@ extern "system" fn copy_texture_region(
 #[cfg(test)]
 impl CopyLocation {
     /// A placed footprint in `resource` (tests).
+    #[cfg(windows)]
     pub(crate) fn placed(resource: This, footprint: crate::resource::PlacedFootprint) -> Self {
         Self { resource, kind: 1, footprint }
     }
     /// Subresource 0 of `resource` (tests).
+    #[cfg(windows)]
     pub(crate) fn whole(resource: This) -> Self {
         Self { resource, kind: 0, footprint: crate::resource::PlacedFootprint::new(0, 0, 0, 0, 0) }
     }
@@ -931,10 +943,12 @@ impl CopyLocation {
 /// Texture read backs since the last frame-rate line: how many, bytes
 /// (diagnostics).
 #[cfg(feature = "diagnostics")]
+#[cfg(windows)]
 pub(crate) static READ_BACKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// (texture, buffer) pairs read back so far, each logged once (diagnostics).
 #[cfg(feature = "diagnostics")]
+#[cfg(windows)]
 static READ_BACK_PAIRS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
 
 /// Texture to buffer (a read back): the region is copied on the host into
@@ -1568,17 +1582,6 @@ pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] =
 /// nothing returned.
 extern "system" fn ignored_state(_: This) {}
 
-/// Depth bounds `(min, max)`.
-/// shortcut: not passed on (host pipelines leave the test out,
-/// `pipeline::host`); the first call says so, and the host's support for
-/// the test is logged when its device is made.
-extern "system" fn depth_bounds(_: This, min: f32, max: f32) {
-    static SAID: std::sync::Once = std::sync::Once::new();
-    SAID.call_once(|| {
-        tracing::info!(min, max, "the title sets depth bounds, which the host is not given")
-    });
-}
-
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
@@ -1616,6 +1619,9 @@ mod state {
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
         with_state(this, |list, s| s.stencil_ref(list, reference));
+    }
+    pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+        with_state(this, |list, s| s.depth_bounds(list, min, max));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
@@ -1821,6 +1827,7 @@ mod state {
     pub(super) use super::ignored_state as index_buffer;
     pub(super) use super::ignored_state as scissors;
     pub(super) use super::ignored_state as stencil_ref;
+    pub(super) use super::ignored_state as depth_bounds;
     pub(super) use super::ignored_state as targets;
     pub(super) use super::ignored_state as topology;
     pub(super) use super::ignored_state as vertex_buffers;
@@ -1862,7 +1869,11 @@ extern "system" fn execute_indirect(
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
+    #[cfg(not(windows))]
+    let _ = (this, count_offset);
+    #[cfg(windows)]
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    #[cfg(windows)]
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -1887,6 +1898,7 @@ extern "system" fn execute_indirect(
             count.is_null() || counter.is_some()
         ));
     }
+    #[cfg(windows)]
     if ran {
         return;
     }
@@ -1907,6 +1919,7 @@ extern "system" fn execute_indirect(
 }
 
 /// Indirect executions dropped since the last call.
+#[cfg(windows)]
 pub(crate) fn take_indirect() -> u64 {
     INDIRECT.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
@@ -2035,7 +2048,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (52, clear_rtv as *const ()),                 // 0x1a0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, depth_bounds as *const ()),              // 0x220 depth bounds
+    (68, state::depth_bounds as *const ()),       // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait32 as *const ()),                    // 0x238 (newer 0x248)

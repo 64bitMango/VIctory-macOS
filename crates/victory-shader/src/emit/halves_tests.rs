@@ -117,6 +117,7 @@ fn far_early_out() -> Vec<u32> {
 
 /// What thread `t` of [`far_early_out`] stores, with `below` threads left
 /// and thread `marked` the one the count looks for.
+#[cfg(windows)]
 fn far_early_out_wants(t: u32, below: u32, marked: u32) -> u32 {
     let seen = marked < below && marked / 64 == t / 64;
     match (t < below, seen) {
@@ -482,6 +483,7 @@ fn branched_mask(source: u8) -> Vec<u32> {
 
 /// What thread `t` of [`branched_mask`] stores: each round adds 1 where its
 /// bit of the mask is set, else 2.
+#[cfg(windows)]
 fn branched_mask_wants(t: u32, source: u8) -> u32 {
     let even = t.is_multiple_of(2);
     let mut mask = even;

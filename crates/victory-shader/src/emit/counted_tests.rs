@@ -262,8 +262,8 @@ fn lanes_counted_over_a_wave_are_those_below_the_count() {
     started.extend(add);
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
-    type Program<'a> = (&'a str, &'a Vec<u32>, fn(u32) -> u32);
-    let programs: [Program; 2] =
+    type Program<'a> = (&'a str, &'a [u32], fn(u32) -> u32);
+    let programs: [Program<'_>; 2] =
         [("even lanes", &evens, even), ("lanes on entry", &started, |n| n)];
     for (what, body, of) in programs {
         for (threads, groups) in [(64u32, 2u32), (256, 1)] {

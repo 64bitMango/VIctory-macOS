@@ -498,7 +498,7 @@ pub fn summary(
             .is_none_or(|n| !n.starts_with('['))
     };
     let mut all: Vec<(&u32, &Use)> = uses.iter().collect();
-    all.sort_by(|a, b| b.1.commands.cmp(&a.1.commands));
+    all.sort_by_key(|entry| std::cmp::Reverse(entry.1.commands));
     let own: u32 = all.iter().filter(|u| ours(u.0)).map(|u| u.1.commands).sum();
     let total: u32 = all.iter().map(|u| u.1.commands).sum();
     line(&format!(

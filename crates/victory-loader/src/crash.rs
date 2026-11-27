@@ -598,57 +598,41 @@ fn cmp_flags(a: u64, b: u64) -> u32 {
 }
 const CMP_FLAGS: u32 = 0x8d5;
 
-/// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
-/// the saved XMM registers; returns the instruction's length.
+/// Applies SSE4a to the saved XMM registers and returns the decoded length.
 unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
-    // SAFETY: the caller's code bytes are readable up to the instruction's end.
+    // SAFETY: the caller provides the instruction bytes at the fault address.
     let b = |i: usize| unsafe { code.add(i).read() };
-    let prefix = b(0);
-    let (rex, at) = if b(1) & 0xf0 == 0x40 {
-        (b(1), 2)
-    } else {
-        (0, 1)
-    };
-    if !matches!(prefix, 0x66 | 0xf2) || b(at) != 0x0f || !matches!(b(at + 1), 0x78 | 0x79) {
+    let at = if b(1) & 0xf0 == 0x40 { 2 } else { 1 };
+    if !matches!(b(0), 0x66 | 0xf2) || b(at) != 0x0f || !matches!(b(at + 1), 0x78 | 0x79) {
         return None;
     }
-    let modrm = b(at + 2);
-    if modrm >> 6 != 3 {
-        return None;
-    }
-    let dst = usize::from((modrm >> 3) & 7 | (rex & 4) << 1);
-    let src = usize::from(modrm & 7 | (rex & 1) << 3);
-    let immediate = b(at + 1) == 0x78;
-    let (fields, len) = if immediate {
-        ((b(at + 3), b(at + 4)), at + 5)
-    } else {
-        // extrq reads its fields from src's low half, insertq from its high.
-        let f = if prefix == 0x66 {
-            xmm[src].Low
-        } else {
+    let len = at + 3 + 2 * usize::from(b(at + 1) == 0x78 && b(at + 2) >= 0xc0);
+    // SAFETY: only the bytes required by this encoding are read.
+    let bytes = unsafe { std::slice::from_raw_parts(code, len) };
+    let op = crate::amd_only::decode_sse4a(bytes)?;
+    let (dst, src) = (usize::from(op.dst), usize::from(op.src));
+    let fields = op.immediate.unwrap_or_else(|| {
+        let f = if op.insert {
             xmm[src].High as u64
+        } else {
+            xmm[src].Low
         };
-        ((f as u8, (f >> 8) as u8), at + 3)
-    };
-    let (n, at_bit) = (u32::from(fields.0 & 63), u32::from(fields.1 & 63));
+        [f as u8, (f >> 8) as u8]
+    });
+    let (n, at_bit) = (u32::from(fields[0] & 63), u32::from(fields[1] & 63));
     let bits = if n == 0 { 64 } else { n };
     let mask = if bits == 64 {
         u64::MAX
     } else {
         (1u64 << bits) - 1
     };
-    if prefix == 0x66 {
-        // extrq: register form takes its fields from src, works on dst.
-        if immediate && (modrm >> 3) & 7 != 0 {
-            return None;
-        }
-        let target = if immediate { src } else { dst };
-        xmm[target].Low = (xmm[target].Low >> at_bit) & mask;
-    } else {
+    if op.insert {
         let value = (xmm[src].Low & mask) << at_bit;
         xmm[dst].Low = xmm[dst].Low & !(mask << at_bit) | value;
+    } else {
+        xmm[dst].Low = (xmm[dst].Low >> at_bit) & mask;
     }
-    Some(len)
+    Some(op.len)
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
@@ -2138,6 +2122,74 @@ mod tests {
         xmm[1] = reg(0x14_08, 0);
         assert_eq!(emulate(&[0x66, 0x0f, 0x79, 0xc1], 0, &mut xmm), Some(4));
         assert_eq!(low(&xmm, 0), 0xbc);
+    }
+
+    #[test]
+    fn patched_sse4a_matches_the_exception_emulator() {
+        use crate::amd_only::{decode_sse4a, patch_sse4a_in};
+
+        let instructions: &[&[u8]] = &[
+            &[0x66, 0x0f, 0x78, 0xc0, 0, 0xff],
+            &[0x66, 0x41, 0x0f, 0x78, 0xc0, 0x8f, 12],
+            &[0xf2, 0x0f, 0x78, 0xc1, 0x85, 62],
+            &[0xf2, 0x45, 0x0f, 0x78, 0xc0, 0, 5],
+            &[0x66, 0x0f, 0x79, 0xc1],
+            &[0xf2, 0x0f, 0x79, 0xc1],
+            &[0x66, 0x45, 0x0f, 0x79, 0xc1],
+            &[0xf2, 0x45, 0x0f, 0x79, 0xc0],
+        ];
+        for instruction in instructions {
+            let op = decode_sse4a(instruction).unwrap();
+            let dst = usize::from(op.dst);
+            let src = usize::from(op.src);
+            // The wrapper loads the inputs from RCX and stores the results
+            // back into that array. Preserve nonvolatile XMMs for the caller.
+            let mut code = vec![0x48, 0x83, 0xec, 32]; // sub rsp, 32
+            let registers = if src == dst { vec![dst] } else { vec![dst, src] };
+            let xmm_move = |code: &mut Vec<u8>, reg: usize, opcode, address: &[u8]| {
+                code.push(0xf3);
+                if reg >= 8 {
+                    code.push(0x44);
+                }
+                code.extend([0x0f, opcode, ((reg as u8 & 7) << 3) | address[0]]);
+                code.extend(&address[1..]);
+            };
+            for (slot, &reg) in registers.iter().enumerate() {
+                xmm_move(&mut code, reg, 0x7f, &[0x44, 0x24, slot as u8 * 16]);
+                let [a, b, c, d] = (reg as u32 * 16).to_le_bytes();
+                xmm_move(&mut code, reg, 0x6f, &[0x81, a, b, c, d]);
+            }
+            let site = code.len();
+            code.extend_from_slice(instruction);
+            for (slot, &reg) in registers.iter().enumerate() {
+                let [a, b, c, d] = (reg as u32 * 16).to_le_bytes();
+                xmm_move(&mut code, reg, 0x7f, &[0x81, a, b, c, d]);
+                xmm_move(&mut code, reg, 0x6f, &[0x44, 0x24, slot as u8 * 16]);
+            }
+            code.extend([0x48, 0x83, 0xc4, 32, 0xc3]);
+            let code_len = code.len() + 5; // INT3 padding for the short forms
+            let page = code_page(4096, &[(0, &code)]);
+            // SAFETY: our fresh code page with no other callers.
+            assert_eq!(unsafe { patch_sse4a_in(page as u64, [(page as u64, code_len)], [page as u64]) }, (1, 0));
+            // SAFETY: the site is inside our page and the function uses the
+            // Windows x64 ABI with one argument in RCX.
+            let run: extern "system" fn(*mut M128A) = unsafe { std::mem::transmute(page) };
+            // SAFETY: the original SSE4a site is inside the mapped code page.
+            let opcode = unsafe { *((page + site) as *const u8) };
+            assert_eq!(opcode, if op.len == 4 { 0xeb } else { 0xe9 });
+            for fields in [0, 0x0500, 0x050f, 0x3f3f, 0xffff] {
+                let mut actual = [M128A { Low: 0x9234_5678_abcd_ef00, High: -2 }; 16];
+                actual[src].Low |= fields;
+                actual[src].High = 0x4321_8765_0000_0000 | i64::from(fields as u16);
+                let mut expected = actual;
+                // SAFETY: this encoding contains every byte the emulator needs.
+                assert_eq!(unsafe { sse4a(instruction.as_ptr(), &mut expected) }, Some(instruction.len()));
+                run(actual.as_mut_ptr());
+                for (actual, expected) in actual.iter().zip(expected) {
+                    assert_eq!((actual.Low, actual.High), (expected.Low, expected.High), "{instruction:02x?}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub mod masked;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub mod mark_stores;
 pub mod prepare;
+#[cfg(any(windows, test))]
 pub(crate) mod publish;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]

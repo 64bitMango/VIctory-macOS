@@ -113,6 +113,8 @@ extern "system" fn release(this: This) -> u32 {
 /// Queues the lists' host lists behind what the queue holds, and runs what
 /// may run (`crate::hold`; decision 0007).
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    #[cfg(not(windows))]
+    let _ = this;
     if lists.is_null() {
         return;
     }
@@ -141,11 +143,15 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
 /// CPU fence call, PresentX, or our timer.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Why {
+    #[cfg(windows)]
     Submission,
+    #[cfg(windows)]
     Signal,
+    #[cfg(windows)]
     Wait,
     Fence,
     Present,
+    #[cfg(windows)]
     Timer,
 }
 
@@ -593,6 +599,7 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(windows)]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -1260,6 +1267,7 @@ mod tests {
         assert!(held.is_empty(), "everything ran from one pump");
         // NOT_EQUAL 0 of the timestamp a flight will write.
         let stamped = list(Some((w2, Written::GpuTimestamp)), "stamped prepared", Box::new(|| 0));
+        // SAFETY: w2 is an aligned timestamp slot in the test allocation.
         unsafe { (w2 as *mut u64).write_volatile(0) };
         held.push(qa, Item::Segment(stamped, Vec::new()));
         held.push(qa, Item::Segment(fourth, vec![wait(w2, 6, 0)]));

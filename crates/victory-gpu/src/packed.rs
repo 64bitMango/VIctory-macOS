@@ -73,15 +73,15 @@ pub(crate) fn narrow_texel(format: u32, [r, g, b, a]: [u8; 4]) -> u16 {
 /// Texels of `format` (2 bytes each) into R8G8B8A8 (4 bytes each), as many
 /// as both hold.
 pub(crate) fn widen(format: u32, from: &[u8], to: &mut [u8]) {
-    for (t, o) in from.chunks_exact(2).zip(to.chunks_exact_mut(4)) {
-        o.copy_from_slice(&widen_texel(format, u16::from_le_bytes([t[0], t[1]])));
+    for (t, o) in from.as_chunks::<2>().0.iter().zip(to.as_chunks_mut::<4>().0) {
+        o.copy_from_slice(&widen_texel(format, u16::from_le_bytes(*t)));
     }
 }
 
 /// R8G8B8A8 texels into texels of `format`, as many as both hold.
 pub(crate) fn narrow(format: u32, from: &[u8], to: &mut [u8]) {
-    for (t, o) in from.chunks_exact(4).zip(to.chunks_exact_mut(2)) {
-        o.copy_from_slice(&narrow_texel(format, [t[0], t[1], t[2], t[3]]).to_le_bytes());
+    for (t, o) in from.as_chunks::<4>().0.iter().zip(to.as_chunks_mut::<2>().0) {
+        o.copy_from_slice(&narrow_texel(format, *t).to_le_bytes());
     }
 }
 

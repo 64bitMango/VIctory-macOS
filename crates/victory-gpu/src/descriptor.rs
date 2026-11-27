@@ -75,6 +75,7 @@ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
 
 impl Heap {
     /// Whether this is a sampler heap.
+    #[cfg(windows)]
     pub(crate) fn samplers(&self) -> bool {
         self.desc.kind == SAMPLERS
     }
@@ -114,6 +115,8 @@ impl Heap {
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
+    #[cfg(windows)]
+    #[cfg(windows)]
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);
         let at = handle.checked_sub(self.start)?;
@@ -336,6 +339,7 @@ pub(crate) fn sync_heaps() {
     let _syncing = crate::contend::syncing();
     let began = std::time::Instant::now();
     let frame = crate::frame::current();
+    let mut runs = Vec::new();
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -347,7 +351,7 @@ pub(crate) fn sync_heaps() {
         let step = u64::from(step);
         // The slots to make, then made together: on several threads where
         // there are enough (`host::HostHeap::make_runs`).
-        let mut runs = Vec::new();
+        runs.clear();
         due_in_heap(host, start, step, heap.desc.count, Some(written), frame, &mut runs);
         host.make_runs(&runs, start, step);
     }
@@ -430,7 +434,7 @@ pub(crate) fn due_in_heap(
         // again at the next sync: `crate::watch::rest_ms`. A slot is made
         // again only if its record changed, so a page told twice costs the
         // look.)
-        let Some(written) = written else {
+        let Some(written) = written.filter(|written| !written.clean()) else {
             return checked;
         };
         #[cfg(feature = "diagnostics")]
@@ -672,13 +676,33 @@ pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) ->
     Some(f(host))
 }
 
-#[cfg(windows)]
+/// Live view descriptor heaps (`VIEWS_KIND`), shader-visible and staging
+/// alike, so [`Shapes::sweep`] can see every `PLACED` shape still named by
+/// any descriptor slot in the process.
+struct ViewHeap {
+    start: u64,
+    count: u32,
+    at: usize,
+}
+
+static VIEW_HEAPS: std::sync::RwLock<Vec<ViewHeap>> = std::sync::RwLock::new(Vec::new());
+
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = heaps_alone();
-        unregister_heap(&mut heaps, at);
-        crate::write_marks::let_go(self.start);
+        if self.desc.kind == VIEWS_KIND {
+            VIEW_HEAPS
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|h| h.at != at);
+            SHAPE_LIVENESS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        #[cfg(windows)]
+        {
+            let mut heaps = heaps_alone();
+            unregister_heap(&mut heaps, at);
+            crate::write_marks::let_go(self.start);
+        }
     }
 }
 
@@ -918,37 +942,178 @@ pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 // them as one 64-bit key per slot). The top two bits of `generation` say
 // what the other 62 bits are: 0, entry `i` of the table at that
 // generation; [`CONSTANT`], a constant buffer view, whole; [`PLACED`], a
-// view of placed memory: its address and the number of its shape.
+// view of placed memory: its address and the number of its shape;
+// or [`SCRATCH_PLACED`], a sequence number in the scratch cache.
 const KIND_SHIFT: u32 = 30;
 /// Table generations stay below the kind bits (and above 0).
 const GENERATION_MASK: u32 = (1 << KIND_SHIFT) - 1;
 const CONSTANT: u32 = 1;
 const PLACED: u32 = 2;
+const SCRATCH_PLACED: u32 = 3;
+/// Scratch slots have no heap lifetime notification. Placed views outside
+/// registered heaps are deduplicated in addressable storage so live
+/// descriptors never have their views overwritten by unrelated publications.
+struct PlacedScratch {
+    list: Vec<View>,
+    index: std::collections::BTreeMap<View, u32>,
+}
+
+const SLOT_LOCK_COUNT: usize = 1024;
+static SLOT_LOCKS: [std::sync::Mutex<()>; SLOT_LOCK_COUNT] =
+    [const { std::sync::Mutex::new(()) }; SLOT_LOCK_COUNT];
+
+fn slot_lock(handle: u64) -> &'static std::sync::Mutex<()> {
+    let mut h = handle.wrapping_mul(0x9e3779b97f4a7c15);
+    h ^= h >> 32;
+    &SLOT_LOCKS[(h as usize) % SLOT_LOCK_COUNT]
+}
+
+fn with_slot_locks<R>(slot_a: u64, slot_b: u64, f: impl FnOnce() -> R) -> R {
+    let mut h_a = slot_a.wrapping_mul(0x9e3779b97f4a7c15);
+    h_a ^= h_a >> 32;
+    let idx_a = (h_a as usize) % SLOT_LOCK_COUNT;
+
+    let mut h_b = slot_b.wrapping_mul(0x9e3779b97f4a7c15);
+    h_b ^= h_b >> 32;
+    let idx_b = (h_b as usize) % SLOT_LOCK_COUNT;
+
+    if idx_a == idx_b {
+        let _guard = SLOT_LOCKS[idx_a].lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    } else if idx_a < idx_b {
+        let _guard_a = SLOT_LOCKS[idx_a].lock().unwrap_or_else(|e| e.into_inner());
+        let _guard_b = SLOT_LOCKS[idx_b].lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    } else {
+        let _guard_b = SLOT_LOCKS[idx_b].lock().unwrap_or_else(|e| e.into_inner());
+        let _guard_a = SLOT_LOCKS[idx_a].lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+}
+
+fn write_record_words(handle: u64, i: u32, generation: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed, Ordering::Release};
+    if handle.is_multiple_of(4) {
+        let words = handle as *mut AtomicU32;
+        // SAFETY: `handle` is a 4-byte-aligned descriptor slot, at least 16 bytes.
+        unsafe {
+            (*words).store(0, Release);
+            (*words.add(1)).store(i, Relaxed);
+            (*words.add(2)).store(generation, Relaxed);
+            (*words).store(VIEW_TAG, Release);
+        }
+    } else {
+        // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+        unsafe {
+            (handle as *mut u32).write_unaligned(0);
+            ((handle + 4) as *mut u64).write_unaligned(u64::from(generation) << 32 | u64::from(i));
+            (handle as *mut u32).write_unaligned(VIEW_TAG);
+        }
+    }
+}
+
+static PLACED_SCRATCH: std::sync::RwLock<PlacedScratch> =
+    std::sync::RwLock::new(PlacedScratch {
+        list: Vec::new(),
+        index: std::collections::BTreeMap::new(),
+    });
+
+fn record_placed_scratch_locked(handle: u64, view: View) -> [u32; 2] {
+    let id = {
+        let mut scratch = PLACED_SCRATCH.write().unwrap_or_else(|e| e.into_inner());
+        match scratch.index.get(&view) {
+            Some(&id) => id,
+            None => {
+                let id = scratch.list.len() as u32;
+                scratch.list.push(view.clone());
+                scratch.index.insert(view, id);
+                id
+            }
+        }
+    };
+    let [i, generation] = kind_words(SCRATCH_PLACED, u64::from(id));
+    write_record_words(handle, i, generation);
+    #[cfg(windows)]
+    mirror(handle);
+    [i, generation]
+}
+
+fn record_placed_scratch(handle: u64, view: View) {
+    let _writes = SHAPE_WRITES.read().unwrap_or_else(|e| e.into_inner());
+    let _slot = slot_lock(handle).lock().unwrap_or_else(|e| e.into_inner());
+    record_placed_scratch_locked(handle, view);
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn scratch_placed_of(i: u32, generation: u32) -> Option<View> {
+    let id = payload(i, generation) as usize;
+    let scratch = PLACED_SCRATCH.read().unwrap_or_else(|e| e.into_inner());
+    scratch.list.get(id).cloned()
+}
 /// Bits of a constant buffer view's address in its record: any address a
 /// program can have. The 15 bits above them are its size.
 const CONSTANT_ADDRESS_BITS: u32 = 47;
 /// Bits of a placed view's address in its record: placed memory is title
-/// memory, which lies below 1 TiB. The 22 bits above them number its shape.
+/// memory, which lies below 1 TiB. The 22 bits above them carry the shape
+/// slot (14 bits, bounding [`SHAPES`] to 16,384 slots) and a non-wrapping
+/// 8-bit generation (slots retire at `u8::MAX` rather than wrapping).
 const PLACED_ADDRESS_BITS: u32 = 40;
-const SHAPE_LIMIT: usize = 1 << (62 - PLACED_ADDRESS_BITS);
+const SHAPE_BITS: u32 = 14;
+const SHAPE_LIMIT: usize = 1 << SHAPE_BITS;
+const SHAPE_INDEX_MASK: usize = SHAPE_LIMIT - 1;
+/// Minimum missed `shape_number` inserts between unsuccessful full sweeps
+/// when no view heap was dropped meanwhile.
+const SWEEP_RETRY_MISSES: u32 = 1024;
 
 /// A view of placed memory without its address: whether it is unordered
 /// access, the resource description, and the view's words but the two that
 /// hold the address (10 and 11).
 type Shape = (bool, [u32; 14], [u32; 14]);
 
-/// The shapes of placed views named whole in their records, by number, and
-/// where each is. Only ever added to: as many as the title has kinds of
-/// textures and buffers, however often it moves them. A lock of its own,
-/// apart from the entries and their index: nearly every placed view has a
-/// shape seen before, which readers share.
+/// The shapes of placed views named whole in their records, by slot, and
+/// where each is. Bounded to [`SHAPE_LIMIT`] entries by sweeping slots that
+/// no live view heap names; a lock of its own, apart from the entries and
+/// their index: nearly every placed view has a shape seen before, which
+/// readers share.
 struct Shapes {
     list: Vec<Shape>,
     index: std::collections::BTreeMap<Shape, u32>,
+    free: Vec<u32>,
+    last_sweep_epoch: u64,
+    misses_since_sweep: u32,
 }
 
-static SHAPES: std::sync::RwLock<Shapes> =
-    std::sync::RwLock::new(Shapes { list: Vec::new(), index: std::collections::BTreeMap::new() });
+static SHAPES: std::sync::RwLock<Shapes> = std::sync::RwLock::new(Shapes {
+    list: Vec::new(),
+    index: std::collections::BTreeMap::new(),
+    free: Vec::new(),
+    last_sweep_epoch: 0,
+    misses_since_sweep: SWEEP_RETRY_MISSES,
+});
+
+/// Per-slot liveness, non-wrapping generation, and in-flight pin count for [`SHAPES`]:
+/// - `SHAPE_ALIVE`: `true` while the slot holds an active shape (false while
+///   on `free` or retired).
+/// - `SHAPE_GENERATIONS`: monotonically incremented on reclamation; slots at
+///   `u8::MAX` retire instead of wrapping so stale headers never alias.
+/// - `SHAPE_PINNED`: incremented before [`shape_number`] returns a slot and
+///   decremented in [`record`] only after [`write_record`] publishes.
+static SHAPE_ALIVE: [std::sync::atomic::AtomicBool; SHAPE_LIMIT] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; SHAPE_LIMIT];
+static SHAPE_GENERATIONS: [std::sync::atomic::AtomicU8; SHAPE_LIMIT] =
+    [const { std::sync::atomic::AtomicU8::new(0) }; SHAPE_LIMIT];
+static SHAPE_PINNED: [std::sync::atomic::AtomicU32; SHAPE_LIMIT] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; SHAPE_LIMIT];
+
+/// Bumped when a `VIEWS_KIND` heap is dropped so [`shape_number`] knows
+/// heap liveness may have changed.
+static SHAPE_LIVENESS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// View header writers share this lock. Sweeps take it exclusively.
+static SHAPE_WRITES: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Bulk copies also hold this separate barrier while resolving the copied view.
+static SHAPE_COPIES: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// The number of shapes in [`SHAPES`], for [`views_current`] to know a
 /// record's shape without the lock (stored after the shape is there).
@@ -1005,6 +1170,7 @@ fn constant_words(address: u64, size: u32) -> Option<[u32; 2]> {
 }
 
 /// The constant buffer view [`constant_words`] named.
+#[cfg(any(windows, test))]
 fn constant_of(i: u32, generation: u32) -> View {
     let payload = payload(i, generation);
     let code = (payload >> CONSTANT_ADDRESS_BITS) as u32;
@@ -1017,42 +1183,272 @@ fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, 
     let mut rest = [0u32; 14];
     rest[..10].copy_from_slice(&desc[..10]);
     rest[10..].copy_from_slice(&desc[12..]);
-    ((unordered, *resource, rest), u64::from(desc[10]) | u64::from(desc[11]) << 32)
+    (
+        (unordered, *resource, rest),
+        u64::from(desc[10]) | u64::from(desc[11]) << 32,
+    )
 }
 
-/// The number of `shape`, a new one if it is not there yet; `None` when the
-/// shapes are full (the view is then a table entry).
-fn shape_number(shape: Shape) -> Option<u32> {
-    if let Some(&at) = SHAPES.read().unwrap_or_else(|e| e.into_inner()).index.get(&shape) {
-        return Some(at);
+/// Encodes a shape slot and its non-wrapping 8-bit generation into the 22-bit
+/// shape code carried by `PLACED` record headers.
+fn shape_code(idx: u32, generation: u8) -> u32 {
+    u32::from(generation) << SHAPE_BITS | idx
+}
+
+/// Pins shape slot `idx` in `pinned` so [`Shapes::sweep`] will not reclaim
+/// it before [`write_record`] publishes the record, and returns `(code, idx)`.
+fn pin_shape(
+    idx: u32,
+    pinned: &[std::sync::atomic::AtomicU32],
+    generations: &[std::sync::atomic::AtomicU8],
+) -> (u32, u32) {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    pinned[idx as usize].fetch_add(1, AcqRel);
+    let generation = generations[idx as usize].load(Acquire);
+    (shape_code(idx, generation), idx)
+}
+
+/// Whether the descriptor memory `[addr, addr + len)` is readable. On Windows
+/// this queries the virtual memory region; if any page is uncommitted,
+/// `PAGE_NOACCESS`, or `PAGE_GUARD`, returns `false` so [`Shapes::sweep`]
+/// conservatively retains all shapes rather than faulting.
+fn range_readable(addr: u64, len: u64) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+        };
+        let mut cur = addr as usize;
+        let end = cur.saturating_add(len as usize);
+        while cur < end {
+            let mut info = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: `VirtualQuery` writes to `info` for the process's own address space.
+            if unsafe { VirtualQuery(cur as *const _, &mut info, size_of_val(&info)) } == 0 {
+                return false;
+            }
+            if info.State != MEM_COMMIT || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0 {
+                return false;
+            }
+            let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+            if region_end <= cur {
+                return false;
+            }
+            cur = region_end;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (addr, len);
+    true
+}
+
+/// Atomically reads `[tag, i, generation]` from a 4-byte-aligned descriptor slot.
+///
+/// # Safety
+/// `addr` must point to a readable 12-byte descriptor header.
+unsafe fn read_record_atomic(addr: u64) -> [u32; 3] {
+    let _slot = slot_lock(addr).lock().unwrap_or_else(|e| e.into_inner());
+    use std::sync::atomic::{AtomicU32, Ordering::Acquire, Ordering::Relaxed};
+    if addr.is_multiple_of(4) {
+        let words = addr as *mut AtomicU32;
+        // SAFETY: `addr` is 4-byte aligned and readable for 3 `u32` words.
+        unsafe {
+            let tag = (*words).load(Acquire);
+            let i = (*words.add(1)).load(Relaxed);
+            let generation = (*words.add(2)).load(Relaxed);
+            [tag, i, generation]
+        }
+    } else {
+        // SAFETY: caller guarantees `addr` is readable for 12 bytes.
+        unsafe { (addr as *const [u32; 3]).read_unaligned() }
+    }
+}
+
+/// Whether `addr` falls inside a live `VIEWS_KIND` heap in [`VIEW_HEAPS`].
+fn in_view_heap(addr: u64) -> bool {
+    VIEW_HEAPS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|h| addr >= h.start && addr < h.start.saturating_add(u64::from(h.count) * 32))
+}
+
+impl Shapes {
+    fn get(
+        &self,
+        shape: &Shape,
+        pinned: &[std::sync::atomic::AtomicU32],
+        generations: &[std::sync::atomic::AtomicU8],
+    ) -> Option<(u32, u32)> {
+        self.index
+            .get(shape)
+            .map(|&idx| pin_shape(idx, pinned, generations))
+    }
+
+    /// Snapshots `pinned` before scanning `heaps`, then reclaims active slots
+    /// that were unpinned at snapshot time and are not named by any live heap
+    /// slot. The caller excludes header writes and copies during the scan.
+    /// An unreadable heap aborts reclamation. Slots whose
+    /// generation reaches `u8::MAX` retire instead of wrapping.
+    fn sweep(
+        &mut self,
+        heaps: &[ViewHeap],
+        pinned: &[std::sync::atomic::AtomicU32],
+        alive: &[std::sync::atomic::AtomicBool],
+        generations: &[std::sync::atomic::AtomicU8],
+    ) -> usize {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+        let n = self.list.len();
+        let pinned_snapshot: Vec<u32> = (0..n).map(|idx| pinned[idx].load(Acquire)).collect();
+        let mut live = vec![false; n];
+        for h in heaps {
+            let bytes = u64::from(h.count) * 32;
+            if !h.start.is_multiple_of(4) || !range_readable(h.start, bytes) {
+                return 0;
+            }
+            for slot in 0..u64::from(h.count) {
+                let addr = h.start + slot * 32;
+                // SAFETY: `h` is a live `VIEWS_KIND` heap and `range_readable` succeeded.
+                let [tag, i, generation] = unsafe { read_record_atomic(addr) };
+                if tag == VIEW_TAG && (generation >> KIND_SHIFT) == PLACED {
+                    let code = (payload(i, generation) >> PLACED_ADDRESS_BITS) as usize;
+                    let idx = code & SHAPE_INDEX_MASK;
+                    let shape_gen = (code >> SHAPE_BITS) as u8;
+                    if idx < n && generations[idx].load(Acquire) == shape_gen {
+                        live[idx] = true;
+                    }
+                }
+            }
+        }
+        let mut freed = 0;
+        for (idx, &in_heap) in live.iter().enumerate() {
+            if !in_heap && pinned_snapshot[idx] == 0 && alive[idx].load(Relaxed) {
+                alive[idx].store(false, Release);
+                self.index.remove(&self.list[idx]);
+                let gen_now = generations[idx].load(Relaxed);
+                if let Some(next_gen) = gen_now.checked_add(1) {
+                    generations[idx].store(next_gen, Release);
+                    self.free.push(idx as u32);
+                }
+                freed += 1;
+            }
+        }
+        freed
+    }
+
+    /// Inserts `shape` or reuses a freed slot from `self.free`, pinning the
+    /// returned slot until [`record`] publishes its record. When full and
+    /// `self.free` is empty, returns `(None, false)`.
+    fn insert(
+        &mut self,
+        shape: Shape,
+        limit: usize,
+        pinned: &[std::sync::atomic::AtomicU32],
+        alive: &[std::sync::atomic::AtomicBool],
+        generations: &[std::sync::atomic::AtomicU8],
+    ) -> (Option<(u32, u32)>, bool) {
+        use std::sync::atomic::Ordering::Release;
+        if let Some(res) = self.get(&shape, pinned, generations) {
+            return (Some(res), false);
+        }
+        if let Some(idx) = self.free.pop() {
+            let slot = idx as usize;
+            self.list[slot] = shape;
+            self.index.insert(shape, idx);
+            alive[slot].store(true, Release);
+            return (Some(pin_shape(idx, pinned, generations)), false);
+        }
+        if self.list.len() < limit {
+            let idx = self.list.len() as u32;
+            self.list.push(shape);
+            self.index.insert(shape, idx);
+            generations[idx as usize].store(0, Release);
+            alive[idx as usize].store(true, Release);
+            return (Some(pin_shape(idx, pinned, generations)), true);
+        }
+        (None, false)
+    }
+}
+
+/// The `(code, slot_idx)` of `shape`, pinned in [`SHAPE_PINNED`], if one is
+/// available; when [`SHAPES`] reaches [`SHAPE_LIMIT`], sweeps live
+/// [`VIEW_HEAPS`] for unused slots only when liveness may have changed or after
+/// [`SWEEP_RETRY_MISSES`] misses, falling back to `None` in between.
+fn shape_number(shape: Shape) -> Option<(u32, u32)> {
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    if let Some(res) = SHAPES.read().unwrap_or_else(|e| e.into_inner()).get(
+        &shape,
+        &SHAPE_PINNED,
+        &SHAPE_GENERATIONS,
+    ) {
+        return Some(res);
     }
     let mut shapes = SHAPES.write().unwrap_or_else(|e| e.into_inner());
-    // Looked up again: another thread may have entered it meanwhile.
-    if let Some(&at) = shapes.index.get(&shape) {
-        return Some(at);
+    let (res, grew) = shapes.insert(
+        shape,
+        SHAPE_LIMIT,
+        &SHAPE_PINNED,
+        &SHAPE_ALIVE,
+        &SHAPE_GENERATIONS,
+    );
+    if grew {
+        SHAPES_KNOWN.store(shapes.list.len(), Release);
+        return res;
     }
-    if shapes.list.len() >= SHAPE_LIMIT {
+    if res.is_some() {
+        return res;
+    }
+    let epoch = SHAPE_LIVENESS_EPOCH.load(Acquire);
+    if shapes.last_sweep_epoch == epoch && shapes.misses_since_sweep < SWEEP_RETRY_MISSES {
+        shapes.misses_since_sweep += 1;
         return None;
     }
-    let at = shapes.list.len() as u32;
-    shapes.list.push(shape);
-    shapes.index.insert(shape, at);
-    SHAPES_KNOWN.store(shapes.list.len(), std::sync::atomic::Ordering::Release);
-    Some(at)
+    // A copy can resolve a shape while holding its read guard. Try the
+    // write lock without waiting because we already hold SHAPES for writing.
+    let Ok(_copies) = SHAPE_COPIES.try_write() else {
+        return None;
+    };
+    let Ok(_writes) = SHAPE_WRITES.try_write() else {
+        return None;
+    };
+    shapes.last_sweep_epoch = epoch;
+    shapes.misses_since_sweep = 0;
+    let heaps = VIEW_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let freed = shapes.sweep(&heaps, &SHAPE_PINNED, &SHAPE_ALIVE, &SHAPE_GENERATIONS);
+    drop(heaps);
+    if freed == 0 {
+        return None;
+    }
+    shapes
+        .insert(
+            shape,
+            SHAPE_LIMIT,
+            &SHAPE_PINNED,
+            &SHAPE_ALIVE,
+            &SHAPE_GENERATIONS,
+        )
+        .0
 }
 
 /// The record words that name the view of placed memory at `address` with
-/// shape number `shape`.
+/// shape code `shape`.
 fn placed_words(shape: u32, address: u64) -> [u32; 2] {
     kind_words(PLACED, u64::from(shape) << PLACED_ADDRESS_BITS | address)
 }
 
-/// The view of placed memory [`placed_words`] named, if its shape is known.
+/// The view of placed memory [`placed_words`] named, if its shape slot is
+/// active and still at the header's generation.
 fn placed_of(i: u32, generation: u32) -> Option<View> {
+    use std::sync::atomic::Ordering::Acquire;
     let payload = payload(i, generation);
     let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
+    let code = (payload >> PLACED_ADDRESS_BITS) as usize;
+    let idx = code & SHAPE_INDEX_MASK;
+    let shape_gen = (code >> SHAPE_BITS) as u8;
     let shapes = SHAPES.read().unwrap_or_else(|e| e.into_inner());
-    let &(unordered, resource, rest) = shapes.list.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
+    let &(unordered, resource, rest) = shapes.list.get(idx)?;
+    if !SHAPE_ALIVE[idx].load(Acquire) || SHAPE_GENERATIONS[idx].load(Acquire) != shape_gen {
+        return None;
+    }
     let mut desc = [0u32; 16];
     desc[..10].copy_from_slice(&rest[..10]);
     (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
@@ -1062,8 +1458,9 @@ fn placed_of(i: u32, generation: u32) -> Option<View> {
 
 /// The two words that name `view` whole in a record, where its kind allows
 /// and `VICTORY_VIEW_INLINE` is not `0` ([`Views`]); else `None`, and the
-/// view is a table entry.
-fn inline_words(view: &View) -> Option<[u32; 2]> {
+/// view is a table entry. For placed views, also returns the pinned shape
+/// slot so [`record`] can unpin it after [`write_record`] publishes.
+fn inline_words(view: &View) -> Option<([u32; 2], Option<u32>)> {
     use std::sync::atomic::Ordering::Relaxed;
     if !view_inline() {
         return None;
@@ -1072,16 +1469,17 @@ fn inline_words(view: &View) -> Option<[u32; 2]> {
         View::Constant(address, size) => {
             let words = constant_words(*address, *size)?;
             NAMED_WHOLE[0].fetch_add(1, Relaxed);
-            Some(words)
+            Some((words, None))
         }
         View::Placed(unordered, resource, desc) => {
             let (shape, address) = shape_of(*unordered, resource, desc);
             if address >> PLACED_ADDRESS_BITS != 0 {
                 return None;
             }
-            let words = placed_words(shape_number(shape)?, address);
+            let (code, idx) = shape_number(shape)?;
+            let words = placed_words(code, address);
             NAMED_WHOLE[1].fetch_add(1, Relaxed);
-            Some(words)
+            Some((words, Some(idx)))
         }
         _ => None,
     }
@@ -1093,7 +1491,20 @@ fn inline_words(view: &View) -> Option<[u32; 2]> {
 fn inline_current(i: u32, generation: u32, shapes: usize) -> bool {
     match generation >> KIND_SHIFT {
         CONSTANT => true,
-        PLACED => ((payload(i, generation) >> PLACED_ADDRESS_BITS) as usize) < shapes,
+        SCRATCH_PLACED => {
+            let id = payload(i, generation) as usize;
+            let scratch = PLACED_SCRATCH.read().unwrap_or_else(|e| e.into_inner());
+            id < scratch.list.len()
+        }
+        PLACED => {
+            use std::sync::atomic::Ordering::Acquire;
+            let code = (payload(i, generation) >> PLACED_ADDRESS_BITS) as usize;
+            let idx = code & SHAPE_INDEX_MASK;
+            let shape_gen = (code >> SHAPE_BITS) as u8;
+            idx < shapes
+                && SHAPE_ALIVE[idx].load(Acquire)
+                && SHAPE_GENERATIONS[idx].load(Acquire) == shape_gen
+        }
         _ => false,
     }
 }
@@ -1113,13 +1524,28 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
+    if matches!(view, View::Placed(..)) && !in_view_heap(handle) {
+        record_placed_scratch(handle, view);
+        return;
+    }
     // A view its record names whole needs neither the index nor an entry.
-    if let Some([i, generation]) = inline_words(&view) {
+    if let Some(([i, generation], pinned)) = inline_words(&view) {
         write_record(handle, i, generation);
+        if let Some(idx) = pinned {
+            SHAPE_PINNED[idx as usize].fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::copystat::add(crate::copystat::C::RecordInline, 1);
         #[cfg(windows)]
         mirror(handle);
+        return;
+    }
+    record_table(handle, view);
+}
+
+/// Records `view` as a table entry in [`VIEWS`] at `handle` (never inlined).
+fn record_table(handle: u64, view: View) {
+    if handle == 0 {
         return;
     }
     // A view recorded before (the title records the same views again and
@@ -1186,20 +1612,10 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
-/// Writes the record of view entry `i`, generation `generation`, at `handle`:
-/// the tag, then the entry and its generation in one store of eight bytes.
-/// Threads recording views share the views table, so two may write one slot
-/// at once (a title's race, but under the table's lock one record or the
-/// other came out whole): the tag is the same from both, and a store of
-/// eight bytes within a cache line lands whole on the processors this runs
-/// on, so the slot holds one thread's entry with its own generation, not
-/// one's entry with the other's generation, which names no view.
 fn write_record(handle: u64, i: u32, generation: u32) {
-    // SAFETY: the handle is a descriptor slot, at least 16 bytes.
-    unsafe {
-        (handle as *mut u32).write_unaligned(VIEW_TAG);
-        ((handle + 4) as *mut u64).write_unaligned(u64::from(generation) << 32 | u64::from(i));
-    }
+    let _writes = SHAPE_WRITES.read().unwrap_or_else(|e| e.into_inner());
+    let _slot = slot_lock(handle).lock().unwrap_or_else(|e| e.into_inner());
+    write_record_words(handle, i, generation);
 }
 
 /// Times a thread waited to enter what a host heap's slot holds, and the
@@ -1221,6 +1637,7 @@ fn record_shared() -> bool {
 }
 
 /// The title released `resource`: the views naming it go stale.
+#[cfg(any(windows, test))]
 pub(crate) fn forget(resource: usize) {
     let mut index = VIEW_INDEX.write().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = index.by_resource.remove(&resource) else {
@@ -1257,6 +1674,7 @@ pub(crate) fn forget(resource: usize) {
 /// The view the record words `i` and `generation` name: the one they hold
 /// whole ([`inline_words`]), or the view of entry `i` if `generation` is
 /// still its own.
+#[cfg(any(windows, test))]
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
         0 => {
@@ -1266,6 +1684,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
         }
         CONSTANT => Some(constant_of(i, generation)),
         PLACED => placed_of(i, generation),
+        SCRATCH_PLACED => scratch_placed_of(i, generation),
         _ => None,
     }
 }
@@ -1314,12 +1733,13 @@ fn generations_alone() -> bool {
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
+#[cfg(any(windows, test))]
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
         return None;
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    let [tag, i, generation] = unsafe { read_record_atomic(handle) };
     if tag != VIEW_TAG {
         return None;
     }
@@ -1440,19 +1860,77 @@ pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], 
     }
 }
 
+/// Scratch copies keep an independent view when their source shape is reclaimed.
+fn preserve_copied_placed_locked(slot: u64, step: u64) -> bool {
+    if step != 32 {
+        return false;
+    }
+    use std::sync::atomic::{AtomicU32, Ordering::Acquire, Ordering::Relaxed};
+    let [tag, i, generation] = if slot.is_multiple_of(4) {
+        let words = slot as *mut AtomicU32;
+        // SAFETY: `slot` is 4-byte aligned, at least 32 bytes, and its slot lock is held.
+        unsafe {
+            let tag = (*words).load(Acquire);
+            let i = (*words.add(1)).load(Relaxed);
+            let generation = (*words.add(2)).load(Relaxed);
+            [tag, i, generation]
+        }
+    } else {
+        // SAFETY: caller holds slot lock and `slot` has at least 32 bytes.
+        unsafe { (slot as *const [u32; 3]).read_unaligned() }
+    };
+    if tag != VIEW_TAG {
+        return false;
+    }
+    match generation >> KIND_SHIFT {
+        PLACED if !in_view_heap(slot) => {
+            if let Some(view) = placed_of(i, generation) {
+                record_placed_scratch_locked(slot, view);
+                return true;
+            }
+        }
+        SCRATCH_PLACED if in_view_heap(slot) => {
+            // Keep the scratch header on this path: SCRATCH_PLACED is already an immutable
+            // scratch-backed view and resolves cleanly in heaps without taking VIEWS or SHAPES entries.
+            #[cfg(windows)]
+            mirror(slot);
+            return true;
+        }
+        _ => {}
+    }
+    false
+}
+
 /// Device method: `count` descriptors of `kind` from `src` to `dst`.
 pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
-    let Some(step) = increment(kind).map(u64::from) else {
+    let Some(step) = increment(kind) else {
         return;
     };
-    let len = u64::from(count) * step;
-    if dst != 0 && src != 0 {
-        // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
-        #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+    let _copies =
+        (kind == VIEWS_KIND).then(|| SHAPE_COPIES.read().unwrap_or_else(|e| e.into_inner()));
+    copy_descriptors(count, dst, src, u64::from(step));
+}
+
+/// Copies one contiguous range under slot locks. View callers hold the copy barrier.
+fn copy_descriptors(count: u32, dst: u64, src: u64, step: u64) {
+    if dst == 0 || src == 0 {
+        return;
+    }
+    for i in 0..u64::from(count) {
+        let src_slot = src + i * step;
+        let dst_slot = dst + i * step;
+        with_slot_locks(src_slot, dst_slot, || {
+            // SAFETY: per-slot locks for both source and destination slots are held in
+            // consistent order, preventing data races with concurrent writes, reads, or other copies,
+            // and both handles point to valid title-owned descriptor memory of at least `step` bytes.
+            unsafe {
+                std::ptr::copy(src_slot as *const u8, dst_slot as *mut u8, step as usize);
+            }
+            if !preserve_copied_placed_locked(dst_slot, step) {
+                #[cfg(windows)]
+                mirror(dst_slot);
+            }
+        });
     }
 }
 
@@ -1493,6 +1971,8 @@ pub(crate) extern "system" fn copy(
     let src = ranges(src_ranges, src_starts, src_sizes);
     let mut dst = ranges(dst_ranges, dst_starts, dst_sizes).into_iter();
     let (mut to, mut room) = dst.next().unwrap_or((0, 0));
+    let _copies =
+        (kind == VIEWS_KIND).then(|| SHAPE_COPIES.read().unwrap_or_else(|e| e.into_inner()));
     for (mut from, mut left) in src {
         while left > 0 {
             while room == 0 {
@@ -1500,7 +1980,7 @@ pub(crate) extern "system" fn copy(
                 (to, room) = next;
             }
             let n = left.min(room);
-            copy_simple(std::ptr::null(), n, to, from, kind);
+            copy_descriptors(n, to, from, u64::from(step));
             let bytes = u64::from(n) * u64::from(step);
             (to, from, room, left) = (to + bytes, from + bytes, room - n, left - n);
         }
@@ -1508,15 +1988,18 @@ pub(crate) extern "system" fn copy(
 }
 
 /// The view recorded at `handle`, if one is.
+#[cfg(windows)]
 pub(crate) fn rtv_record(handle: u64) -> Option<RtvRecord> {
     tagged_record(handle, RTV_TAG)
 }
 
 /// The depth view recorded at `handle`, if one is.
+#[cfg(windows)]
 pub(crate) fn dsv_record(handle: u64) -> Option<RtvRecord> {
     tagged_record(handle, DSV_TAG)
 }
 
+#[cfg(windows)]
 fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
     if handle == 0 {
         return None;
@@ -1576,19 +2059,29 @@ pub(crate) extern "system" fn create_heap(
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
     });
-    #[cfg(windows)]
-    let at = std::ptr::from_ref::<Heap>(&heap) as usize;
     #[cfg(not(windows))]
     let _ = visible;
+    let at = std::ptr::from_ref::<Heap>(&heap) as usize;
     let result = object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out);
-    #[cfg(windows)]
-    if visible && result == crate::object::S_OK {
-        let mut heaps = heaps_alone();
-        register_heap(&mut heaps, (start, start + size), at);
-        // Write marks (`VICTORY_WRITE_MARKS`): the title's own stores tell
-        // this heap's slots.
-        if placed && desc.kind == VIEWS_KIND {
-            crate::write_marks::adopt(start, desc.count);
+    if result == crate::object::S_OK {
+        if desc.kind == VIEWS_KIND {
+            VIEW_HEAPS
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(ViewHeap {
+                    start,
+                    count: desc.count,
+                    at,
+                });
+        }
+        #[cfg(windows)]
+        if visible {
+            let mut heaps = heaps_alone();
+            register_heap(&mut heaps, (start, start + size), at);
+            // The title's own stores mark the slots in this heap.
+            if placed && desc.kind == VIEWS_KIND {
+                crate::write_marks::adopt(start, desc.count);
+            }
         }
     }
     result
@@ -1628,11 +2121,14 @@ static FUNCTIONS: Table<24> = {
 pub(crate) mod tests {
     /// Work to run while `make_read` makes the textures of a read slot (the
     /// slot), outside the heaps' lock.
+    #[cfg(windows)]
     pub(crate) static WHILE_MAKING: std::sync::Mutex<Option<(u32, Work)>> = std::sync::Mutex::new(None);
 
     /// The work [`WHILE_MAKING`] runs.
+    #[cfg(windows)]
     pub(crate) type Work = Box<dyn FnOnce() + Send>;
 
+    #[cfg(windows)]
     pub(crate) fn while_making(slots: &[u32]) {
         let mut hook = WHILE_MAKING.lock().unwrap_or_else(|e| e.into_inner());
         if hook.as_ref().is_some_and(|(slot, _)| slots.contains(slot))
@@ -1819,10 +2315,8 @@ pub(crate) mod tests {
         assert_eq!(heaps, [(10, 20, 2)]);
     }
 
-    #[cfg(windows)]
     struct HeapOwner(This);
 
-    #[cfg(windows)]
     impl Drop for HeapOwner {
         fn drop(&mut self) {
             if !self.0.is_null() {
@@ -1831,7 +2325,6 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(windows)]
     fn owner(desc: HeapDesc, placement: Placement) -> HeapOwner {
         let mut this = std::ptr::null();
         assert_eq!(create(desc, placement, &mut this), S_OK);
@@ -1938,9 +2431,9 @@ pub(crate) mod tests {
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1000, 512));
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1100, 256));
         assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
-        // A kind no record has names nothing.
-        assert_eq!(view_at(0, 3 << KIND_SHIFT), None);
-        assert_eq!(views_current(&[[VIEW_TAG, 0, 3 << KIND_SHIFT]]), [false]);
+        // A scratch record whose sequence has never been issued names nothing.
+        assert_eq!(view_at(u32::MAX, u32::MAX), None);
+        assert_eq!(views_current(&[[VIEW_TAG, u32::MAX, u32::MAX]]), [false]);
     }
 
     /// The table's entries that are views of addresses in `addresses`, or
@@ -1966,13 +2459,19 @@ pub(crate) mod tests {
             return;
         }
         let null = std::ptr::null();
-        let slots = [0u64; 4];
-        let at = slots.as_ptr() as u64;
+        let heap_owner = owner(
+            HeapDesc { kind: VIEWS_KIND, count: 8, flags: SHADER_VISIBLE, nodes: 1 },
+            Placement { address: 0, size: 0 },
+        );
+        let at = heap(heap_owner.0).start;
+        let mut scratch_slots = [0u64; 8];
+        let scratch = scratch_slots.as_mut_ptr() as u64;
+        let mut first_copy = None;
         // A resource description and a view no other test uses.
         let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
         let addresses = 0x6_0000_0000..0x6_1000_0000;
-        // SAFETY: a slot of `slots`.
+        // SAFETY: a slot of the heap.
         let record = || unsafe { (at as *const [u32; 3]).read_unaligned() };
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
@@ -1984,17 +2483,32 @@ pub(crate) mod tests {
             create_placed_srv(null, &resource, &desc, at);
             assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
             assert_eq!(views_current(&[record()]), [true]);
+            copy_simple(null, 1, scratch, at, VIEWS_KIND);
+            assert_eq!(view(scratch), Some(View::Placed(false, resource, desc)));
+            if first_copy.is_none() {
+                // SAFETY: `scratch` is a 32-byte scratch slot.
+                first_copy = Some((unsafe { read_record_atomic(scratch) }, desc));
+            }
         }
         assert_eq!(address_entries(addresses.clone(), resource), (0, 1), "no entries, one shape for 20,000 placed views");
         // The same shape, unordered: another shape.
         create_placed_uav(null, &resource, &desc, at);
         assert_eq!(view(at), Some(View::Placed(true, resource, desc)));
         assert_eq!(address_entries(addresses.clone(), resource), (0, 2));
-        // Placed memory past 1 TiB (not title memory) is a table entry.
+        let ([_, i, generation], first_desc) = first_copy.unwrap();
+        assert_eq!(
+            view_at(i, generation),
+            Some(View::Placed(false, resource, first_desc)),
+            "scratch copy remains addressable and is never overwritten"
+        );
+        // A scratch view past 1 TiB also uses scratch storage.
         (desc[10], desc[11]) = (0, 0x100);
-        create_placed_srv(null, &resource, &desc, at);
-        assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
-        assert_eq!(address_entries(addresses.clone(), resource), (1, 2));
+        create_placed_srv(null, &resource, &desc, scratch);
+        assert_eq!(view(scratch), Some(View::Placed(false, resource, desc)));
+        // SAFETY: `scratch` is a 32-byte slot.
+        let scratch_record = unsafe { read_record_atomic(scratch) };
+        assert_eq!(scratch_record[2] >> KIND_SHIFT, SCRATCH_PLACED);
+        assert_eq!(address_entries(addresses.clone(), resource), (0, 2));
         // A placed record of a shape not made yet names nothing.
         let unknown = placed_words(SHAPE_LIMIT as u32 - 1, 0x1000);
         assert_eq!(view_at(unknown[0], unknown[1]), None);
@@ -2023,6 +2537,289 @@ pub(crate) mod tests {
         assert_eq!(address_entries(addresses, resource).0, before + 100);
     }
 
+    /// `Shapes::sweep` keeps any shape still named by a live descriptor heap
+    /// slot or pinned in flight, and only reclaims slots that no live heap
+    /// names once unpinned. Copied placed records outside `VIEW_HEAPS` are
+    /// held in the scratch cache so they keep resolving after slot reuse.
+    #[test]
+    fn shapes_table_is_bounded_and_evicts_stale() {
+        use std::sync::atomic::{
+            AtomicBool, AtomicU8, AtomicU32, Ordering::Acquire, Ordering::Release,
+        };
+        const CAP: usize = 4;
+        let mut shapes = Shapes {
+            list: Vec::new(),
+            index: std::collections::BTreeMap::new(),
+            free: Vec::new(),
+            last_sweep_epoch: 0,
+            misses_since_sweep: 0,
+        };
+        let pinned = [const { AtomicU32::new(0) }; CAP];
+        let alive = [const { AtomicBool::new(false) }; CAP];
+        let generations = [const { AtomicU8::new(0) }; CAP];
+        let make = |k: u32| -> Shape { (false, [k; 14], [k + 100; 14]) };
+
+        // Two backing heaps (4 slots each); slot 0 of heap_a holds shape 0
+        // permanently, while heap_b holds shapes 1..3 and is later dropped.
+        let mut heap_a = [[0u32; 8]; 4];
+        let mut heap_b = [[0u32; 8]; 4];
+        for k in 0..CAP as u32 {
+            let (res, grew) = shapes.insert(make(k), CAP, &pinned, &alive, &generations);
+            assert!(grew);
+            let (code, idx) = res.unwrap();
+            let [i, generation] = placed_words(code, 0x1000);
+            let dst = if k == 0 {
+                &mut heap_a[0]
+            } else {
+                &mut heap_b[k as usize]
+            };
+            write_record(dst.as_mut_ptr() as u64, i, generation);
+            pinned[idx as usize].fetch_sub(1, Release);
+        }
+        assert_eq!(shapes.list.len(), CAP);
+
+        let heaps = [
+            ViewHeap {
+                start: heap_a.as_ptr() as u64,
+                count: 4,
+                at: 1,
+            },
+            ViewHeap {
+                start: heap_b.as_ptr() as u64,
+                count: 4,
+                at: 2,
+            },
+        ];
+
+        // All 4 shapes are in live heaps, so none are evicted.
+        assert_eq!(shapes.sweep(&heaps, &pinned, &alive, &generations), 0);
+        assert_eq!(
+            shapes.insert(make(99), CAP, &pinned, &alive, &generations),
+            (None, false)
+        );
+
+        // Pin slot 1 in-flight, drop heap_b, and sweep: slot 1 stays protected
+        // while slots 2 and 3 are reclaimed and their generations advance.
+        pin_shape(1, &pinned, &generations);
+        assert_eq!(shapes.sweep(&heaps[..1], &pinned, &alive, &generations), 2);
+        assert!(alive[1].load(Acquire));
+        assert!(!alive[2].load(Acquire));
+        assert_eq!(generations[2].load(Acquire), 1);
+
+        // Unpin slot 1 after publication: now it is reclaimed too.
+        pinned[1].fetch_sub(1, Release);
+        assert_eq!(shapes.sweep(&heaps[..1], &pinned, &alive, &generations), 1);
+        assert!(!alive[1].load(Acquire));
+        assert_eq!(generations[1].load(Acquire), 1);
+        assert!(alive[0].load(Acquire));
+
+        // Shape 0 is still intact; a new shape reuses one of the freed slots
+        // with generation 1.
+        assert_eq!(shapes.get(&make(0), &pinned, &generations), Some((0, 0)));
+        pinned[0].fetch_sub(1, Release);
+        let (reused, grew) = shapes.insert(make(99), CAP, &pinned, &alive, &generations);
+        assert!(!grew);
+        let (code, idx) = reused.unwrap();
+        assert!(matches!(idx, 1..=3));
+        assert_eq!((code >> SHAPE_BITS) as u8, 1);
+        pinned[idx as usize].fetch_sub(1, Release);
+        assert_eq!(shapes.list.len(), CAP);
+
+        // A slot at generation `u8::MAX` retires instead of wrapping around.
+        generations[idx as usize].store(u8::MAX, Release);
+        let freed_at_max = shapes.sweep(&heaps[..1], &pinned, &alive, &generations);
+        assert!(freed_at_max >= 1);
+        assert!(!alive[idx as usize].load(Acquire));
+        assert!(!shapes.free.contains(&idx));
+
+        // A scratch copy keeps resolving after its source shape is reclaimed.
+        let src_heap = owner(
+            HeapDesc { kind: VIEWS_KIND, count: 4, flags: SHADER_VISIBLE, nodes: 1 },
+            Placement { address: 0, size: 0 },
+        );
+        let src_slot = heap(src_heap.0).start;
+        let mut dst_slot = [0u64; 4];
+        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee8_0000 + k as u32);
+        let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a78_0000 + k as u32);
+        (desc[10], desc[11]) = (0x2000, 0x2);
+        create_placed_srv(
+            std::ptr::null(),
+            &resource,
+            &desc,
+            src_slot,
+        );
+        // SAFETY: `src_slot` holds a 32-byte record.
+        let [_, src_i, src_generation] = unsafe { read_record_atomic(src_slot) };
+        assert_eq!(src_generation >> KIND_SHIFT, PLACED);
+        copy_simple(
+            std::ptr::null(),
+            1,
+            dst_slot.as_mut_ptr() as u64,
+            src_slot,
+            VIEWS_KIND,
+        );
+        // SAFETY: `dst_slot` holds a 32-byte record.
+        let copied = unsafe { read_record_atomic(dst_slot.as_ptr() as u64) };
+        assert_eq!(
+            copied[2] >> KIND_SHIFT,
+            SCRATCH_PLACED,
+            "copied outside VIEW_HEAPS becomes a scratch entry"
+        );
+        {
+            let mut shapes = SHAPES.write().unwrap();
+            let code = (payload(src_i, src_generation) >> PLACED_ADDRESS_BITS) as usize;
+            let source = code & SHAPE_INDEX_MASK;
+            // Reclaim only this test's shape so parallel tests keep their shapes.
+            let pinned: Vec<_> = (0..shapes.list.len())
+                .map(|idx| AtomicU32::new(u32::from(idx != source)))
+                .collect();
+            assert_eq!(shapes.sweep(&[], &pinned, &SHAPE_ALIVE, &SHAPE_GENERATIONS), 1);
+        }
+        assert!(placed_of(src_i, src_generation).is_none());
+        assert_eq!(
+            view(dst_slot.as_ptr() as u64),
+            Some(View::Placed(false, resource, desc))
+        );
+        let dst_heap = owner(
+            HeapDesc { kind: VIEWS_KIND, count: 4, flags: SHADER_VISIBLE, nodes: 1 },
+            Placement { address: 0, size: 0 },
+        );
+        let heap_slot = heap(dst_heap.0).start;
+        // SAFETY: `dst_slot` and `heap_slot` are both 32-byte descriptor slots.
+        unsafe {
+            std::ptr::copy(dst_slot.as_ptr() as *const u8, heap_slot as *mut u8, 32);
+        }
+        assert_eq!(
+            view(heap_slot),
+            Some(View::Placed(false, resource, desc)),
+            "raw-byte copy into registered heap remains addressable"
+        );
+    }
+
+    /// Shape reclamation at the 16,384-slot bound correctly sweeps and reclaims
+    /// unreferenced shapes while preserving shapes referenced by live heaps,
+    /// allowing subsequent insertions to reuse evicted slots with advancing generations.
+    #[test]
+    fn shapes_table_reclamation_at_16384_bound() {
+        use std::sync::atomic::{
+            AtomicBool, AtomicU8, AtomicU32, Ordering::Acquire, Ordering::Release,
+        };
+        let mut shapes = Shapes {
+            list: Vec::new(),
+            index: std::collections::BTreeMap::new(),
+            free: Vec::new(),
+            last_sweep_epoch: 0,
+            misses_since_sweep: 0,
+        };
+        let pinned: Vec<AtomicU32> = (0..SHAPE_LIMIT).map(|_| AtomicU32::new(0)).collect();
+        let alive: Vec<AtomicBool> = (0..SHAPE_LIMIT).map(|_| AtomicBool::new(false)).collect();
+        let generations: Vec<AtomicU8> = (0..SHAPE_LIMIT).map(|_| AtomicU8::new(0)).collect();
+        let make = |k: u32| -> Shape { (false, [k; 14], [k + 100; 14]) };
+
+        // Fill shapes table to its 16,384-slot bound.
+        for k in 0..SHAPE_LIMIT as u32 {
+            let (res, grew) = shapes.insert(make(k), SHAPE_LIMIT, &pinned, &alive, &generations);
+            assert!(grew);
+            let (_code, idx) = res.unwrap();
+            pinned[idx as usize].fetch_sub(1, Release);
+        }
+        assert_eq!(shapes.list.len(), SHAPE_LIMIT);
+
+        // At capacity, new insertions fail without sweeping.
+        assert_eq!(
+            shapes.insert(make(999_999), SHAPE_LIMIT, &pinned, &alive, &generations),
+            (None, false)
+        );
+
+        // Create a single backing heap referencing only slot 0.
+        let mut heap_slot = [0u32; 8];
+        let [i, generation] = placed_words(0, 0x1000);
+        write_record(heap_slot.as_mut_ptr() as u64, i, generation);
+        let heaps = [ViewHeap {
+            start: heap_slot.as_ptr() as u64,
+            count: 1,
+            at: 1,
+        }];
+
+        // Sweep reclaims the 16,383 unreferenced shapes while keeping slot 0 live.
+        let freed = shapes.sweep(&heaps, &pinned, &alive, &generations);
+        assert_eq!(freed, SHAPE_LIMIT - 1);
+        assert!(alive[0].load(Acquire));
+        for idx in 1..SHAPE_LIMIT {
+            assert!(!alive[idx].load(Acquire));
+            assert_eq!(generations[idx].load(Acquire), 1);
+        }
+
+        // Subsequent insertion reuses an evicted slot with generation 1 instead of growing.
+        let (reused, grew) = shapes.insert(make(999_999), SHAPE_LIMIT, &pinned, &alive, &generations);
+        assert!(!grew);
+        let (code, idx) = reused.unwrap();
+        assert_ne!(idx, 0);
+        assert_eq!((code >> SHAPE_BITS) as u8, 1);
+        pinned[idx as usize].fetch_sub(1, Release);
+        assert_eq!(shapes.list.len(), SHAPE_LIMIT);
+    }
+
+    /// Concurrent writers to the same slot never interleave their stores,
+    /// combine fields from different writes, or resolve to a mixed shape.
+    #[test]
+    fn same_slot_writers_never_combine_fields_or_resolve_to_mixed_shape() {
+        let heap_owner = owner(
+            HeapDesc { kind: VIEWS_KIND, count: 4, flags: SHADER_VISIBLE, nodes: 1 },
+            Placement { address: 0, size: 0 },
+        );
+        let slot = heap(heap_owner.0).start;
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for t in 0..4u32 {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let null = std::ptr::null();
+                    let mut resource: [u32; 14] = [0; 14];
+                    resource[0] = 3;
+                    resource[6] = 1;
+                    resource[7] = 1 | 1 << 16;
+                    resource[8] = 28;
+                    resource[9] = 1;
+                    resource[11] = 0x100 + t;
+                    let mut desc: [u32; 16] = [0; 16];
+                    desc[0] = 28;
+                    desc[1] = 4;
+                    desc[2] = 0x1688 + t;
+                    desc[5] = 1;
+                    let address = 0x6_0000_0000 + (u64::from(t) << 16);
+                    (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+                    barrier.wait();
+                    for _ in 0..2000 {
+                        create_placed_srv(null, &resource, &desc, slot);
+                        if let Some(View::Placed(false, r, d)) = view(slot) {
+                            let thread_id = r[11] - 0x100;
+                            assert!(thread_id < 4, "valid thread id");
+                            assert_eq!(d[2], 0x1688 + thread_id, "shape must not be mixed");
+                            let expected_addr = 0x6_0000_0000 + (u64::from(thread_id) << 16);
+                            assert_eq!(
+                                (u64::from(d[11]) << 32 | u64::from(d[10])),
+                                expected_addr,
+                                "address must match shape"
+                            );
+                        }
+                    }
+                });
+            }
+        });
+        let final_view = view(slot);
+        assert!(final_view.is_some(), "slot must resolve after writes finish");
+        if let Some(View::Placed(false, r, d)) = final_view {
+            let thread_id = r[11] - 0x100;
+            assert!(thread_id < 4);
+            assert_eq!(d[2], 0x1688 + thread_id);
+            let expected_addr = 0x6_0000_0000 + (u64::from(thread_id) << 16);
+            assert_eq!((u64::from(d[11]) << 32 | u64::from(d[10])), expected_addr);
+        } else {
+            panic!("unexpected view: {:?}", final_view);
+        }
+    }
+
     /// A record copied as bytes names its constant buffer or placed view
     /// wherever it lands, as an entry's record does.
     #[test]
@@ -2036,7 +2833,16 @@ pub(crate) mod tests {
         create_cbv(null, &[0x2000, 7, 1 << 16, 0], at(0));
         create_placed_uav(null, &resource, &desc, at(1));
         let (dst, dst_n, src, src_n) = ([at(2)], [2u32], [at(0), at(1)], [1u32, 1]);
-        copy(null, 1, dst.as_ptr(), dst_n.as_ptr(), 2, src.as_ptr(), src_n.as_ptr(), 0);
+        copy(
+            null,
+            1,
+            dst.as_ptr(),
+            dst_n.as_ptr(),
+            2,
+            src.as_ptr(),
+            src_n.as_ptr(),
+            0,
+        );
         assert_eq!(view(at(2)), Some(View::Constant(0x7_0000_2000, 1 << 16)));
         assert_eq!(view(at(3)), Some(View::Placed(true, resource, desc)));
     }
@@ -2334,7 +3140,7 @@ pub(crate) mod tests {
                             let slot = FIRST + ((seed >> 20) % span) as u32;
                             // A third of the writes into the heap no sync
                             // looks at: by calls only.
-                            let own = (seed >> 48) % 3 == 0;
+                            let own = (seed >> 48).is_multiple_of(3);
                             let views = own || what & 1 == 1;
                             let (kind, step) = if views { (VIEWS_KIND, 32u64) } else { (SAMPLERS, 16) };
                             let start = if own { unwatched_start } else { base(usize::from(views)) };
@@ -2479,7 +3285,7 @@ pub(crate) mod tests {
                         let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
                         let mut view = [0u32; 16];
                         view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
-                        let address = textures_at + ((round + t) % 16 << 12);
+                        let address = textures_at + (((round + t) % 16) << 12);
                         (view[10], view[11]) = (address as u32, (address >> 32) as u32);
                         barrier.wait();
                         for i in FIRST..SLOTS {

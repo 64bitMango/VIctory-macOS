@@ -256,6 +256,10 @@ fn set_dirty(bit: Option<u32>, dirty: bool) {
     }
 }
 
+pub(crate) fn dirty_word(word: u32) -> u64 {
+    DIRTY[word as usize].load(Ordering::Acquire)
+}
+
 /// Whether the tracker with bit `bit` holds no changed page (see
 /// [`Tracked::clean`]).
 pub(crate) fn clean_bit(bit: Option<u32>) -> bool {
@@ -984,18 +988,12 @@ impl Tracked {
 
     /// Shaders may write the copy's bytes `[from, to)` until [`Tracked::disarm`]:
     /// pages there written next after they were taken have their bytes kept
-    /// first ([`Tracked::saved`]).
+    /// first ([`Tracked::take_saved_for_copy_back`]).
     pub(crate) fn arm(&self, from: usize, to: usize) {
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from < to {
             self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).armed.extend(from / PAGE..to.div_ceil(PAGE));
         }
-    }
-
-    /// Page `page` (a page number) needs no saving any more: its copy-back
-    /// is under way.
-    pub(crate) fn unarm(&self, page: usize) {
-        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).armed.remove(&page);
     }
 
     /// No shader writes the copy any more: nothing is armed or kept.
@@ -1007,11 +1005,13 @@ impl Tracked {
 
     /// The bytes page `page` (a page number) held when it was first written
     /// since it was taken, if it was armed then (and so changed).
-    pub(crate) fn saved(&self, page: usize) -> Option<Box<[u8]>> {
-        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page)
+    pub(crate) fn take_saved_for_copy_back(&self, page: usize) -> Option<Box<[u8]>> {
+        let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        saved.armed.remove(&page);
+        saved.bytes.remove(&page)
     }
 
-    /// A copy of what [`Tracked::saved`] would hand out, which stays (the
+    /// A copy of what [`Tracked::take_saved_for_copy_back`] would hand out, which stays (the
     /// checker of `crate::unwaited` looks before the copy-back takes it).
     pub(crate) fn saved_peek(&self, page: usize) -> Option<Box<[u8]>> {
         self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.get(&page).cloned()
@@ -1254,6 +1254,11 @@ fn changed_noting(g: &mut Guards, first: usize, last: usize, save: bool, opened:
 /// [`changed`] of `[first, last)` alone. With `save`, before the write
 /// lands: trackers armed for a page they had taken keep its bytes.
 fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool, mut opened: Option<&mut Vec<(usize, usize)>>) -> bool {
+    // The write handler opens one page and does not need a list of runs.
+    if last - first == 1 && opened.is_none() {
+        mark(g, first, last, save);
+        return open(g, first);
+    }
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
     // Marked while still read-only, so that a block is never open without
     // its trackers knowing: a fault on a block found open ([`OPENED`]) goes
@@ -2281,6 +2286,7 @@ pub(crate) mod tests {
         assert_eq!(calls(), before, "no protection changed");
         // A write during the rest: no fault to say so, and it is told all
         // the same, as often as asked.
+        // SAFETY: The byte is within the live test mapping.
         unsafe { ((p + 9) as *mut u8).write_volatile(2) };
         for _ in 0..3 {
             assert_eq!(t.take_resting(all.0, all.1), [(p, p + PAGE)], "a write during the rest is told");
@@ -2295,6 +2301,7 @@ pub(crate) mod tests {
         assert!(opened(p / PAGE).is_none());
         assert!(t.take_resting(all.0, all.1).is_empty(), "and not told again");
         // A write now faults, and is told.
+        // SAFETY: The byte is within the live test mapping.
         unsafe { ((p + 10) as *mut u8).write_volatile(3) };
         assert!(t.changed(p / PAGE) && writable(p));
         // A rest of nothing: guarded at once, as before.
@@ -2321,6 +2328,7 @@ pub(crate) mod tests {
         assert!(writable(p) && !a.clean() && !b.clean());
         // `b` takes it for good: read-only from here, and `a` is told what
         // was written while it was open.
+        // SAFETY: the byte is within the live test mapping.
         unsafe { ((p + 1) as *mut u8).write_volatile(2) };
         assert_eq!(b.take(all.0, all.1), [all]);
         assert!(read_only(p) && b.clean() && !a.clean());
@@ -2380,6 +2388,7 @@ pub(crate) mod tests {
         assert!(writable(b) && read_only(a) && t.changed(a / PAGE));
         assert_eq!(t.take_resting(a, a + PAGE), [(a, a + PAGE)]);
         assert!(writable(b) && t.changed(a / PAGE), "the written view left open, the page still marked");
+        // SAFETY: the byte is within the live test mapping.
         unsafe { ((b + 1) as *mut u8).write_volatile(2) };
         assert_eq!(t.take_resting(a, a + PAGE), [(a, a + PAGE)], "a write during the rest is told");
         rest(20);

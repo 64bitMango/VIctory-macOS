@@ -251,6 +251,7 @@ struct Again {
 }
 
 /// The words of a text, those in double quotes as one.
+#[cfg(any(windows, test))]
 fn words(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut word = String::new();

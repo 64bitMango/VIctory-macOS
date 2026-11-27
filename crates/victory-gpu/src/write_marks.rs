@@ -160,9 +160,7 @@ impl Maps {
         Maps { start, count, slots: leak(count), chunks: leak(count.div_ceil(CHUNK)), writers }
     }
 
-    /// Marks slot `slot` (in the heap: checked by the caller), as a stub
-    /// does (tests).
-    #[cfg(test)]
+    /// Marks slot `slot` (in the heap: checked by the caller), as a stub does.
     fn mark_slot(&self, slot: usize) {
         self.slots[slot].store(1, Release);
         self.chunks[slot / CHUNK].store(1, Release);
@@ -250,7 +248,7 @@ fn adopt_now(start: u64, count: u32) -> bool {
         start = format_args!("{start:#x}"),
         count,
         stores = IMAGE[2].load(Relaxed),
-        "write marks: the title's view heap is synced by the slots its stores, copies and our calls mark (VICTORY_WRITE_MARKS)"
+        "write marks: the title's view heap is synced by the slots its stores, memory functions and our calls mark (VICTORY_WRITE_MARKS)"
     );
     true
 }
@@ -301,16 +299,16 @@ unsafe fn mark_cell(slot: usize) {
     }
 }
 
-/// The runtime's own `memcpy` and `memmove` ([`import`]).
-static REAL: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
+/// The runtime memory functions wrapped by [`import`].
+static REAL: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
 
 /// What the title's import `name` (bound to `address`) is bound to: with the
-/// switch, its `memcpy` and `memmove` go through ours, which mark the view
-/// records they copy into the marked heap.
+/// switch, memory copies and fills mark any descriptor records they touch.
 pub fn import(name: &str, address: usize) -> usize {
     let (which, ours) = match name {
         "memcpy" => (0, copy as *const () as usize),
         "memmove" => (1, shift as *const () as usize),
+        "memset" => (2, fill as *const () as usize),
         _ => return address,
     };
     if !on() || address == 0 {
@@ -340,28 +338,52 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
     let real: Copy = unsafe { std::mem::transmute::<usize, Copy>(real) };
     // SAFETY: by the caller.
     let out = unsafe { real(to, from, n) };
-    let len = CELLS.len.load(Acquire);
-    if len != 0 && n >= 4 {
-        let start = CELLS.start.load(Relaxed);
-        let (lo, hi) = ((to as u64).max(start), (to as u64).saturating_add(n as u64).min(start + len));
-        if lo < hi {
-            STATS[S_COPIES].fetch_add(1, Relaxed);
-            // Each slot whose first word lies in the copy and is a view's.
-            let mut slot = (lo - start).div_ceil(SLOT);
-            let mut marked = 0;
-            while start + slot * SLOT + 4 <= hi {
-                // SAFETY: just written by the copy, inside the heap.
-                if unsafe { ((start + slot * SLOT) as *const u32).read_unaligned() } == crate::descriptor::VIEW_TAG {
-                    // SAFETY: below the length's slots (checked by the loop).
-                    unsafe { mark_cell(slot as usize) };
-                    marked += 1;
-                }
-                slot += 1;
-            }
-            STATS[S_COPY_MARKS].fetch_add(marked, Relaxed);
-        }
-    }
+    mark_written(to as u64, n);
     out
+}
+
+unsafe extern "system-unwind" fn fill(to: *mut u8, value: i32, n: usize) -> *mut u8 {
+    type Fill = unsafe extern "system-unwind" fn(*mut u8, i32, usize) -> *mut u8;
+    // SAFETY: import saved the runtime function with this signature.
+    let real: Fill = unsafe { std::mem::transmute(REAL[2].load(Relaxed)) };
+    // SAFETY: forward the original call's arguments.
+    let out = unsafe { real(to, value, n) };
+    mark_written(to as u64, n);
+    out
+}
+
+/// Mark writes to any part of a record's tag, index, or generation.
+#[inline]
+fn mark_written(to: u64, n: usize) {
+    let len = CELLS.len.load(Acquire);
+    if len == 0 || n == 0 {
+        return;
+    }
+    let start = CELLS.start.load(Relaxed);
+    let end = to.saturating_add(n as u64);
+    if to >= start + len || end <= start {
+        return;
+    }
+    let Some(maps) = maps_for(start) else {
+        return;
+    };
+    let lo = to.max(maps.start);
+    let hi = end.min(maps.start + maps.count as u64 * SLOT);
+    if lo >= hi {
+        return;
+    }
+    let offset = lo - start;
+    let mut first = offset / SLOT;
+    // The remaining bytes in a 32-byte slot do not affect its view record.
+    first += u64::from(offset % SLOT >= 12);
+    let last = (hi - start).div_ceil(SLOT);
+    for slot in first..last {
+        maps.mark_slot(slot as usize);
+    }
+    if first < last {
+        STATS[S_COPIES].fetch_add(1, Relaxed);
+        STATS[S_COPY_MARKS].fetch_add(last - first, Relaxed);
+    }
 }
 
 /// Frames between askings of the write watch for the fallback
@@ -587,7 +609,7 @@ pub(crate) fn line(frames: f64) {
     let marks = if working() && maps_for(CELLS.start.load(Relaxed)).is_some() {
         format!(
             "write marks (VICTORY_WRITE_MARKS, {} stores): {:.0} slots taken by their marks in {:.2} ms ({:.0} marked by our calls; \
-             {:.0} title copies into the heap marked {:.0}); fallback (asked every {} frames, {} pages a frame): {:.1} pages read whole, \
+             {:.0} title memory writes into the heap marked {:.0}); fallback (asked every {} frames, {} pages a frame): {:.1} pages read whole, \
              {:.2} unmarked view records ({:.2} of them at slots made from another record before), {:.1} marked and not taken yet, {:.0} other records, \
              asking {:.2} ms; block tails: {:.0} read, {:.2} unmarked view records there; unmarked since the start {} (by the code that last opened their block with a write fault: {})",
             IMAGE[2].load(Relaxed),
@@ -699,6 +721,55 @@ pub(crate) mod tests {
         assert!(maps_for(start).is_none());
         assert_eq!(CELLS.len.load(Acquire), 0);
         assert!(!maps.marked(5), "nothing marked once the heap went");
+    }
+
+    #[test]
+    fn bulk_writes_mark_partial_records_and_skip_padding() {
+        let _one = ADOPTING.lock().unwrap_or_else(|e| e.into_inner());
+        let start = 0x7_2000_0000;
+        let maps = adopt_for_test(start, 4);
+        mark_written(start - 2, 3);
+        mark_written(start + SLOT + 8, 1);
+        mark_written(start + SLOT * 2 + 12, 20);
+        mark_written(start + SLOT * 4 - 32, 64);
+        mark_written(start + SLOT * 2, 0);
+        assert_eq!(maps.take(), [(0, 2), (3, 1)]);
+        let_go(start);
+    }
+
+    #[test]
+    fn fill_wrapper_forwards_arguments_marks_writes_and_returns_destination() {
+        let _one = ADOPTING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buffer = [0u8; 128];
+        let start = buffer.as_mut_ptr() as u64;
+        let maps = adopt_for_test(start, 4);
+
+        unsafe extern "system-unwind" fn mock_memset(to: *mut u8, value: i32, n: usize) -> *mut u8 {
+            // SAFETY: caller passes a valid writable buffer of `n` bytes.
+            unsafe { std::ptr::write_bytes(to, value as u8, n) };
+            to
+        }
+
+        REAL[2].store(mock_memset as *const () as usize, Relaxed);
+        // SAFETY: offset 8 is within the 128-byte local buffer.
+        let dst = unsafe { buffer.as_mut_ptr().add(8) };
+        // SAFETY: writing 12 bytes at offset 8 stays within `buffer`.
+        let returned = unsafe { fill(dst, 0x5a, 12) };
+        assert_eq!(returned, dst);
+        assert_eq!(&buffer[..8], &[0u8; 8]);
+        assert_eq!(&buffer[8..20], &[0x5a; 12]);
+        assert_eq!(&buffer[20..], &[0u8; 108]);
+        assert_eq!(maps.take(), [(0, 1)]);
+
+        // SAFETY: offset 36 is within the 128-byte local buffer.
+        let dst2 = unsafe { buffer.as_mut_ptr().add(32 + 4) };
+        // SAFETY: writing 8 bytes at offset 36 stays within `buffer`.
+        let ret2 = unsafe { fill(dst2, 0xa5, 8) };
+        assert_eq!(ret2, dst2);
+        assert_eq!(&buffer[36..44], &[0xa5; 8]);
+        assert_eq!(maps.take(), [(1, 1)]);
+
+        let_go(start);
     }
 
     #[test]

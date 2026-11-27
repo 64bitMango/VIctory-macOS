@@ -172,6 +172,7 @@ mod tests {
 
 /// A decoded masked store, enough to redo it with plain stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(windows, test))]
 pub(crate) struct Store {
     /// Instruction length in bytes.
     pub len: usize,
@@ -195,6 +196,7 @@ pub(crate) struct Store {
     pub plain: Option<(u8, u8, u8, Option<u8>, u8)>,
 }
 
+#[cfg(any(windows, test))]
 impl Store {
     fn lanes(&self) -> usize {
         match (self.ymm, self.wide_lanes) {
@@ -203,6 +205,7 @@ impl Store {
             (false, true) => 2,
         }
     }
+    #[cfg(windows)]
     fn lane_bytes(&self) -> u8 {
         if self.wide_lanes { 8 } else { 4 }
     }
@@ -211,6 +214,7 @@ impl Store {
         self.modrm >> 6 == 0 && self.modrm & 7 == 5
     }
     /// A SIB with no base (mod 0, base 5): an absolute disp32.
+    #[cfg(windows)]
     fn no_base(&self) -> bool {
         self.modrm >> 6 == 0 && self.sib.is_some_and(|s| s & 7 == 5)
     }
@@ -222,6 +226,7 @@ impl Store {
 
 /// The memory operand whose ModRM byte is at `at`: ModRM, the SIB byte if
 /// any, the displacement, and where the operand ends.
+#[cfg(any(windows, test))]
 fn operand(code: &[u8], at: usize) -> Option<(u8, Option<u8>, i32, usize)> {
     let modrm = *code.get(at)?;
     let mut end = at + 1;
@@ -248,6 +253,7 @@ fn operand(code: &[u8], at: usize) -> Option<(u8, Option<u8>, i32, usize)> {
 }
 
 /// Decodes the whole masked store at `at`: its operands and length.
+#[cfg(any(windows, test))]
 pub(crate) fn decode_store(code: &[u8], at: usize) -> Option<Store> {
     let (kind, ymm) = decode(code, at)?;
     let (b1, b2) = (code[at + 1], code[at + 2]);
@@ -287,6 +293,7 @@ pub(crate) fn decode_store(code: &[u8], at: usize) -> Option<Store> {
 /// masked stores and the scan does not look for them, so only RVAs named
 /// in `VICTORY_PATCH_MASKED` are decoded this way. Under 5 bytes there is
 /// no room for the jump, so those are left alone.
+#[cfg(any(windows, test))]
 pub(crate) fn decode_wide_move(code: &[u8], at: usize) -> Option<Store> {
     let (b1, b2, vex) = match *code.get(at)? {
         0xc4 => (*code.get(at + 1)?, *code.get(at + 2)?, 3),
@@ -325,12 +332,14 @@ pub(crate) fn decode_wide_move(code: &[u8], at: usize) -> Option<Store> {
 }
 
 /// Bytes the stack moves before the trampoline's `lea`: rax, rcx, flags.
+#[cfg(windows)]
 const PUSHED: i32 = 24;
 
 /// The trampoline for `s`, placed at `at`, for the store at `site`: the
 /// same stores done one lane at a time with plain `mov`s (which Rosetta
 /// can resume after a fault), then a jump back past the store. Flags,
 /// rax, rcx and the vector registers are kept.
+#[cfg(windows)]
 pub(crate) fn trampoline(s: &Store, site: u64, at: u64) -> Option<Vec<u8>> {
     let mut c = vec![0x50, 0x51, 0x9c]; // push rax; push rcx; pushfq
     // lea rax, [operand]
@@ -416,6 +425,7 @@ pub(crate) fn trampoline(s: &Store, site: u64, at: u64) -> Option<Vec<u8>> {
 }
 
 /// Restores flags, rcx and rax, and jumps back past the store.
+#[cfg(windows)]
 fn tail(mut c: Vec<u8>, site: u64, len: usize, at: u64) -> Option<Vec<u8>> {
     c.extend_from_slice(&[0x9d, 0x59, 0x58]); // popfq; pop rcx; pop rax
     let back = (site as i64) + len as i64;

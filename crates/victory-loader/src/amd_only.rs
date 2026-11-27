@@ -13,6 +13,9 @@
 //!   at their first exception by a jump over themselves ([`replace_wait`],
 //!   `VICTORY_PATCH_WAITS=0`: emulated each time). Found by the exception and
 //!   not by their three bytes, which other instructions' operands hold too.
+//! - `extrq` and `insertq` are redirected to SSE2 stubs at load
+//!   (`VICTORY_PATCH_SSE4A=0`: leave them to the handler). Four-byte forms
+//!   use a short jump to a relay in nearby executable padding.
 //!
 //! Diagnostics builds log the counts per frame ([`log_emulated`]).
 
@@ -170,6 +173,196 @@ pub(crate) fn clzero_stub(l: &ClzeroLoop, code_at: u64, stub: u64) -> Option<Vec
     code.extend([0x72, back as u8]);
     let here = stub + code.len() as u64;
     code.extend(jump(here, code_at + l.end as u64)?);
+    Some(code)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Sse4a {
+    pub len: usize,
+    pub dst: u8,
+    pub src: u8,
+    pub insert: bool,
+    pub immediate: Option<[u8; 2]>,
+}
+
+pub(crate) fn decode_sse4a(code: &[u8]) -> Option<Sse4a> {
+    let (&prefix, rest) = code.split_first()?;
+    let insert = match prefix {
+        0x66 => false,
+        0xf2 => true,
+        _ => return None,
+    };
+    let (rex, rest) = match rest {
+        [rex @ 0x40..=0x4f, rest @ ..] => (*rex, rest),
+        _ => (0, rest),
+    };
+    let &[0x0f, opcode @ (0x78 | 0x79), modrm @ 0xc0..=0xff, ref tail @ ..] = rest else {
+        return None;
+    };
+    let src = modrm & 7 | (rex & 1) << 3;
+    let mut dst = (modrm >> 3) & 7 | (rex & 4) << 1;
+    let immediate = if opcode == 0x78 {
+        if !insert {
+            if modrm & 0x38 != 0 {
+                return None;
+            }
+            dst = src;
+        }
+        Some(tail.get(..2)?.try_into().ok()?)
+    } else {
+        None
+    };
+    Some(Sse4a {
+        len: 4 + usize::from(rex != 0) + 2 * usize::from(immediate.is_some()),
+        dst,
+        src,
+        insert,
+        immediate,
+    })
+}
+
+/// Saves flags and its three scratch GPRs. Legacy SSE2 loads and stores
+/// preserve the upper YMM lanes, and the stack slot preserves XMM[127:64].
+pub(crate) fn sse4a_body(op: Sse4a) -> Vec<u8> {
+    let mut code = vec![
+        0x9c, 0x50, 0x51, 0x52, // pushfq; push rax; push rcx; push rdx
+        0x48, 0x83, 0xec, 0x10, // sub rsp, 16
+    ];
+    let xmm_stack = |code: &mut Vec<u8>, reg: u8, opcode| {
+        code.push(0xf3);
+        if reg >= 8 {
+            code.push(0x44);
+        }
+        code.extend([0x0f, opcode, (reg & 7) << 3 | 4, 0x24]);
+    };
+    if let Some([len, index]) = op.immediate {
+        code.extend([0xb9, len, index, 0, 0]); // mov ecx, fields
+    } else {
+        xmm_stack(&mut code, op.src, 0x7f); // movdqu [rsp], xmmSrc
+        code.extend([0x8b, 0x4c, 0x24, if op.insert { 8 } else { 0 }]); // mov ecx, [rsp+half]
+    }
+    let value = if op.insert { op.src } else { op.dst };
+    code.extend([
+        0x66,
+        0x48 | ((value >> 3) << 2),
+        0x0f,
+        0x7e,
+        0xc0 | ((value & 7) << 3),
+    ]); // movq rax, xmmValue
+    xmm_stack(&mut code, op.dst, 0x7f); // movdqu [rsp], xmmDst
+    code.extend([
+        0x48, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, // mov rdx, -1
+        0x80, 0xe1, 0x3f, // and cl, 63
+        0x74, 0x06, // jz past mask construction (length zero means 64)
+        0x48, 0xd3, 0xe2, // shl rdx, cl
+        0x48, 0xf7, 0xd2, // not rdx
+        0xc1, 0xe9, 0x08, // shr ecx, 8 (64-bit shifts mask the count)
+    ]);
+    if op.insert {
+        code.extend([
+            0x48, 0x21, 0xd0, // and rax, rdx
+            0x48, 0xd3, 0xe0, // shl rax, cl
+            0x48, 0xd3, 0xe2, // shl rdx, cl
+            0x48, 0xf7, 0xd2, // not rdx
+            0x48, 0x23, 0x14, 0x24, // and rdx, [rsp]
+            0x48, 0x09, 0xd0, // or rax, rdx
+        ]);
+    } else {
+        code.extend([0x48, 0xd3, 0xe8, 0x48, 0x21, 0xd0]); // shr rax, cl; and rax, rdx
+    }
+    code.extend([0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
+    xmm_stack(&mut code, op.dst, 0x6f); // movdqu xmmDst, [rsp]
+    code.extend([0x48, 0x83, 0xc4, 0x10, 0x5a, 0x59, 0x58, 0x9d]); // add rsp, 16; pop rdx; pop rcx; pop rax; popfq
+    code
+}
+
+/// Decode from instruction boundaries so opcode bytes in immediates or
+/// displacements are skipped. Runs of INT3 after a terminal instruction
+/// can hold a jump relay for a four-byte register form.
+fn scan_sse4a(
+    code: &[u8],
+    start: u64,
+    targets: &mut std::collections::HashSet<u64>,
+) -> (Vec<(u64, Sse4a)>, Vec<u64>) {
+    use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind};
+
+    let mut branch_targets = targets.clone();
+    let mut decoder = Decoder::with_ip(64, code, start, DecoderOptions::AMD);
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if matches!(
+            instruction.op0_kind(),
+            OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+        ) {
+            let target = instruction.near_branch_target();
+            branch_targets.insert(target);
+            targets.insert(target);
+        }
+        if instruction.is_ip_rel_memory_operand() {
+            let base = instruction.ip_rel_memory_address();
+            let size = instruction.memory_size().size().max(1) as u64;
+            for b in base..base + size {
+                targets.insert(b);
+            }
+        }
+    }
+
+    let mut sites = Vec::new();
+    let mut relays = Vec::new();
+    let mut decoder = Decoder::with_ip(64, code, start, DecoderOptions::AMD);
+    let mut padding = 0;
+    let mut reachable = true;
+    while decoder.can_decode() {
+        let offset = decoder.position();
+        let instruction = decoder.decode();
+        let ip = instruction.ip();
+        if branch_targets.contains(&ip) {
+            reachable = true;
+        }
+        if padding != 0 && instruction.mnemonic() == Mnemonic::Int3 && instruction.len() == 1 {
+            padding += 1;
+            if padding == 6 {
+                let candidate = ip - 4;
+                if (candidate..candidate + 5).all(|b| !targets.contains(&b)) {
+                    relays.push(candidate);
+                }
+                padding = 1;
+            }
+        } else {
+            padding = usize::from(matches!(
+                instruction.flow_control(),
+                FlowControl::Return
+                    | FlowControl::UnconditionalBranch
+                    | FlowControl::IndirectBranch
+            ));
+        }
+        if reachable
+            && matches!(instruction.mnemonic(), Mnemonic::Extrq | Mnemonic::Insertq)
+            && let Some(op) = decode_sse4a(&code[offset..decoder.position()])
+            && op.len == instruction.len()
+        {
+            sites.push((ip, op));
+        }
+        if matches!(
+            instruction.flow_control(),
+            FlowControl::Return
+                | FlowControl::UnconditionalBranch
+                | FlowControl::IndirectBranch
+        ) {
+            reachable = false;
+        }
+    }
+    (sites, relays)
+}
+
+fn sse4a_redirect(site: u64, len: usize, stub: u64, relay: Option<u64>) -> Option<Vec<u8>> {
+    let mut code = if len >= 5 {
+        jump(site, stub)?.to_vec()
+    } else {
+        let displacement = i8::try_from(relay? as i64 - (site as i64 + 2)).ok()?;
+        vec![0xeb, displacement as u8]
+    };
+    code.resize(len, 0x90);
     Some(code)
 }
 
@@ -449,6 +642,165 @@ mod on_windows {
         (patched, left)
     }
 
+    /// Replaces decoded SSE4a instructions before the image can run.
+    /// Short sites without a reachable padding relay use the crash handler.
+    pub(crate) fn patch_sse4a(base: u64, info: &victory_pe::ImageInfo) {
+        if std::env::var("VICTORY_PATCH_SSE4A").is_ok_and(|value| value.trim() == "0") {
+            return;
+        }
+        use std::arch::x86_64::__cpuid;
+        if __cpuid(0x8000_0000).eax >= 0x8000_0001
+            && __cpuid(0x8000_0001).ecx & (1 << 6) != 0
+        {
+            return;
+        }
+        let sections = info.sections.iter().filter(|s| s.characteristics & EXECUTE != 0).map(|s| {
+            (base + u64::from(s.rva), s.virtual_size.min(s.file_size) as usize)
+        });
+        let entries = std::iter::once(info.entry_rva)
+            .chain(info.exports.iter().filter_map(|export| export.rva))
+            .chain(info.tls.iter().flat_map(|tls| tls.callback_rvas.iter().copied()))
+            .map(|rva| base + u64::from(rva));
+        // SAFETY: these sections have just been mapped and cannot run yet.
+        let (patched, left) = unsafe { patch_sse4a_in(base, sections, entries) };
+        if patched + left != 0 {
+            tracing::info!(patched, left, "SSE4a load-time patches");
+        }
+    }
+
+    /// The ranges must be mapped executable sections that cannot run during patching.
+    pub(crate) unsafe fn patch_sse4a_in(
+        base: u64,
+        sections: impl IntoIterator<Item = (u64, usize)>,
+        entries: impl IntoIterator<Item = u64>,
+    ) -> (usize, usize) {
+        let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut targets: std::collections::HashSet<_> = entries.into_iter().collect();
+        let mut sites = Vec::new();
+        let mut relays = Vec::new();
+        for (start, len) in sections {
+            // SAFETY: the caller provided mapped code.
+            let code = unsafe { std::slice::from_raw_parts(start as *const u8, len) };
+            let (mut found, mut padding) = scan_sse4a(code, start, &mut targets);
+            sites.append(&mut found);
+            relays.append(&mut padding);
+        }
+        if sites.is_empty() {
+            return (0, 0);
+        }
+        // Keep a trap anywhere a direct branch enters the padding.
+        relays.retain(|at| (*at..*at + 5).all(|byte| !targets.contains(&byte)));
+        let mut relays: std::collections::BTreeSet<_> = relays.into_iter().collect();
+        let mut pools = Vec::new();
+        let mut writes = Vec::new();
+        let total = sites.len();
+        let mut patched = 0;
+        for (site, op) in sites {
+            if (site + 1..site + op.len as u64).any(|byte| targets.contains(&byte)) {
+                continue;
+            }
+            let relay = if op.len < 5 {
+                let end = site + 2;
+                let Some(&at) = relays.range(end.saturating_sub(128)..=end + 127).next() else {
+                    continue;
+                };
+                Some(at)
+            } else {
+                None
+            };
+            let mut body = sse4a_body(op);
+            if pools
+                .last()
+                .is_none_or(|&(_, used)| used + body.len() + 5 > POOL)
+            {
+                let Some(at) = near(base) else {
+                    break;
+                };
+                pools.push((at, 0));
+            }
+            let (at, used) = pools.last_mut().unwrap();
+            let stub = *at + *used as u64;
+            let Some(back) = jump(stub + body.len() as u64, site + op.len as u64) else {
+                continue;
+            };
+            let Some(replacement) = sse4a_redirect(site, op.len, stub, relay) else {
+                continue;
+            };
+            let relay_jump = if let Some(relay) = relay {
+                let Some(bytes) = jump(relay, stub) else {
+                    continue;
+                };
+                relays.remove(&relay);
+                Some((relay, bytes))
+            } else {
+                None
+            };
+            body.extend(back);
+            // SAFETY: this stub fits within our writable pool.
+            unsafe { std::ptr::copy_nonoverlapping(body.as_ptr(), stub as *mut u8, body.len()) };
+            *used += body.len();
+            writes.push((*at, site, replacement, relay_jump));
+        }
+        for (at, _) in pools {
+            let mut old = 0;
+            // SAFETY: only publish redirects after their pool becomes executable.
+            if unsafe { VirtualProtect(at as *const _, POOL, PAGE_EXECUTE_READ, &mut old) } == 0 {
+                continue;
+            }
+            for (_, site, replacement, relay) in writes.iter().filter(|write| write.0 == at) {
+                if relay
+                    .as_ref()
+                    .is_none_or(|(at, bytes)| write_code(*at, bytes))
+                    && write_code(*site, replacement)
+                {
+                    patched += 1;
+                }
+            }
+        }
+        // SAFETY: flush our process's instruction cache before running the image.
+        unsafe { FlushInstructionCache(GetCurrentProcess(), std::ptr::null(), 0) };
+        (patched, total - patched)
+    }
+
+    fn write_code(mut at: u64, mut bytes: &[u8]) -> bool {
+        // Keep each page's original protection, even if the write crosses
+        // a page boundary. Loosen every touched page before writing.
+        let mut pages = [(0, 0); 2];
+        let mut count = 0;
+        let start = at;
+        let replacement = bytes;
+        while !bytes.is_empty() {
+            let len = bytes.len().min(4096 - (at as usize & 4095));
+            let mut old = 0;
+            // SAFETY: the scanner found this range in mapped executable code.
+            if unsafe { VirtualProtect(at as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) } == 0
+            {
+                break;
+            }
+            pages[count] = (at, old);
+            count += 1;
+            at += len as u64;
+            bytes = &bytes[len..];
+        }
+        let writable = bytes.is_empty();
+        if writable {
+            // SAFETY: all pages in this range are now writable.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    replacement.as_ptr(),
+                    start as *mut u8,
+                    replacement.len(),
+                )
+            };
+        }
+        for &(at, protection) in &pages[..count] {
+            let mut old = 0;
+            // SAFETY: a byte suffices to restore the protection for its page.
+            unsafe { VirtualProtect(at as *const _, 1, protection, &mut old) };
+        }
+        writable
+    }
+
     /// The plain stores are written: their memory becomes code.
     pub(crate) fn seal(pool: Option<(u64, usize)>) {
         if let Some((at, _)) = pool {
@@ -487,6 +839,43 @@ mod tests {
     /// `mov rax, rdx; add rdx, 0x40; clzero; cmp rdx, r8; jb`.
     const SECOND: [u8; 15] =
         [0x48, 0x89, 0xd0, 0x48, 0x83, 0xc2, 0x40, 0x0f, 0x01, 0xfc, 0x4c, 0x39, 0xc2, 0x72, 0xf1];
+
+    #[test]
+    fn sse4a_scan_skips_operands_and_finds_short_redirect_padding() {
+        let code = [
+            0xb8, 0x66, 0x0f, 0x79, 0xc1, // mov eax, 0xc1790f66
+            0x66, 0x0f, 0x79, 0xc1, // extrq xmm0, xmm1
+            0xf2, 0x0f, 0x79, 0xc1, // insertq xmm0, xmm1
+            0x66, 0x41, 0x0f, 0x78, 0xc0, 0, 0xff, // extrq xmm8, 0, 255
+            0xf2, 0x0f, 0x78, 0xc1, 15, 20, // insertq xmm0, xmm1, 15, 20
+            0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+        ];
+        let (sites, relays) = scan_sse4a(&code, 0x1000, &mut Default::default());
+        let locations: Vec<_> = sites.iter().map(|(ip, op)| (*ip, op.len, op.dst)).collect();
+        assert_eq!(locations, [(0x1005, 4, 0), (0x1009, 4, 0), (0x100d, 7, 8), (0x1014, 6, 0)]);
+        assert_eq!(relays, [0x101b]);
+        assert_eq!(sse4a_redirect(0x1005, 4, 0x2000, Some(relays[0])).unwrap(), [0xeb, 20, 0x90, 0x90]);
+        assert!(sse4a_redirect(0x1005, 4, 0x2000, None).is_none());
+    }
+
+    #[test]
+    fn skipped_inline_data_after_unconditional_jump_is_not_classified_as_site() {
+        let mut code = vec![0xeb, 0x06];
+        code.extend([0x66, 0x0f, 0x78, 0xc0, 0x08, 0x00]);
+        code.extend([0x8b, 0x05, 0xf4, 0xff, 0xff, 0xff, 0xc3]);
+        let (sites, _) = scan_sse4a(&code, 0x1000, &mut Default::default());
+        assert!(sites.is_empty(), "skipped constant must not be accepted as site");
+    }
+
+    #[test]
+    fn candidate_storage_referenced_by_data_is_rejected_as_relay() {
+        let mut code = vec![0x66, 0x0f, 0x79, 0xc1, 0xc3];
+        code.extend([0xcc, 0xcc, 0xcc, 0xcc, 0xcc]);
+        code.extend([0x8b, 0x05, 0xf5, 0xff, 0xff, 0xff, 0xc3]);
+        let (sites, relays) = scan_sse4a(&code, 0x1000, &mut Default::default());
+        assert_eq!(sites.len(), 1);
+        assert!(relays.is_empty(), "data-referenced padding must not be accepted as a relay");
+    }
 
     #[test]
     fn both_loops_are_found_with_their_ends() {

@@ -90,6 +90,7 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         path = %loaded.path.display(),
         "image mapped"
     );
+    crate::amd_only::patch_sse4a(loaded.base() as u64, &loaded.info);
     crate::threads::mapped(&loaded);
     Ok(loaded)
 }

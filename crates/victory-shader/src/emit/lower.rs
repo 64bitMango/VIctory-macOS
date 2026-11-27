@@ -71,7 +71,7 @@ pub(crate) struct Lowered {
     #[cfg(test)]
     pub wave_ops: bool,
     /// Whether it declares rasterizer-ordered views.
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub rovs: bool,
     /// Barriers added for narrow host waves ([`split_wave_barriers`]).
     #[cfg(test)]
@@ -2174,7 +2174,7 @@ impl<'a> Lower<'a> {
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            #[cfg(test)]
+            #[cfg(all(test, windows))]
             rovs: self.s.flags & flags::ROVS != 0,
             #[cfg(test)]
             split_barriers: self.split_barriers.len(),

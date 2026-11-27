@@ -163,6 +163,7 @@ impl Shadow {
     }
 
     /// The host GPU address of the copy's first byte.
+    #[expect(clippy::misnamed_getters, reason = "base is the host GPU base address")]
     pub(crate) fn base(&self) -> u64 {
         self.gpu
     }
@@ -571,8 +572,7 @@ impl Shadow {
                 continue;
             }
             // Our own write below must not save the page for this copy again.
-            t.unarm(page / PAGE);
-            let saved = t.saved(page / PAGE);
+            let saved = t.take_saved_for_copy_back(page / PAGE);
             if saved.is_none() && t.changed(page / PAGE) {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::MarkedKept, 1);
@@ -1176,6 +1176,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     let quick = marks_quick();
     #[cfg(feature = "diagnostics")]
     let scanning = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarksScanUs);
+    let mut used_words = None;
     for memory in [false, true] {
         let Some(b) = bitmap(memory) else {
             continue;
@@ -1186,7 +1187,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
         // Marks of offsets past the bitmap land in its last bit, no copy's.
         bits[words - 1] = 0;
-        let used = (marks().end as usize).div_ceil(32).min(words);
+        let used = *used_words.get_or_insert_with(|| (marks().end as usize).div_ceil(32).min(words));
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::MarksWords, used as u64);
         let into = if memory && memory_withheld { &mut held } else { &mut marked };
@@ -1235,7 +1236,21 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     }
     let pages: Vec<(Arc<Shadow>, usize)> = {
         let m = marks();
-        marked.iter().filter_map(|&n| page_of(&m, n)).collect()
+        // Sorted marks usually name consecutive pages of the same copy.
+        // Resolve its owner once and reuse it until the next copy.
+        let mut owner: Option<(u32, u32, Arc<Shadow>)> = None;
+        marked.iter().filter_map(|&n| {
+            if !owner.as_ref().is_some_and(|(base, end, _)| (*base..*end).contains(&n)) {
+                owner = m.owners.range(..=n).next_back().and_then(|(&base, copy)| {
+                    let copy = copy.upgrade()?;
+                    let end = base + pages(copy.start, copy.len);
+                    (n < end).then_some((base, end, copy))
+                });
+            }
+            let (base, _, copy) = owner.as_ref()?;
+            let page = (((copy.start >> 16) + u64::from(n - base)) << 16) as usize;
+            Some((copy.clone(), page))
+        }).collect()
     };
     // Per copy, in page order, so its pages go back together.
     let mut by_copy: Vec<(Arc<Shadow>, Vec<usize>)> = Vec::new();
@@ -1605,8 +1620,7 @@ fn marked_at_once(marked: &[(Arc<Shadow>, Vec<usize>)]) -> Option<usize> {
                 continue;
             }
             // Our own write below must not save the page for this copy again.
-            t.unarm(page / PAGE);
-            let before = match t.saved(page / PAGE) {
+            let before = match t.take_saved_for_copy_back(page / PAGE) {
                 Some(saved) => Before::Saved(saved, from - page),
                 None if t.changed(page / PAGE) => {
                     #[cfg(feature = "diagnostics")]
@@ -2406,15 +2420,15 @@ pub(crate) mod tests {
                         LOOKUPS_ALONE.with(|alone| alone.set(t % 3 == 2));
                         let mut seen = [0usize; 6];
                         for round in 0..2000u64 {
-                            for k in 0..6 {
+                            for (k, seen) in seen.iter_mut().enumerate() {
                                 let address = match k {
                                     0..4 => buffer(k) as u64 + 16 * (round % 8),
                                     _ => w + (k as u64 - 4) * WINDOW + 4096 * (round % 8),
                                 };
                                 let copy = find(address, 64).expect("a copy");
                                 let at = Arc::as_ptr(&copy) as usize;
-                                assert!(seen[k] == 0 || seen[k] == at, "another copy of range {k}");
-                                seen[k] = at;
+                                assert!(*seen == 0 || *seen == at, "another copy of range {k}");
+                                *seen = at;
                             }
                         }
                         seen.to_vec()
@@ -3541,9 +3555,11 @@ pub(crate) mod tests {
         assert_eq!(host(40), 0x11);
         assert!(tracked.rested(p, p + len) && !copy.clean(), "left open and marked");
         // Written again while it rests: no fault, and the next refresh has it.
+        // SAFETY: The byte is within the live test mapping.
         unsafe { title(41).write_volatile(0x22) };
         assert_eq!(copy.update_as(p, len, Take::Resting), PAGE, "copied again while it rests");
         assert_eq!(host(41), 0x22);
+        // SAFETY: The byte is within the live test mapping.
         unsafe { title(42).write_volatile(0x33) };
         // Shaders are to write the range: taken for good, with that write.
         copy.writing(p, len, true);
@@ -3551,6 +3567,7 @@ pub(crate) mod tests {
         assert_eq!(host(42), 0x33);
         // The shaders write a byte of page 0; the title another meanwhile.
         copy.write_host((p + 10) as u64, &[0xaa]);
+        // SAFETY: The byte is within the live test mapping.
         unsafe { title(50).write_volatile(0x44) };
         let bits = b.data as *mut u32;
         // SAFETY: a dword of the mapped bitmap.

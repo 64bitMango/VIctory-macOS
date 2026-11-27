@@ -155,6 +155,14 @@ struct Inner {
     ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
     /// The slots viewing each texture, and its host texture as last asked.
     textures: BTreeMap<usize, Texture>,
+    // Host creation or eviction can invalidate a staging bit. Each bucket
+    // remembers the epoch at which its cached records were last checked.
+    texture_hosts: crate::quick::Map<usize, (u64, crate::quick::Set<usize>)>,
+    // New records and textures without a write-watch bit need polling.
+
+    unchecked: crate::quick::Set<usize>,
+    // Only occupied write-watch words are read during candidate collection.
+    tracked: BTreeMap<u32, std::collections::BTreeSet<(u32, usize)>>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
     /// as ranges come and go (each list running heap shaders asks for all
     /// of them; rebuilt whole after every change, they cost 13-27 ms a frame,
@@ -181,6 +189,7 @@ struct Texture {
     host: Option<std::sync::Weak<crate::resource::HostTexture>>,
     staging: Option<std::sync::Weak<crate::texture::Staging>>,
     asked: u64,
+    bit: Option<u32>,
 }
 
 /// Whether [`uploads`] keeps what it found of a texture until its host
@@ -204,6 +213,19 @@ fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
 }
 
 impl Inner {
+    fn unindex(&mut self, resource: usize, bit: Option<u32>) {
+        self.unchecked.remove(&resource);
+        if let Some(bit) = bit {
+            let word = bit / 64;
+            if let Some(entries) = self.tracked.get_mut(&word) {
+                entries.remove(&(bit, resource));
+                if entries.is_empty() {
+                    self.tracked.remove(&word);
+                }
+            }
+        }
+    }
+
     /// Slot `index` views `seen` now (`add`) or no more; a buffer's range
     /// is counted in its copy's piece `piece`.
     fn count(&mut self, seen: &Seen, index: u32, add: bool, piece: u64) {
@@ -255,13 +277,26 @@ impl Inner {
                 }
             }
             Seen::Texture(r) if add => {
-                self.textures.entry(*r).or_default().slots.insert(index);
+                self.textures.entry(*r).or_insert_with(|| {
+                    self.unchecked.insert(*r);
+                    self.texture_hosts.entry(crate::resource::texture_host_bucket(*r)).or_default().1.insert(*r);
+                    Texture::default()
+                }).slots.insert(index);
             }
             Seen::Texture(r) => {
                 if let Some(texture) = self.textures.get_mut(r) {
                     texture.slots.remove(&index);
                     if texture.slots.is_empty() {
+                        let bit = texture.bit;
                         self.textures.remove(r);
+                        self.unindex(*r, bit);
+                        let bucket = crate::resource::texture_host_bucket(*r);
+                        if let Some((_, members)) = self.texture_hosts.get_mut(&bucket) {
+                            members.remove(r);
+                            if members.is_empty() {
+                                self.texture_hosts.remove(&bucket);
+                            }
+                        }
                     }
                 }
             }
@@ -293,16 +328,15 @@ impl Viewed {
         // Held until the counts are changed: another change to this slot
         // is counted after this one.
         let mut slots = self.slots[self.slots_part(index)].lock();
-        let old = match &seen {
-            Some(seen) => slots.insert(index, seen.clone()),
-            None => slots.remove(&index),
-        };
-        // The same range or texture as before: no count changes.
-        if let (Some(old), Some(new)) = (&old, &seen)
+        if let (Some(old), Some(new)) = (slots.get(&index), &seen)
             && old.same(new)
         {
             return;
         }
+        let old = match &seen {
+            Some(seen) => slots.insert(index, seen.clone()),
+            None => slots.remove(&index),
+        };
         for (seen, add) in [(old, false), (seen, true)] {
             if let Some(seen) = seen
                 && let Some((part, piece)) = self.counts_part(&seen)
@@ -526,7 +560,7 @@ pub(crate) fn uploads(
             work.push((staging.clone(), copy.clone()));
         }
     }
-    let mut done = crate::quick::Set::default();
+    let mut candidates = Vec::new();
     for viewed in heaps {
         let _held = viewed.hold();
         // Each part's textures with its lock held: a title texture is
@@ -539,13 +573,35 @@ pub(crate) fn uploads(
         // twenty submissions was most of this function's time.
         for part in viewed.counts.iter() {
             let mut inner = part.lock();
-            for (&r, known) in inner.textures.iter_mut() {
-                if !done.insert(r) {
-                    continue;
+            candidates.clear();
+            if !uploads_kept() {
+                candidates.extend(inner.textures.keys().copied());
+            } else {
+                candidates.extend(inner.unchecked.iter().copied());
+                for (&bucket, (seen, members)) in &mut inner.texture_hosts {
+                    let epoch = crate::resource::TEXTURE_HOST_EPOCHS[bucket].load(std::sync::atomic::Ordering::Acquire);
+                    if *seen != epoch {
+                        candidates.extend(members.iter().copied());
+                        *seen = epoch;
+                    }
                 }
+                for (&word, entries) in &inner.tracked {
+                    let mut dirty = crate::watch::dirty_word(word);
+                    while dirty != 0 {
+                        let bit = word * 64 + dirty.trailing_zeros();
+                        candidates.extend(entries.range((bit, 0)..=(bit, usize::MAX)).map(|&(_, r)| r));
+                        dirty &= dirty - 1;
+                    }
+                }
+                candidates.sort_unstable();
+                candidates.dedup();
+            }
+            for &r in &candidates {
+                let known = inner.textures.get_mut(&r).expect("indexed texture");
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::UploadsLooked, 1);
                 let now = crate::resource::hosts_changed(r as This);
+                let previous = known.bit;
                 let mut found = known.host.as_ref().and_then(std::sync::Weak::upgrade);
                 // Asked again also when the one found went (not expected
                 // while the count holds: the title texture holds its host
@@ -554,10 +610,11 @@ pub(crate) fn uploads(
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::UploadsAsked, 1);
                     found = crate::resource::made_copy(r as This);
-                    (known.host, known.staging, known.asked) = (found.as_ref().map(Arc::downgrade), None, now);
+                    (known.host, known.staging, known.asked, known.bit) = (found.as_ref().map(Arc::downgrade), None, now, None);
                 }
                 // Not made (given up, or never read): nothing to bring up.
                 let Some(texture) = found else {
+                    inner.unindex(r, previous);
                     continue;
                 };
                 // Only what shaders read lately (the eviction pass's stamps):
@@ -569,10 +626,19 @@ pub(crate) fn uploads(
                 // old (a slot the title rewrites is made fresh anyway); upload on
                 // the mark itself if that shows.
                 if !texture.used_recently() {
+                    let bit = known.bit;
+                    if previous != bit {
+                        inner.unindex(r, previous);
+                    }
+                    if bit.is_none() {
+                        inner.unchecked.insert(r);
+                    }
                     continue;
                 }
                 // Its contents are the host's since a host copy wrote it.
                 if texture.host_written.load(Relaxed) {
+                    known.bit = None;
+                    inner.unindex(r, previous);
                     continue;
                 }
                 // Its host texture's own, made on first use (and held by it).
@@ -581,7 +647,21 @@ pub(crate) fn uploads(
                     staging = crate::texture::staging(r as This, &texture.texture);
                     known.staging = staging.as_ref().map(Arc::downgrade);
                 }
+                let old = previous;
+                let bit = staging.as_ref().and_then(|s| s.dirty_bit());
+                known.bit = bit;
+                if old != bit {
+                    inner.unindex(r, old);
+                }
+                if let Some(bit) = bit {
+                    if old != Some(bit) {
+                        inner.tracked.entry(bit / 64).or_default().insert((bit, r));
+                    }
+                } else {
+                    inner.unchecked.insert(r);
+                }
                 if let Some(staging) = staging
+                    && staging.maybe_changed()
                     && staged.insert(Arc::as_ptr(&staging))
                 {
                     work.push((staging, texture));
@@ -845,7 +925,7 @@ pub(crate) mod tests {
                 0 => None,
                 1..=4 => {
                     let (copy, from) = (&copies[k % 4], 0x3f00 * (k as u64 / 4 % 16));
-                    Some(Seen::Buffer(copy.clone(), copy.range().0 + from, 0x40 + 0x40 * (k as u64 / 64 % 4), k % 3 == 0))
+                    Some(Seen::Buffer(copy.clone(), copy.range().0 + from, 0x40 + 0x40 * (k as u64 / 64 % 4), k.is_multiple_of(3)))
                 }
                 5 | 6 => Some(Seen::Texture(0x7e57_0000_0000 + 0x100 * (k % 6))),
                 _ => Some(Seen::Left((2, 0, 0))),
