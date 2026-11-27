@@ -116,6 +116,7 @@ struct Fixed {
     scissors: Option<Vec<RECT>>,
     blend_factor: Option<Option<[f32; 4]>>,
     stencil_ref: Option<u32>,
+    depth_bounds: Option<(f32, f32)>,
     /// Render target and depth view handles.
     targets: Option<(Vec<u64>, u64)>,
     topology: bool,
@@ -428,18 +429,28 @@ impl State {
         unsafe { list.list.OMSetStencilRef(reference) };
     }
 
+    pub(crate) fn depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+        use windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList1;
+        use windows::core::Interface;
+        self.fixed.depth_bounds = Some((min, max));
+        if let Ok(l) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+            // SAFETY: an open list.
+            unsafe { l.OMSetDepthBounds(min, max) };
+        }
+    }
+
     /// The title list goes on in a fresh host list (a segment after a wait
     /// or from a run of indirect draws on, `crate::list`): the state it set
     /// is given to `list` again.
     ///
     /// Replayed: topology, viewports, scissors, blend factor, stencil
-    /// reference, render targets and depth (set at once); heaps, root
-    /// signatures, pipelines, root arguments, vertex and index buffers are
-    /// set by the next draw or dispatch from what this state holds (the
+    /// reference, depth bounds, render targets and depth (set at once); heaps,
+    /// root signatures, pipelines, root arguments, vertex and index buffers
+    /// are set by the next draw or dispatch from what this state holds (the
     /// host caches are cleared). Made again in the new segment, so their
     /// submission-time work (refreshes, uploads) runs with it: fresh tables,
     /// root views and the title-memory page table. Not replayed, as nothing
-    /// of it is on the host list: depth bounds and shading rate (ignored),
+    /// of it is on the host list: shading rate (ignored),
     /// queries (resolved with plain values), the 0x4a0 upload memory (the
     /// title list's own), texture states and twins (each segment has its
     /// own, made from the real states at its submission). Clears and copies
@@ -464,6 +475,9 @@ impl State {
         }
         if let Some(s) = fixed.stencil_ref {
             self.stencil_ref(list, s);
+        }
+        if let Some((min, max)) = fixed.depth_bounds {
+            self.depth_bounds(list, min, max);
         }
         if let Some((targets, depth)) = &fixed.targets {
             self.set_targets(list, targets, *depth);
