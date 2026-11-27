@@ -1,2 +1,5 @@
-# Every change needs the maintainer's review before it can be merged.
+# The maintainer is asked to review every change. Greptile's approval with
+# passing CI merges most of them (.github/workflows/automerge.yml); changes
+# to CI, the policy check, build config, dependencies and tools/ always wait
+# for the maintainer.
 * @64bitMango
