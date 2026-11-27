@@ -1,0 +1,17 @@
+# Does nothing itself. A review on a pull request from a fork runs with a
+# read-only token, so this only wakes `Auto-merge`, which runs from main
+# with the rights to merge.
+name: Review relay
+
+on:
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions: {}
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: echo "review on pull request ${{ github.event.pull_request.number }}"
