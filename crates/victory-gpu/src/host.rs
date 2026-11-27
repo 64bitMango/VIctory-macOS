@@ -1561,16 +1561,10 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
-        // Blocks the title has just written are left open by this
-        // submission's refreshes and copied again by the next one's
-        // (`crate::watch::rest_ms`), unless its shaders write title memory at
-        // addresses they compute: what they wrote is then told from the
-        // title's bytes page by page, by whether the title wrote the page
-        // since its copy took it (`Shadow::copy_back_page`), which a page
-        // left open cannot say. Ranges shaders write through views settle
-        // their own pages (`Shadow::writing`).
-        batch.rest = crate::watch::rest_ms() != 0 && !runs.iter().any(|list| list.writes_memory());
+        let mut batch = Batch {
+            rest: crate::watch::rest_ms() != 0 && !runs.iter().any(|list| list.writes_memory()),
+            ..Batch::default()
+        };
         #[cfg(feature = "diagnostics")]
         if crate::watch::rest_ms() != 0 {
             use crate::copystat::{C, add};
@@ -4554,6 +4548,7 @@ mod batch {
             assert!(!copy.clean());
             batch.add(&copy, p, len);
             assert_eq!(batch.flush(), 0, "once per submission");
+            // SAFETY: `p` is our test's own writable allocation of `len` bytes.
             unsafe { ((p + 8) as *mut u8).write_volatile(8) };
         }
         let mut batch = Batch::default();

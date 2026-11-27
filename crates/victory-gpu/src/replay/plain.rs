@@ -12,8 +12,8 @@ pub(super) fn page_hash(bytes: &[u8]) -> u64 {
         0x27d4_eb2f_1656_67c5,
     ];
     let mut lanes = [0u64; 4];
-    let mut blocks = bytes.chunks_exact(32);
-    for block in &mut blocks {
+    let (blocks, remainder) = bytes.as_chunks::<32>();
+    for block in blocks {
         for (i, lane) in lanes.iter_mut().enumerate() {
             let mut word = [0u8; 8];
             word.copy_from_slice(&block[i * 8..i * 8 + 8]);
@@ -22,7 +22,7 @@ pub(super) fn page_hash(bytes: &[u8]) -> u64 {
                 .rotate_left(29);
         }
     }
-    for (i, rest) in blocks.remainder().chunks(8).enumerate() {
+    for (i, rest) in remainder.chunks(8).enumerate() {
         let mut word = [0u8; 8];
         word[..rest.len()].copy_from_slice(rest);
         lanes[i] = (lanes[i] ^ u64::from_le_bytes(word))
@@ -309,7 +309,7 @@ mod tests {
                 }
             }
         }
-        let page: Vec<u8> = (0..4096u32).map(|i| (i * 31 >> 3) as u8).collect();
+        let page: Vec<u8> = (0..4096u32).map(|i| ((i * 31) >> 3) as u8).collect();
         let mut seen = std::collections::HashSet::new();
         seen.insert(page_hash(&page));
         for at in 0..page.len() {

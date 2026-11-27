@@ -125,7 +125,6 @@ fn keep() -> f32 {
 /// The program that draws the sky as the title reflects it, named by
 /// `VICTORY_HOOK_SKY` ([`crate::pipeline::Hook`]): a small image of the whole
 /// sky, in the light's own units.
-
 type Copy = std::sync::Arc<crate::resource::HostTexture>;
 
 /// The sky dome that program last drew into: the host copy, held, since
