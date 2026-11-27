@@ -626,8 +626,11 @@ pub(crate) fn uploads(
                 // old (a slot the title rewrites is made fresh anyway); upload on
                 // the mark itself if that shows.
                 if !texture.used_recently() {
-                    if previous != known.bit {
+                    let bit = known.bit;
+                    if previous != bit {
                         inner.unindex(r, previous);
+                    }
+                    if bit.is_none() {
                         inner.unchecked.insert(r);
                     }
                     continue;

@@ -1246,6 +1246,8 @@ mod tests {
         let mut g = GraphicsState::default();
         assert!(!g.depth_bounds);
         let without = g.describe();
+        let bounds_only = GraphicsState { depth_bounds: true, ..GraphicsState::default() };
+        assert_ne!(bounds_only.describe(), without);
 
         let sub1 = Sub1(
             21,

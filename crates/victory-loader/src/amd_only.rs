@@ -616,6 +616,12 @@ mod on_windows {
         if std::env::var("VICTORY_PATCH_SSE4A").is_ok_and(|value| value.trim() == "0") {
             return;
         }
+        use std::arch::x86_64::__cpuid;
+        if __cpuid(0x8000_0000).eax >= 0x8000_0001
+            && __cpuid(0x8000_0001).ecx & (1 << 6) != 0
+        {
+            return;
+        }
         let sections = info.sections.iter().filter(|s| s.characteristics & EXECUTE != 0).map(|s| {
             (base + u64::from(s.rva), s.virtual_size.min(s.file_size) as usize)
         });
