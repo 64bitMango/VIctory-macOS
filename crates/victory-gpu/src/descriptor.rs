@@ -958,13 +958,67 @@ struct PlacedScratch {
     index: std::collections::BTreeMap<View, u32>,
 }
 
+const SLOT_LOCK_COUNT: usize = 1024;
+static SLOT_LOCKS: [std::sync::Mutex<()>; SLOT_LOCK_COUNT] =
+    [const { std::sync::Mutex::new(()) }; SLOT_LOCK_COUNT];
+
+fn slot_lock(handle: u64) -> &'static std::sync::Mutex<()> {
+    let mut h = handle.wrapping_mul(0x9e3779b97f4a7c15);
+    h ^= h >> 32;
+    &SLOT_LOCKS[(h as usize) % SLOT_LOCK_COUNT]
+}
+
+fn with_slot_locks<R>(slot_a: u64, slot_b: u64, f: impl FnOnce() -> R) -> R {
+    let mut h_a = slot_a.wrapping_mul(0x9e3779b97f4a7c15);
+    h_a ^= h_a >> 32;
+    let idx_a = (h_a as usize) % SLOT_LOCK_COUNT;
+
+    let mut h_b = slot_b.wrapping_mul(0x9e3779b97f4a7c15);
+    h_b ^= h_b >> 32;
+    let idx_b = (h_b as usize) % SLOT_LOCK_COUNT;
+
+    if idx_a == idx_b {
+        let _guard = SLOT_LOCKS[idx_a].lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    } else if idx_a < idx_b {
+        let _guard_a = SLOT_LOCKS[idx_a].lock().unwrap_or_else(|e| e.into_inner());
+        let _guard_b = SLOT_LOCKS[idx_b].lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    } else {
+        let _guard_b = SLOT_LOCKS[idx_b].lock().unwrap_or_else(|e| e.into_inner());
+        let _guard_a = SLOT_LOCKS[idx_a].lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+}
+
+fn write_record_words(handle: u64, i: u32, generation: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed, Ordering::Release};
+    if handle.is_multiple_of(4) {
+        let words = handle as *mut AtomicU32;
+        // SAFETY: `handle` is a 4-byte-aligned descriptor slot, at least 16 bytes.
+        unsafe {
+            (*words).store(0, Release);
+            (*words.add(1)).store(i, Relaxed);
+            (*words.add(2)).store(generation, Relaxed);
+            (*words).store(VIEW_TAG, Release);
+        }
+    } else {
+        // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+        unsafe {
+            (handle as *mut u32).write_unaligned(0);
+            ((handle + 4) as *mut u64).write_unaligned(u64::from(generation) << 32 | u64::from(i));
+            (handle as *mut u32).write_unaligned(VIEW_TAG);
+        }
+    }
+}
+
 static PLACED_SCRATCH: std::sync::RwLock<PlacedScratch> =
     std::sync::RwLock::new(PlacedScratch {
         list: Vec::new(),
         index: std::collections::BTreeMap::new(),
     });
 
-fn record_placed_scratch(handle: u64, view: View) {
+fn record_placed_scratch_locked(handle: u64, view: View) -> [u32; 2] {
     let id = {
         let mut scratch = PLACED_SCRATCH.write().unwrap_or_else(|e| e.into_inner());
         match scratch.index.get(&view) {
@@ -978,11 +1032,19 @@ fn record_placed_scratch(handle: u64, view: View) {
         }
     };
     let [i, generation] = kind_words(SCRATCH_PLACED, u64::from(id));
-    write_record(handle, i, generation);
+    write_record_words(handle, i, generation);
     #[cfg(windows)]
     mirror(handle);
+    [i, generation]
 }
 
+fn record_placed_scratch(handle: u64, view: View) {
+    let _writes = SHAPE_WRITES.read().unwrap_or_else(|e| e.into_inner());
+    let _slot = slot_lock(handle).lock().unwrap_or_else(|e| e.into_inner());
+    record_placed_scratch_locked(handle, view);
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
 fn scratch_placed_of(i: u32, generation: u32) -> Option<View> {
     let id = payload(i, generation) as usize;
     let scratch = PLACED_SCRATCH.read().unwrap_or_else(|e| e.into_inner());
@@ -1253,6 +1315,30 @@ impl Shapes {
                     let shape_gen = (code >> SHAPE_BITS) as u8;
                     if idx < n && generations[idx].load(Acquire) == shape_gen {
                         live[idx] = true;
+                    }
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            let hosts = crate::descriptor::heaps();
+            for &(_, _, h) in hosts.iter() {
+                // SAFETY: registered heaps in heaps() are live.
+                if let Some(Some(host)) = unsafe { &*(h as *const Heap) }.host.get() {
+                    for slot in 0..host.count() {
+                        let key = host.made_key(slot);
+                        if key != 0 {
+                            let generation = (key >> 32) as u32;
+                            if (generation >> KIND_SHIFT) == PLACED {
+                                let item = key as u32;
+                                let code = (payload(item, generation) >> PLACED_ADDRESS_BITS) as usize;
+                                let idx = code & SHAPE_INDEX_MASK;
+                                let shape_gen = (code >> SHAPE_BITS) as u8;
+                                if idx < n && generations[idx].load(Acquire) == shape_gen {
+                                    live[idx] = true;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1550,41 +1636,10 @@ fn record_table(handle: u64, view: View) {
     mirror(handle);
 }
 
-const SLOT_LOCK_COUNT: usize = 1024;
-static SLOT_LOCKS: [std::sync::Mutex<()>; SLOT_LOCK_COUNT] =
-    [const { std::sync::Mutex::new(()) }; SLOT_LOCK_COUNT];
-
-fn slot_lock(handle: u64) -> &'static std::sync::Mutex<()> {
-    let mut h = handle.wrapping_mul(0x9e3779b97f4a7c15);
-    h ^= h >> 32;
-    &SLOT_LOCKS[(h as usize) % SLOT_LOCK_COUNT]
-}
-
-/// Writes the record of view entry `i`, generation `generation`, at `handle`:
-/// the entry and its generation, then the tag published with release ordering.
-/// Publishes a view header using atomic words under a per-slot lock so concurrent
-/// same-slot writers never mix fields or interleave stores.
 fn write_record(handle: u64, i: u32, generation: u32) {
     let _writes = SHAPE_WRITES.read().unwrap_or_else(|e| e.into_inner());
     let _slot = slot_lock(handle).lock().unwrap_or_else(|e| e.into_inner());
-    use std::sync::atomic::{AtomicU32, Ordering::Relaxed, Ordering::Release};
-    if handle.is_multiple_of(4) {
-        let words = handle as *mut AtomicU32;
-        // SAFETY: `handle` is a 4-byte-aligned descriptor slot, at least 16 bytes.
-        unsafe {
-            (*words).store(0, Release);
-            (*words.add(1)).store(i, Relaxed);
-            (*words.add(2)).store(generation, Relaxed);
-            (*words).store(VIEW_TAG, Release);
-        }
-    } else {
-        // SAFETY: the handle is a descriptor slot, at least 16 bytes.
-        unsafe {
-            (handle as *mut u32).write_unaligned(0);
-            ((handle + 4) as *mut u64).write_unaligned(u64::from(generation) << 32 | u64::from(i));
-            (handle as *mut u32).write_unaligned(VIEW_TAG);
-        }
-    }
+    write_record_words(handle, i, generation);
 }
 
 /// Times a thread waited to enter what a host heap's slot holds, and the
@@ -1830,28 +1885,40 @@ pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], 
 }
 
 /// Scratch copies keep an independent view when their source shape is reclaimed.
-fn preserve_copied_placed(slot: u64, step: u64) -> bool {
+fn preserve_copied_placed_locked(slot: u64, step: u64) -> bool {
     if step != 32 {
         return false;
     }
-    // SAFETY: `slot` was just copied and is at least `step` bytes.
-    let [tag, i, generation] = unsafe { read_record_atomic(slot) };
+    use std::sync::atomic::{AtomicU32, Ordering::Acquire, Ordering::Relaxed};
+    let [tag, i, generation] = if slot.is_multiple_of(4) {
+        let words = slot as *mut AtomicU32;
+        // SAFETY: `slot` is 4-byte aligned, at least 32 bytes, and its slot lock is held.
+        unsafe {
+            let tag = (*words).load(Acquire);
+            let i = (*words.add(1)).load(Relaxed);
+            let generation = (*words.add(2)).load(Relaxed);
+            [tag, i, generation]
+        }
+    } else {
+        // SAFETY: caller holds slot lock and `slot` has at least 32 bytes.
+        unsafe { (slot as *const [u32; 3]).read_unaligned() }
+    };
     if tag != VIEW_TAG {
         return false;
     }
     match generation >> KIND_SHIFT {
         PLACED if !in_view_heap(slot) => {
             if let Some(view) = placed_of(i, generation) {
-                record_placed_scratch(slot, view);
+                record_placed_scratch_locked(slot, view);
                 return true;
             }
         }
         SCRATCH_PLACED if in_view_heap(slot) => {
-            if let Some(view) = scratch_placed_of(i, generation) {
-                // Publish a heap record with its own lifetime. `record` also mirrors it.
-                record(slot, view);
-                return true;
-            }
+            // Keep the scratch header on this path: SCRATCH_PLACED is already an immutable
+            // scratch-backed view and resolves cleanly in heaps without taking VIEWS or SHAPES entries.
+            #[cfg(windows)]
+            mirror(slot);
+            return true;
         }
         _ => {}
     }
@@ -1868,25 +1935,26 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     copy_descriptors(count, dst, src, u64::from(step));
 }
 
-/// Copies one contiguous range. View callers hold the copy barrier.
+/// Copies one contiguous range under slot locks. View callers hold the copy barrier.
 fn copy_descriptors(count: u32, dst: u64, src: u64, step: u64) {
     if dst == 0 || src == 0 {
         return;
     }
-    // SAFETY: both ranges are descriptor slots the title owns.
-    unsafe {
-        std::ptr::copy(
-            src as *const u8,
-            dst as *mut u8,
-            (u64::from(count) * step) as usize,
-        )
-    };
     for i in 0..u64::from(count) {
-        let slot = dst + i * step;
-        if !preserve_copied_placed(slot, step) {
-            #[cfg(windows)]
-            mirror(slot);
-        }
+        let src_slot = src + i * step;
+        let dst_slot = dst + i * step;
+        with_slot_locks(src_slot, dst_slot, || {
+            // SAFETY: per-slot locks for both source and destination slots are held in
+            // consistent order, preventing data races with concurrent writes, reads, or other copies,
+            // and both handles point to valid title-owned descriptor memory of at least `step` bytes.
+            unsafe {
+                std::ptr::copy(src_slot as *const u8, dst_slot as *mut u8, step as usize);
+            }
+            if !preserve_copied_placed_locked(dst_slot, step) {
+                #[cfg(windows)]
+                mirror(dst_slot);
+            }
+        });
     }
 }
 

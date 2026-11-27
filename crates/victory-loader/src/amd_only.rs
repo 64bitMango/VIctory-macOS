@@ -286,23 +286,46 @@ fn scan_sse4a(
 ) -> (Vec<(u64, Sse4a)>, Vec<u64>) {
     use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind};
 
-    let mut sites = Vec::new();
-    let mut relays = Vec::new();
+    let mut branch_targets = targets.clone();
     let mut decoder = Decoder::with_ip(64, code, start, DecoderOptions::AMD);
-    let mut padding = 0;
     while decoder.can_decode() {
-        let offset = decoder.position();
         let instruction = decoder.decode();
         if matches!(
             instruction.op0_kind(),
             OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
         ) {
-            targets.insert(instruction.near_branch_target());
+            let target = instruction.near_branch_target();
+            branch_targets.insert(target);
+            targets.insert(target);
+        }
+        if instruction.is_ip_rel_memory_operand() {
+            let base = instruction.ip_rel_memory_address();
+            let size = instruction.memory_size().size().max(1) as u64;
+            for b in base..base + size {
+                targets.insert(b);
+            }
+        }
+    }
+
+    let mut sites = Vec::new();
+    let mut relays = Vec::new();
+    let mut decoder = Decoder::with_ip(64, code, start, DecoderOptions::AMD);
+    let mut padding = 0;
+    let mut reachable = true;
+    while decoder.can_decode() {
+        let offset = decoder.position();
+        let instruction = decoder.decode();
+        let ip = instruction.ip();
+        if branch_targets.contains(&ip) {
+            reachable = true;
         }
         if padding != 0 && instruction.mnemonic() == Mnemonic::Int3 && instruction.len() == 1 {
             padding += 1;
             if padding == 6 {
-                relays.push(instruction.ip() - 4);
+                let candidate = ip - 4;
+                if (candidate..candidate + 5).all(|b| !targets.contains(&b)) {
+                    relays.push(candidate);
+                }
                 padding = 1;
             }
         } else {
@@ -313,11 +336,20 @@ fn scan_sse4a(
                     | FlowControl::IndirectBranch
             ));
         }
-        if matches!(instruction.mnemonic(), Mnemonic::Extrq | Mnemonic::Insertq)
+        if reachable
+            && matches!(instruction.mnemonic(), Mnemonic::Extrq | Mnemonic::Insertq)
             && let Some(op) = decode_sse4a(&code[offset..decoder.position()])
             && op.len == instruction.len()
         {
-            sites.push((instruction.ip(), op));
+            sites.push((ip, op));
+        }
+        if matches!(
+            instruction.flow_control(),
+            FlowControl::Return
+                | FlowControl::UnconditionalBranch
+                | FlowControl::IndirectBranch
+        ) {
+            reachable = false;
         }
     }
     (sites, relays)
@@ -824,6 +856,25 @@ mod tests {
         assert_eq!(relays, [0x101b]);
         assert_eq!(sse4a_redirect(0x1005, 4, 0x2000, Some(relays[0])).unwrap(), [0xeb, 20, 0x90, 0x90]);
         assert!(sse4a_redirect(0x1005, 4, 0x2000, None).is_none());
+    }
+
+    #[test]
+    fn skipped_inline_data_after_unconditional_jump_is_not_classified_as_site() {
+        let mut code = vec![0xeb, 0x06];
+        code.extend([0x66, 0x0f, 0x78, 0xc0, 0x08, 0x00]);
+        code.extend([0x8b, 0x05, 0xf4, 0xff, 0xff, 0xff, 0xc3]);
+        let (sites, _) = scan_sse4a(&code, 0x1000, &mut Default::default());
+        assert!(sites.is_empty(), "skipped constant must not be accepted as site");
+    }
+
+    #[test]
+    fn candidate_storage_referenced_by_data_is_rejected_as_relay() {
+        let mut code = vec![0x66, 0x0f, 0x79, 0xc1, 0xc3];
+        code.extend([0xcc, 0xcc, 0xcc, 0xcc, 0xcc]);
+        code.extend([0x8b, 0x05, 0xf5, 0xff, 0xff, 0xff, 0xc3]);
+        let (sites, relays) = scan_sse4a(&code, 0x1000, &mut Default::default());
+        assert_eq!(sites.len(), 1);
+        assert!(relays.is_empty(), "data-referenced padding must not be accepted as a relay");
     }
 
     #[test]

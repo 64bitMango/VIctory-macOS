@@ -738,6 +738,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn fill_wrapper_forwards_arguments_marks_writes_and_returns_destination() {
+        let _one = ADOPTING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buffer = [0u8; 128];
+        let start = buffer.as_mut_ptr() as u64;
+        let maps = adopt_for_test(start, 4);
+
+        unsafe extern "system-unwind" fn mock_memset(to: *mut u8, value: i32, n: usize) -> *mut u8 {
+            // SAFETY: caller passes a valid writable buffer of `n` bytes.
+            unsafe { std::ptr::write_bytes(to, value as u8, n) };
+            to
+        }
+
+        REAL[2].store(mock_memset as *const () as usize, Relaxed);
+        // SAFETY: offset 8 is within the 128-byte local buffer.
+        let dst = unsafe { buffer.as_mut_ptr().add(8) };
+        // SAFETY: writing 12 bytes at offset 8 stays within `buffer`.
+        let returned = unsafe { fill(dst, 0x5a, 12) };
+        assert_eq!(returned, dst);
+        assert_eq!(&buffer[..8], &[0u8; 8]);
+        assert_eq!(&buffer[8..20], &[0x5a; 12]);
+        assert_eq!(&buffer[20..], &[0u8; 108]);
+        assert_eq!(maps.take(), [(0, 1)]);
+
+        // SAFETY: offset 36 is within the 128-byte local buffer.
+        let dst2 = unsafe { buffer.as_mut_ptr().add(32 + 4) };
+        // SAFETY: writing 8 bytes at offset 36 stays within `buffer`.
+        let ret2 = unsafe { fill(dst2, 0xa5, 8) };
+        assert_eq!(ret2, dst2);
+        assert_eq!(&buffer[36..44], &[0xa5; 8]);
+        assert_eq!(maps.take(), [(1, 1)]);
+
+        let_go(start);
+    }
+
+    #[test]
     fn a_page_read_whole_leaves_out_the_slots_taken_by_marks() {
         let taken = [(100, 10), (2040, 15), (2060, 10), (4090, 12)];
         assert_eq!(without(2048, 4096, &taken), [(2055, 2060), (2070, 4090)]);

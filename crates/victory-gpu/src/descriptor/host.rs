@@ -106,6 +106,8 @@ pub(crate) struct HostHeap {
     /// the title views through a fraction of the slots, and a dense table
     /// of them all was 37.7 MB, written when the heap was made.
     kept: Pages<Held>,
+    /// Decoded view retained per title slot while the host slot holds it.
+    retained_views: Pages<View>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<DynamicSlots>,
@@ -581,6 +583,7 @@ impl HostHeap {
             left: (!sampler && tables_to_draws()).then(|| zeroed(count as usize)),
             waiting: Mutex::default(),
             kept: Pages::new((count + extra) as usize, !kept_pages()),
+            retained_views: Pages::new((count + extra) as usize, !kept_pages()),
             next: Mutex::new(DynamicSlots {
                 cursor: 0,
                 taken: vec![false; extra as usize],
@@ -970,7 +973,13 @@ impl HostHeap {
             let _still = self.hold_slots();
             for (i, key) in self.made.iter().enumerate() {
                 let key = key.load(Acquire);
-                let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
+                let view = (key != 0)
+                    .then(|| {
+                        self.retained_views
+                            .with(i, |v| v.cloned())
+                            .or_else(|| view_at(key as u32, (key >> 32) as u32))
+                    })
+                    .flatten();
                 write_address(data, i, view.as_ref());
             }
             // SAFETY: a live buffer.
@@ -1110,7 +1119,12 @@ impl HostHeap {
                     left[0] += 1;
                     continue;
                 }
-                if look != Look::Waited && matches!(generation >> super::KIND_SHIFT, super::CONSTANT | super::PLACED) {
+                if look != Look::Waited
+                    && matches!(
+                        generation >> super::KIND_SHIFT,
+                        super::CONSTANT | super::PLACED | super::SCRATCH_PLACED
+                    )
+                {
                     self.note_left(i, key);
                     wait.push(i);
                     continue;
@@ -1530,6 +1544,7 @@ impl HostHeap {
                     crate::copystat::add(crate::copystat::C::NullKept, 1);
                 }
                 self.make_null_view(index, shows || !null_once(), &mut laps);
+                self.retained_views.replace(index as usize, None, |_| {});
                 self.note_address(index, None);
                 lap!(laps, SlotTablesNs);
             }
@@ -1556,6 +1571,7 @@ impl HostHeap {
             entry.store(was, SeqCst);
             return Made::Needs(view, record);
         }
+        self.retained_views.replace(index as usize, Some(view.clone()), |_| {});
         self.set_stride(index, Some(&view));
         self.note_address(index, Some(&view));
         if later {
