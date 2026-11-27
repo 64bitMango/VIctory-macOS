@@ -483,7 +483,7 @@ fn branched_mask(source: u8) -> Vec<u32> {
 /// What thread `t` of [`branched_mask`] stores: each round adds 1 where its
 /// bit of the mask is set, else 2.
 fn branched_mask_wants(t: u32, source: u8) -> u32 {
-    let even = t % 2 == 0;
+    let even = t.is_multiple_of(2);
     let mut mask = even;
     let mut sum = 0;
     for round in 0..4 {
