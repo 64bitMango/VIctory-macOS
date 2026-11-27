@@ -321,6 +321,9 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     return false;
                 };
                 count(Kind::Sse4a);
+                if crate::amd_only::patches_sse4a() {
+                    crate::amd_only::replace_sse4a(context.Rip as usize);
+                }
                 context.Rip += len as u64;
                 return true;
             }

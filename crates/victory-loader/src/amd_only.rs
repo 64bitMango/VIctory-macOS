@@ -13,6 +13,9 @@
 //!   at their first exception by a jump over themselves ([`replace_wait`],
 //!   `VICTORY_PATCH_WAITS=0`: emulated each time). Found by the exception and
 //!   not by their three bytes, which other instructions' operands hold too.
+//! - `extrq` and `insertq` (5+ byte forms) are replaced at their first
+//!   exception by a jump to an equivalent integer/XMM stub ([`replace_sse4a`],
+//!   `VICTORY_PATCH_SSE4A=0`: emulated each time).
 //!
 //! Diagnostics builds log the counts per frame ([`log_emulated`]).
 
@@ -191,6 +194,135 @@ fn patches_waits_from(value: Option<&str>) -> bool {
     value.map(str::trim) != Some("0")
 }
 
+/// Whether `extrq` and `insertq` (5+ byte forms) are replaced at their first
+/// exception; not with `VICTORY_PATCH_SSE4A=0`.
+fn patches_sse4a_from(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
+}
+
+/// Decoded SSE4a `extrq` / `insertq` register instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Sse4aOp {
+    pub insert: bool,
+    pub dst: u8,
+    pub src: u8,
+    pub immediate: Option<(u8, u8)>,
+    pub len: usize,
+}
+
+/// Decodes an SSE4a `extrq` / `insertq` instruction at `code[0..]`.
+pub(crate) fn decode_sse4a(code: &[u8]) -> Option<Sse4aOp> {
+    let &prefix = code.first()?;
+    if !matches!(prefix, 0x66 | 0xf2) {
+        return None;
+    }
+    let &b1 = code.get(1)?;
+    let (rex, at) = if b1 & 0xf0 == 0x40 { (b1, 2) } else { (0, 1) };
+    if *code.get(at)? != 0x0f {
+        return None;
+    }
+    let op = *code.get(at + 1)?;
+    if !matches!(op, 0x78 | 0x79) {
+        return None;
+    }
+    let modrm = *code.get(at + 2)?;
+    if modrm >> 6 != 3 {
+        return None;
+    }
+    let insert = prefix == 0xf2;
+    let dst = ((modrm >> 3) & 7) | ((rex & 4) << 1);
+    let src = (modrm & 7) | ((rex & 1) << 3);
+    if op == 0x78 {
+        if !insert && ((modrm >> 3) & 7) != 0 {
+            return None;
+        }
+        let len = at + 5;
+        let (&ib0, &ib1) = (code.get(at + 3)?, code.get(at + 4)?);
+        let target = if insert { dst } else { src };
+        Some(Sse4aOp {
+            insert,
+            dst: target,
+            src,
+            immediate: Some((ib0, ib1)),
+            len,
+        })
+    } else {
+        let len = at + 3;
+        Some(Sse4aOp {
+            insert,
+            dst,
+            src,
+            immediate: None,
+            len,
+        })
+    }
+}
+
+/// Emits `movq r64, xmm` (`r64` is `0`=rax or `2`=rdx).
+fn emit_movq_gpr_from_xmm(out: &mut Vec<u8>, gpr: u8, xmm: u8) {
+    let rex = 0x48 | ((xmm >> 3) << 2);
+    let modrm = 0xc0 | ((xmm & 7) << 3) | (gpr & 7);
+    out.extend_from_slice(&[0x66, rex, 0x0f, 0x7e, modrm]);
+}
+
+/// Emits `pinsrq xmm, r64, 0` (preserving the upper 64 bits of `xmm`).
+fn emit_pinsrq_xmm_from_gpr(out: &mut Vec<u8>, xmm: u8, gpr: u8) {
+    let rex = 0x48 | ((xmm >> 3) << 2);
+    let modrm = 0xc0 | ((xmm & 7) << 3) | (gpr & 7);
+    out.extend_from_slice(&[0x66, rex, 0x0f, 0x3a, 0x22, modrm, 0x00]);
+}
+
+/// Emits an equivalent x86-64 stub for an immediate `extrq`/`insertq` at
+/// `site`, placed at `stub`, jumping back to `site + op.len`.
+pub(crate) fn sse4a_stub(op: &Sse4aOp, site: u64, stub: u64) -> Option<Vec<u8>> {
+    let (n, at_bit) = op.immediate?;
+    let bits = if (n & 63) == 0 { 64 } else { u32::from(n & 63) };
+    let at_bit = at_bit & 63;
+    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+
+    let mut code = Vec::with_capacity(64);
+    // pushfq; push rax; push rcx; push rdx
+    code.extend_from_slice(&[0x9c, 0x50, 0x51, 0x52]);
+    emit_movq_gpr_from_xmm(&mut code, 0, op.src); // rax = xmm[src].Low
+    if !op.insert {
+        if at_bit != 0 {
+            // shr rax, at_bit
+            code.extend_from_slice(&[0x48, 0xc1, 0xe8, at_bit]);
+        }
+        if mask != u64::MAX {
+            // mov rcx, mask; and rax, rcx
+            code.extend_from_slice(&[0x48, 0xb9]);
+            code.extend_from_slice(&mask.to_le_bytes());
+            code.extend_from_slice(&[0x48, 0x21, 0xc8]);
+        }
+        emit_pinsrq_xmm_from_gpr(&mut code, op.dst, 0);
+    } else {
+        if mask != u64::MAX {
+            // mov rcx, mask; and rax, rcx
+            code.extend_from_slice(&[0x48, 0xb9]);
+            code.extend_from_slice(&mask.to_le_bytes());
+            code.extend_from_slice(&[0x48, 0x21, 0xc8]);
+        }
+        if at_bit != 0 {
+            // shl rax, at_bit
+            code.extend_from_slice(&[0x48, 0xc1, 0xe0, at_bit]);
+        }
+        emit_movq_gpr_from_xmm(&mut code, 2, op.dst); // rdx = xmm[dst].Low
+        let clear = !(mask.wrapping_shl(u32::from(at_bit)));
+        // mov rcx, clear; and rdx, rcx; or rax, rdx
+        code.extend_from_slice(&[0x48, 0xb9]);
+        code.extend_from_slice(&clear.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x21, 0xca, 0x48, 0x09, 0xd0]);
+        emit_pinsrq_xmm_from_gpr(&mut code, op.dst, 0);
+    }
+    // pop rdx; pop rcx; pop rax; popfq
+    code.extend_from_slice(&[0x5a, 0x59, 0x58, 0x9d]);
+    let ret_from = stub + code.len() as u64;
+    let jump_back = jump(ret_from, site + op.len as u64)?;
+    code.extend_from_slice(&jump_back);
+    Some(code)
+}
+
 #[cfg(windows)]
 pub use on_windows::*;
 
@@ -293,6 +425,85 @@ mod on_windows {
     pub fn patches_waits() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| patches_waits_from(std::env::var("VICTORY_PATCH_WAITS").ok().as_deref()))
+    }
+
+    /// Whether `extrq` and `insertq` (immediate forms, 6-7 bytes) are replaced
+    /// at their first exception (`VICTORY_PATCH_SSE4A=0`: emulated each time).
+    pub fn patches_sse4a() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| patches_sse4a_from(std::env::var("VICTORY_PATCH_SSE4A").ok().as_deref()))
+    }
+
+    static SSE4A_REPLACED: AtomicU64 = AtomicU64::new(0);
+    static SSE4A_POOL: std::sync::Mutex<Option<(u64, usize)>> = std::sync::Mutex::new(None);
+
+    /// Replaces the immediate `extrq`/`insertq` at `at` with a `jmp rel32` to an
+    /// equivalent stub in [`SSE4A_POOL`]. Returns `true` if replaced.
+    ///
+    /// # Safety
+    /// `at` must point to a mapped, executable instruction in title code (or
+    /// `TEST_CODE`).
+    pub(crate) unsafe fn replace_sse4a(at: usize) -> bool {
+        #[cfg(test)]
+        let known = TEST_CODE.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, b)| (a..b).contains(&at));
+        #[cfg(not(test))]
+        let known = false;
+        if !known && !crate::threads::in_title_image(at) {
+            return false;
+        }
+        // SAFETY: `at` is inside a title module or `TEST_CODE`, readable for 7 bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, 7) };
+        let Some(op) = decode_sse4a(bytes) else {
+            return false;
+        };
+        if op.immediate.is_none() || op.len < 5 {
+            return false;
+        }
+        let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
+        // Re-check after taking the lock in case another thread already patched it.
+        // SAFETY: as above.
+        let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, 7) };
+        let Some(op) = decode_sse4a(bytes) else {
+            return false;
+        };
+        let mut pool = SSE4A_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.as_ref().is_none_or(|(_, used)| *used + 96 > POOL) {
+            let Some(base) = near(at as u64) else {
+                return false;
+            };
+            *pool = Some((base, 0));
+        }
+        let (pool_base, used) = pool.as_mut().expect("pool initialized");
+        let stub_addr = *pool_base + *used as u64;
+        let Some(body) = sse4a_stub(&op, at as u64, stub_addr) else {
+            return false;
+        };
+        let Some(jump_to) = jump(at as u64, stub_addr) else {
+            return false;
+        };
+        let mut patch = [0x90u8; 7];
+        patch[..5].copy_from_slice(&jump_to);
+        let mut old = 0;
+        // SAFETY: `stub_addr` is within `SSE4A_POOL` (`POOL` bytes) and `at` is
+        // writable for `op.len` bytes under `VirtualProtect`.
+        unsafe {
+            let mut pool_old = 0;
+            if VirtualProtect(stub_addr as *const _, body.len(), PAGE_EXECUTE_READWRITE, &mut pool_old) == 0 {
+                return false;
+            }
+            std::ptr::copy_nonoverlapping(body.as_ptr(), stub_addr as *mut u8, body.len());
+            VirtualProtect(stub_addr as *const _, body.len(), PAGE_EXECUTE_READ, &mut pool_old);
+            if VirtualProtect(at as *const _, op.len, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+                return false;
+            }
+            std::ptr::copy_nonoverlapping(patch.as_ptr(), at as *mut u8, op.len);
+            VirtualProtect(at as *const _, op.len, old, &mut old);
+            FlushInstructionCache(GetCurrentProcess(), stub_addr as *const _, body.len());
+            FlushInstructionCache(GetCurrentProcess(), at as *const _, op.len);
+        }
+        *used += body.len().next_multiple_of(16);
+        SSE4A_REPLACED.fetch_add(1, Relaxed);
+        true
     }
 
     /// One thread at a time changes code: a second one would take the
@@ -578,5 +789,38 @@ mod tests {
         assert!(patches_waits_from(None));
         assert!(patches_waits_from(Some("1")));
         assert!(!patches_waits_from(Some(" 0 ")));
+        assert!(patches_sse4a_from(None));
+        assert!(patches_sse4a_from(Some("1")));
+        assert!(!patches_sse4a_from(Some("0")));
+    }
+
+    #[test]
+    fn sse4a_decode_and_stub_cover_extrq_and_insertq() {
+        // extrq xmm0, length 8, index 20 (6 bytes)
+        let extrq = [0x66, 0x0f, 0x78, 0xc0, 0x08, 0x14];
+        let op = decode_sse4a(&extrq).expect("extrq");
+        assert!(!op.insert);
+        assert_eq!((op.dst, op.src, op.len, op.immediate), (0, 0, 6, Some((8, 20))));
+        let stub = sse4a_stub(&op, 0x1_0000, 0x9000).expect("extrq stub");
+        // pushfq; push rax; push rcx; push rdx ... ends with jmp rel32 back to 0x1_0006
+        assert_eq!(&stub[..4], &[0x9c, 0x50, 0x51, 0x52]);
+        let jmp_at = stub.len() - 5;
+        assert_eq!(stub[jmp_at], 0xe9);
+        let rel = i32::from_le_bytes(stub[jmp_at + 1..].try_into().unwrap());
+        assert_eq!(0x9000 + stub.len() as i64 + i64::from(rel), 0x1_0006);
+
+        // insertq xmm8, xmm9, length 16, index 16 (REX.R + REX.B, 7 bytes)
+        let insertq = [0xf2, 0x45, 0x0f, 0x78, 0xc1, 0x10, 0x10];
+        let op = decode_sse4a(&insertq).expect("insertq");
+        assert!(op.insert);
+        assert_eq!((op.dst, op.src, op.len, op.immediate), (8, 9, 7, Some((16, 16))));
+        let stub = sse4a_stub(&op, 0x2_0000, 0x9000).expect("insertq stub");
+        let jmp_at = stub.len() - 5;
+        assert_eq!(stub[jmp_at], 0xe9);
+        let rel = i32::from_le_bytes(stub[jmp_at + 1..].try_into().unwrap());
+        assert_eq!(0x9000 + stub.len() as i64 + i64::from(rel), 0x2_0007);
+
+        // extrq with invalid ModRM.reg != 0 is rejected.
+        assert!(decode_sse4a(&[0x66, 0x0f, 0x78, 0xc8, 0x08, 0x14]).is_none());
     }
 }
