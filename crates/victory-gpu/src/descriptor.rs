@@ -1242,6 +1242,7 @@ impl Shapes {
         let n = self.list.len();
         let pinned_snapshot: Vec<u32> = (0..n).map(|idx| pinned[idx].load(Acquire)).collect();
         let mut live = vec![false; n];
+        let mut any_gen_live = vec![false; n];
         for h in heaps {
             let bytes = u64::from(h.count) * 32;
             if !range_readable(h.start, bytes) {
@@ -1255,8 +1256,11 @@ impl Shapes {
                     let code = (payload(i, generation) >> PLACED_ADDRESS_BITS) as usize;
                     let idx = code & SHAPE_INDEX_MASK;
                     let shape_gen = (code >> SHAPE_BITS) as u8;
-                    if idx < n && generations[idx].load(Acquire) == shape_gen {
-                        live[idx] = true;
+                    if idx < n {
+                        any_gen_live[idx] = true;
+                        if generations[idx].load(Acquire) == shape_gen {
+                            live[idx] = true;
+                        }
                     }
                 }
             }
@@ -1274,6 +1278,9 @@ impl Shapes {
                 let gen_now = generations[idx].load(Relaxed);
                 if let Some(next_gen) = gen_now.checked_add(1) {
                     generations[idx].store(next_gen, Release);
+                    self.free.push(idx as u32);
+                } else if !any_gen_live[idx] {
+                    generations[idx].store(0, Release);
                     self.free.push(idx as u32);
                 }
                 freed += 1;
@@ -2482,12 +2489,14 @@ pub(crate) mod tests {
         pinned[idx as usize].fetch_sub(1, Release);
         assert_eq!(shapes.list.len(), CAP);
 
-        // A slot at generation `u8::MAX` retires instead of wrapping around.
+        // A slot at generation `u8::MAX` wraps to 0 once no live heap names
+        // it at any generation.
         generations[idx as usize].store(u8::MAX, Release);
         let freed_at_max = shapes.sweep(&heaps[..1], &pinned, &alive, &generations, None);
         assert!(freed_at_max >= 1);
         assert!(!alive[idx as usize].load(Acquire));
-        assert!(!shapes.free.contains(&idx));
+        assert!(shapes.free.contains(&idx));
+        assert_eq!(generations[idx as usize].load(Acquire), 0);
 
         // Copying a PLACED record outside VIEW_HEAPS materializes it into VIEWS
         // so it keeps resolving even if the shape slot is later reused.
