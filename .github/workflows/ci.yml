@@ -24,12 +24,10 @@ jobs:
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      # Warnings are reported but do not fail the run until main is clean
-      # of them (see the clippy cleanup issue); errors still do.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
-        run: cargo clippy --workspace --all-targets --all-features --locked
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Includes xtask's repository_passes_policy, the asset-policy check.
       # Every crate's tests, even after one fails. victory-gpu's without a
       # GPU device: the runners have none, and WARP crashes in its tests

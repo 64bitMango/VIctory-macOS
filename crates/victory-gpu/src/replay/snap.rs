@@ -185,7 +185,7 @@ pub(super) fn present(
         Stage::Waiting => {
             let seconds = r.began.elapsed().as_secs_f64();
             let asked = plain::due(r.settings.at, presents, world, seconds);
-            let by_file = asked.is_none() && phase.seen % 16 == 0 && triggered(r);
+            let by_file = asked.is_none() && phase.seen.is_multiple_of(16) && triggered(r);
             if let Some(target) = asked.or(by_file.then_some(0)) {
                 tracing::info!(
                     presents,
@@ -372,6 +372,8 @@ unsafe impl Send for CpuBuffer {}
 // SAFETY: as above; the mapping is only read.
 unsafe impl Sync for CpuBuffer {}
 
+type HeapSlots = (Arc<Heap>, Vec<(u32, u32, Slot)>);
+
 struct Capture {
     worker: Worker,
     others: Vec<Worker>,
@@ -379,7 +381,7 @@ struct Capture {
     frame: u32,
     states: States,
     idle: HashSet<u32>,
-    heaps: Vec<(Arc<Heap>, Vec<(u32, u32, Slot)>)>,
+    heaps: Vec<HeapSlots>,
     contents: Vec<Content>,
     buffers: Vec<CpuBuffer>,
     known: HashSet<u32>,

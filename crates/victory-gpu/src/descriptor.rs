@@ -2334,7 +2334,7 @@ pub(crate) mod tests {
                             let slot = FIRST + ((seed >> 20) % span) as u32;
                             // A third of the writes into the heap no sync
                             // looks at: by calls only.
-                            let own = (seed >> 48) % 3 == 0;
+                            let own = (seed >> 48).is_multiple_of(3);
                             let views = own || what & 1 == 1;
                             let (kind, step) = if views { (VIEWS_KIND, 32u64) } else { (SAMPLERS, 16) };
                             let start = if own { unwatched_start } else { base(usize::from(views)) };
@@ -2479,7 +2479,7 @@ pub(crate) mod tests {
                         let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
                         let mut view = [0u32; 16];
                         view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
-                        let address = textures_at + ((round + t) % 16 << 12);
+                        let address = textures_at + (((round + t) % 16) << 12);
                         (view[10], view[11]) = (address as u32, (address >> 32) as u32);
                         barrier.wait();
                         for i in FIRST..SLOTS {

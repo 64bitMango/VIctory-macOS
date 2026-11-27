@@ -1260,6 +1260,7 @@ mod tests {
         assert!(held.is_empty(), "everything ran from one pump");
         // NOT_EQUAL 0 of the timestamp a flight will write.
         let stamped = list(Some((w2, Written::GpuTimestamp)), "stamped prepared", Box::new(|| 0));
+        // SAFETY: `w2` is our test's own writable `u64` slot.
         unsafe { (w2 as *mut u64).write_volatile(0) };
         held.push(qa, Item::Segment(stamped, Vec::new()));
         held.push(qa, Item::Segment(fourth, vec![wait(w2, 6, 0)]));
