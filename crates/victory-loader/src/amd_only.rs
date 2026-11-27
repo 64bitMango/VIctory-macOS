@@ -232,11 +232,38 @@ pub(crate) struct Sse4aSite {
     at_imm: u8,
 }
 
+/// Whether the bytes just before `code[at]` are the opcode of a `mov`
+/// with an immediate and `at` falls inside it, as a pattern found there
+/// is part of the constant, not an instruction: `b8..=bf` loads four,
+/// and with a REX that has the wide bit set, eight bytes.
+fn inside_a_mov_immediate(code: &[u8], at: usize) -> bool {
+    for p in at.saturating_sub(9)..at {
+        let Some(&opcode) = code.get(p) else { continue };
+        if !matches!(opcode, 0xb8..=0xbf) {
+            continue;
+        }
+        let start = p + 1;
+        let len = if p > 0 && code[p - 1].wrapping_sub(0x40) < 0x10 && code[p - 1] & 8 != 0 {
+            8
+        } else {
+            4
+        };
+        if start <= at && at < start + len {
+            return true;
+        }
+    }
+    false
+}
+
 /// The `extrq`/`insertq` at `code[at]`, if it is one of the four forms
-/// ([`Sse4aSite`]); the modrm's register field must be 0 in the immediate
-/// form, as only that is ever emitted, and both forms are register-to-
-/// register.
+/// ([`Sse4aSite`]); the modrm's register field must be 0 in `extrq`'s
+/// immediate form, as only that is ever emitted, both forms are
+/// register-to-register, and a site inside a `mov` immediate is a
+/// coincidence of bytes, not an instruction.
 pub(crate) fn sse4a_site(code: &[u8], at: usize) -> Option<Sse4aSite> {
+    if inside_a_mov_immediate(code, at) {
+        return None;
+    }
     let &prefix = code.get(at)?;
     if !matches!(prefix, 0x66 | 0xf2) {
         return None;
@@ -257,7 +284,7 @@ pub(crate) fn sse4a_site(code: &[u8], at: usize) -> Option<Sse4aSite> {
         _ => return None,
     };
     let modrm = *code.get(o + 2)?;
-    if modrm >> 6 != 3 || immediate && (modrm >> 3) & 7 != 0 {
+    if modrm >> 6 != 3 || immediate && prefix == 0x66 && (modrm >> 3) & 7 != 0 {
         return None;
     }
     let dst = (modrm >> 3) & 7 | (rex & 4) << 1;
@@ -979,12 +1006,34 @@ mod tests {
         // left), though too short to patch.
         let found = sse4a_site(&[0x66, 0x0f, 0x79, 0xc1], 0).unwrap();
         assert_eq!(found.len, 4);
-        // The forms' own rules: the immediate form's register field is 0,
-        // and both are register-to-register.
+        // `insertq`'s immediate form keeps its register field: the bits land
+        // in the register it names, not in the one the modrm encodes.
+        let f = sse4a_site(&[0xf2, 0x0f, 0x78, 0xc9, 0x10, 0x10], 0).unwrap();
+        assert_eq!(
+            (f.len, f.prefix, f.immediate, f.src, f.dst),
+            (6, 0xf2, true, 1, 1)
+        );
+        // The forms' own rules: `extrq`'s immediate form has the register
+        // field 0, and both are register-to-register.
         assert!(sse4a_site(&[0x66, 0x0f, 0x78, 0xc9, 0x08, 0x14], 0).is_none());
         assert!(sse4a_site(&[0x66, 0x0f, 0x78, 0x06, 0x08, 0x14], 0).is_none());
         assert!(sse4a_site(&[0xf3, 0x0f, 0x79, 0xc1], 0).is_none());
         assert!(sse4a_site(&[0x66, 0x0f, 0x7a, 0xc1], 0).is_none());
+        // A pattern inside another instruction's immediate is a constant,
+        // not an instruction: `movabs rax, 0x1408c6780f66`.
+        let movabs = [
+            0x48, 0xb8, 0x66, 0x0f, 0x78, 0xc6, 0x08, 0x14, 0x00, 0x00, 0xc3,
+        ];
+        assert!(sse4a_site(&movabs, 2).is_none());
+        assert_eq!(sse4a_sites(&movabs).len(), 0);
+        // The same, as a four-byte immediate (`mov eax, 0x1408c6780f66`),
+        // and a real `extrq` right after one, still found.
+        let mov = [0xb8, 0x66, 0x0f, 0x78, 0xc6, 0xc3];
+        assert!(sse4a_site(&mov, 1).is_none());
+        let after = [
+            0xb8, 0x00, 0x00, 0x00, 0x00, 0x66, 0x0f, 0x78, 0xc6, 0x08, 0x14,
+        ];
+        assert_eq!(sse4a_sites(&after).len(), 1);
     }
 
     #[test]
