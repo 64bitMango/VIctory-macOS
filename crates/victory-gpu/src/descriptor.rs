@@ -1319,30 +1319,6 @@ impl Shapes {
                 }
             }
         }
-        #[cfg(windows)]
-        {
-            let hosts = crate::descriptor::heaps();
-            for &(_, _, h) in hosts.iter() {
-                // SAFETY: registered heaps in heaps() are live.
-                if let Some(Some(host)) = unsafe { &*(h as *const Heap) }.host.get() {
-                    for slot in 0..host.count() {
-                        let key = host.made_key(slot);
-                        if key != 0 {
-                            let generation = (key >> 32) as u32;
-                            if (generation >> KIND_SHIFT) == PLACED {
-                                let item = key as u32;
-                                let code = (payload(item, generation) >> PLACED_ADDRESS_BITS) as usize;
-                                let idx = code & SHAPE_INDEX_MASK;
-                                let shape_gen = (code >> SHAPE_BITS) as u8;
-                                if idx < n && generations[idx].load(Acquire) == shape_gen {
-                                    live[idx] = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
         let mut freed = 0;
         for (idx, &in_heap) in live.iter().enumerate() {
             if !in_heap && pinned_snapshot[idx] == 0 && alive[idx].load(Relaxed) {
@@ -2718,6 +2694,70 @@ pub(crate) mod tests {
             Some(View::Placed(false, resource, desc)),
             "raw-byte copy into registered heap remains addressable"
         );
+    }
+
+    /// Shape reclamation at the 16,384-slot bound correctly sweeps and reclaims
+    /// unreferenced shapes while preserving shapes referenced by live heaps,
+    /// allowing subsequent insertions to reuse evicted slots with advancing generations.
+    #[test]
+    fn shapes_table_reclamation_at_16384_bound() {
+        use std::sync::atomic::{
+            AtomicBool, AtomicU8, AtomicU32, Ordering::Acquire, Ordering::Release,
+        };
+        let mut shapes = Shapes {
+            list: Vec::new(),
+            index: std::collections::BTreeMap::new(),
+            free: Vec::new(),
+            last_sweep_epoch: 0,
+            misses_since_sweep: 0,
+        };
+        let pinned: Vec<AtomicU32> = (0..SHAPE_LIMIT).map(|_| AtomicU32::new(0)).collect();
+        let alive: Vec<AtomicBool> = (0..SHAPE_LIMIT).map(|_| AtomicBool::new(false)).collect();
+        let generations: Vec<AtomicU8> = (0..SHAPE_LIMIT).map(|_| AtomicU8::new(0)).collect();
+        let make = |k: u32| -> Shape { (false, [k; 14], [k + 100; 14]) };
+
+        // Fill shapes table to its 16,384-slot bound.
+        for k in 0..SHAPE_LIMIT as u32 {
+            let (res, grew) = shapes.insert(make(k), SHAPE_LIMIT, &pinned, &alive, &generations);
+            assert!(grew);
+            let (_code, idx) = res.unwrap();
+            pinned[idx as usize].fetch_sub(1, Release);
+        }
+        assert_eq!(shapes.list.len(), SHAPE_LIMIT);
+
+        // At capacity, new insertions fail without sweeping.
+        assert_eq!(
+            shapes.insert(make(999_999), SHAPE_LIMIT, &pinned, &alive, &generations),
+            (None, false)
+        );
+
+        // Create a single backing heap referencing only slot 0.
+        let mut heap_slot = [0u32; 8];
+        let [i, generation] = placed_words(0, 0x1000);
+        write_record(heap_slot.as_mut_ptr() as u64, i, generation);
+        let heaps = [ViewHeap {
+            start: heap_slot.as_ptr() as u64,
+            count: 1,
+            at: 1,
+        }];
+
+        // Sweep reclaims the 16,383 unreferenced shapes while keeping slot 0 live.
+        let freed = shapes.sweep(&heaps, &pinned, &alive, &generations);
+        assert_eq!(freed, SHAPE_LIMIT - 1);
+        assert!(alive[0].load(Acquire));
+        for idx in 1..SHAPE_LIMIT {
+            assert!(!alive[idx].load(Acquire));
+            assert_eq!(generations[idx].load(Acquire), 1);
+        }
+
+        // Subsequent insertion reuses an evicted slot with generation 1 instead of growing.
+        let (reused, grew) = shapes.insert(make(999_999), SHAPE_LIMIT, &pinned, &alive, &generations);
+        assert!(!grew);
+        let (code, idx) = reused.unwrap();
+        assert_ne!(idx, 0);
+        assert_eq!((code >> SHAPE_BITS) as u8, 1);
+        pinned[idx as usize].fetch_sub(1, Release);
+        assert_eq!(shapes.list.len(), SHAPE_LIMIT);
     }
 
     /// Concurrent writers to the same slot never interleave their stores,
