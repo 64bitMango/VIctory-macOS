@@ -9,3 +9,7 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "atomic_locks"
+harness = false

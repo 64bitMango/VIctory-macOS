@@ -1035,11 +1035,14 @@ unsafe impl Send for Bitmap {}
 // SAFETY: as above.
 unsafe impl Sync for Bitmap {}
 
+/// The two bitmaps of [`bitmap`], each made when first asked for.
+static BITMAPS: [std::sync::OnceLock<Option<Bitmap>>; 2] =
+    [const { std::sync::OnceLock::new() }; 2];
+
 /// The bitmap of other shaders, or (`memory`) of shaders that use title
 /// memory, whose marks go back only while it is not withheld
 /// (`crate::memory::withholding`).
 fn bitmap(memory: bool) -> Option<&'static Bitmap> {
-    static BITMAPS: [std::sync::OnceLock<Option<Bitmap>>; 2] = [const { std::sync::OnceLock::new() }; 2];
     BITMAPS[usize::from(memory)]
         .get_or_init(|| {
             // Written pages, then one read mark per heap index, then the lock
@@ -1065,6 +1068,31 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
 /// title memory, see [`bitmap`]).
 pub(crate) fn view_writes(memory: bool) -> Option<u64> {
     bitmap(memory).map(|b| b.gpu)
+}
+
+/// After a submission: how many lanes gave up waiting for a 64-bit
+/// atomic's lock since the last call and went on without it, so that their
+/// updates may be lost (`victory_shader::emit`, "Atomic locks"; #240). The
+/// counts are cleared.
+pub(crate) fn take_gave_up() -> u64 {
+    let dwords = (victory_shader::emit::VIEW_WRITES_BYTES / 4) as usize;
+    BITMAPS
+        .iter()
+        .filter_map(|b| b.get()?.as_ref())
+        .map(|b| {
+            // SAFETY: the mapped buffer of `dwords` dwords; the GPU is done
+            // with it (one submission runs at a time, and none runs now).
+            let words = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, dwords) };
+            take_count(words)
+        })
+        .sum()
+}
+
+/// Takes the give-up count from `words`, a bitmap buffer's dwords.
+fn take_count(words: &mut [u32]) -> u64 {
+    u64::from(std::mem::take(
+        &mut words[(victory_shader::emit::ATOMIC_LOCKS_GAVE_UP_AT / 4) as usize],
+    ))
 }
 
 /// Heap slots whose texture views shaders read: the marks seen so far (a
@@ -1293,6 +1321,27 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
     }
+}
+
+/// The bytes a batch's refreshes ask for at least before they run on
+/// several threads ([`parallel_copies`]).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const PARALLEL_REFRESH_MIN_BYTES: usize = 512 << 10;
+
+/// Whether the refreshes of several copies before a submission run on
+/// helper threads at once, each copy's ranges in order on one of them
+/// (upstream #280): with `VICTORY_PARALLEL_COPIES=1`, off until it is
+/// compared in the game (upstream has it on). Upstream's parallel
+/// copy-back is not taken: copy-back here is already a batch of pieces on
+/// several threads ([`batched`]).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn parallel_copies() -> bool {
+    #[cfg(test)]
+    if tests::PARALLEL.with(|p| p.get()) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_PARALLEL_COPIES"))
 }
 
 /// Whether a submission's copy-back is done as a batch of pieces on
@@ -2384,6 +2433,9 @@ pub(crate) mod tests {
         /// This thread's submissions copy back range by range (as
         /// `VICTORY_COPY_BACK_BATCH=0`).
         pub(crate) static ONE_BY_ONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// This thread's refresh batches run on several threads (as
+        /// `VICTORY_PARALLEL_COPIES=1`).
+        pub(crate) static PARALLEL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// The threads this thread's batches use for every pass, however
         /// few the pieces (0: as outside tests).
         pub(crate) static THREADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2439,6 +2491,19 @@ pub(crate) mod tests {
         // SAFETY: a bit of the mapped bitmap; no submission runs (the caller
         // holds the submission lock).
         unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+    }
+
+    /// The give-up count of the emulated 64-bit atomics' locks is taken
+    /// once, and the words around it stay as they were (#240).
+    #[test]
+    fn the_give_up_count_is_taken_once() {
+        let dwords = (victory_shader::emit::VIEW_WRITES_BYTES / 4) as usize;
+        let at = (victory_shader::emit::ATOMIC_LOCKS_GAVE_UP_AT / 4) as usize;
+        assert_eq!(at + 1, dwords, "the last dword");
+        let mut words = vec![0xA5A5_A5A5u32; dwords];
+        assert_eq!(take_count(&mut words), 0xA5A5_A5A5, "the give-up count");
+        assert_eq!(take_count(&mut words), 0, "taken once");
+        assert!(words[..at].iter().all(|&w| w == 0xA5A5_A5A5), "the rest kept");
     }
 
     /// The title writes a constant under a range an earlier list of the

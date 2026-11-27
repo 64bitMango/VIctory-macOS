@@ -95,6 +95,28 @@ fn atomic_locks() -> bool {
     })
 }
 
+/// Whether the lanes of a wave first try their 64-bit atomics' locks in
+/// rounds before the lanes still not done take turns (`emit`, "Atomic
+/// locks"; #240): opt-in while it is measured, `VICTORY_ATOMIC_LOCK_ROUNDS=1`.
+/// Only with [`atomic_locks`].
+fn atomic_lock_rounds() -> bool {
+    static ROUNDS: OnceLock<bool> = OnceLock::new();
+    *ROUNDS.get_or_init(|| {
+        atomic_locks() && std::env::var("VICTORY_ATOMIC_LOCK_ROUNDS").as_deref() == Ok("1")
+    })
+}
+
+/// Whether a glc-clear 64-bit `umax` first reduces each texel's lanes of
+/// a wave to their maximum key, one representative locking (`emit`,
+/// "Atomic locks"; #240): opt-in while it is measured,
+/// `VICTORY_ATOMIC_UMAX=1`. Only with [`atomic_lock_rounds`].
+fn atomic_umax() -> bool {
+    static UMAX: OnceLock<bool> = OnceLock::new();
+    *UMAX.get_or_init(|| {
+        atomic_lock_rounds() && std::env::var("VICTORY_ATOMIC_UMAX").as_deref() == Ok("1")
+    })
+}
+
 /// Whether compute shaders' biased samples run as scaled gradient samples:
 /// under Wine, whose D3DMetal ignores the bias there (#30).
 /// `VICTORY_BIAS_AS_GRADIENTS=0` or `1` overrides.
@@ -293,7 +315,7 @@ fn warn_kept_wide() {
 /// made for dispatches counted in threads: their own cache entries, one
 /// per combination.
 fn options_build(o: &victory_shader::emit::Options) -> &'static [u8; 32] {
-    static BUILDS: [OnceLock<[u8; 32]>; 512] = [const { OnceLock::new() }; 512];
+    static BUILDS: [OnceLock<[u8; 32]>; 2048] = [const { OnceLock::new() }; 2048];
     let i = usize::from(o.atomic_locks)
         | usize::from(o.bias_as_gradients) << 1
         | usize::from(o.mesh_stores_last) << 2
@@ -302,12 +324,20 @@ fn options_build(o: &victory_shader::emit::Options) -> &'static [u8; 32] {
         | usize::from(o.thread_counts) << 5
         | usize::from(o.atomic_fences) << 6
         | usize::from(o.no_wave_walk) << 7
-        | usize::from(o.uav_size_level0) << 8;
+        | usize::from(o.uav_size_level0) << 8
+        | usize::from(o.atomic_locks && o.atomic_lock_rounds) << 9
+        | usize::from(o.atomic_locks && o.atomic_lock_rounds && o.atomic_umax) << 10;
     BUILDS[i].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
         if o.atomic_locks {
             h.update(b"atomic locks");
+        }
+        if o.atomic_locks && o.atomic_lock_rounds {
+            h.update(b"atomic lock rounds");
+        }
+        if o.atomic_locks && o.atomic_lock_rounds && o.atomic_umax {
+            h.update(b"atomic umax");
         }
         if o.bias_as_gradients {
             h.update(b"bias as gradients");
@@ -382,6 +412,8 @@ pub fn host_shader_keeping(
     let options = victory_shader::emit::Options {
         view_marks: true,
         atomic_locks: atomic_locks(),
+        atomic_lock_rounds: atomic_lock_rounds(),
+        atomic_umax: atomic_umax(),
         bias_as_gradients: bias_as_gradients(),
         compact_mesh_interface: false,
         mesh_stores_last: mesh_stores_last(),

@@ -233,6 +233,8 @@ fn build(
         dropped_rows: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves: false,
         uav_size_level0: false,

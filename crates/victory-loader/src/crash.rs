@@ -104,21 +104,49 @@ pub fn log_crash(text: &str) {
 }
 
 fn append_to_log(text: &str) {
-    use std::io::Write;
     let Some(file) = LOG.get() else { return };
+    let _ = append_record(file, text);
+}
+
+/// Held while a record is appended. Wine appends at the size `fstat` gives
+/// and `pwrite`s there, so two threads appending at once can write over each
+/// other's records. A bounded spin stands in for a lock: a thread that
+/// faults while holding it delays a report but cannot stop it.
+static APPENDING: AtomicBool = AtomicBool::new(false);
+const APPEND_TRIES: u32 = 1 << 16;
+
+fn append_record(file: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let held = (0..APPEND_TRIES).any(|_| {
+        let won = APPENDING
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok();
+        if !won {
+            std::thread::yield_now();
+        }
+        won
+    });
+    let appended = append_once(file, text);
+    if held {
+        APPENDING.store(false, Ordering::Release);
+    }
+    appended
+}
+
+fn append_once(file: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let opened = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(file);
-    if let Ok(mut f) = opened {
-        let _ = write!(
-            f,
-            "unix time {now}, process {}\n{text}\n",
-            std::process::id()
-        );
+    let record = format!("unix time {now}, process {}\n{text}\n", std::process::id());
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
+    // Formatting directly into the file can append fragments separately.
+    // Use one append, with no lock to acquire from an exception handler.
+    if file.write(record.as_bytes())? == record.len() {
+        Ok(())
+    } else {
+        // Retrying a short write could put another report between its pieces.
+        Err(Error::new(ErrorKind::WriteZero, "incomplete crash record append"))
     }
 }
 
@@ -1118,6 +1146,49 @@ mod tests {
         EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
 
+    #[test]
+    fn concurrent_crash_records_stay_together() {
+        const THREADS: usize = 8;
+        const RECORDS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("synthetic-crashes.txt");
+        let ready = std::sync::Barrier::new(THREADS);
+        let body = "x".repeat(8192);
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                let (file, ready, body) = (&file, &ready, &body);
+                scope.spawn(move || {
+                    ready.wait();
+                    for record in 0..RECORDS {
+                        super::append_record(file, &format!("record {thread}:{record}\n{body}"))
+                            .unwrap();
+                    }
+                });
+            }
+        });
+
+        let log = std::fs::read_to_string(file).unwrap();
+        let mut lines = log.lines();
+        let mut seen = std::collections::BTreeSet::new();
+        let process = std::process::id().to_string();
+        while let Some(header) = lines.next() {
+            let (time, pid) = header
+                .strip_prefix("unix time ")
+                .and_then(|line| line.split_once(", process "))
+                .expect("each record starts with a complete header");
+            assert!(time.parse::<u64>().is_ok());
+            assert_eq!(pid, process);
+            assert!(seen.insert(lines.next().expect("record identifier")));
+            assert!(lines.next().is_some_and(|line| line == body));
+        }
+        for thread in 0..THREADS {
+            for record in 0..RECORDS {
+                assert!(seen.remove(format!("record {thread}:{record}").as_str()));
+            }
+        }
+        assert!(seen.is_empty());
+    }
+
     /// What [`capture_frames`] saw: our [`unwind`], then the system's walk.
     type Captured = (Vec<u64>, Vec<usize>);
 
@@ -1274,8 +1345,10 @@ mod tests {
         assert_eq!(memory_at(base + 0x3008), "no access");
         // SAFETY: releases the reservation made above.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
-        // Not asked of `base` again: tests on other threads map memory, and
-        // one may be given the pages just released (CI saw "read-execute").
+        // The released range is not asked about: another test's thread can
+        // reserve or map it again at once, and the answer is then that
+        // thread's memory (#162). Address 0 is free in the same way and
+        // stays free.
         assert_eq!(memory_at(0), "nothing mapped there");
         assert_eq!(memory_at(usize::MAX), "outside the address space");
         // This test's own code: an image page, named by its module.

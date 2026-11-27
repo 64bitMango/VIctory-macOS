@@ -113,6 +113,10 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
+/// Lanes that gave up waiting for a 64-bit atomic's lock, over the run
+/// (`crate::shadow::take_gave_up`).
+static GAVE_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
@@ -495,6 +499,46 @@ pub(crate) mod tests {
     /// The barriers built on this thread since the last call.
     pub(crate) fn issued() -> Vec<(usize, u32, u32)> {
         ISSUED.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+
+    /// Refreshes of several copies at once (`VICTORY_PARALLEL_COPIES=1`)
+    /// bring each copy up to date as one after the other would.
+    #[test]
+    fn parallel_batch_flush_updates_multiple_shadows_identically() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        if super::host().is_none() {
+            return;
+        }
+        crate::shadow::tests::PARALLEL.with(|p| p.set(true));
+        let len = 0x40000usize;
+        let mut ptrs = Vec::new();
+        let mut shadows = Vec::new();
+        for i in 0..3usize {
+            // SAFETY: fresh committed allocation, freed below.
+            let p = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+            assert_ne!(p, 0);
+            let pattern = (0x21 + i as u8).wrapping_mul(3);
+            // SAFETY: `len` committed bytes at `p`.
+            unsafe { std::ptr::write_bytes(p as *mut u8, pattern, len) };
+            let id = 0x9100 + i;
+            crate::shadow::register(id, p as u64, len as u64);
+            let shadow = crate::shadow::find(p as u64, len as u64).expect("shadow");
+            ptrs.push((id, p, pattern));
+            shadows.push(shadow);
+        }
+        let mut batch = super::Batch::default();
+        for (i, &(_, p, _)) in ptrs.iter().enumerate() {
+            batch.add(&shadows[i], p, len);
+        }
+        let copied = batch.flush();
+        crate::shadow::tests::PARALLEL.with(|p| p.set(false));
+        assert!(copied >= 3 * len);
+        for (i, &(_, _, pattern)) in ptrs.iter().enumerate() {
+            assert_eq!(shadows[i].read_host(ptrs[i].1 as u64, 4), vec![u32::from_le_bytes([pattern; 4]); 4]);
+            crate::shadow::unregister(ptrs[i].0, ptrs[i].1 as u64);
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(ptrs[i].1 as *mut _, 0, MEM_RELEASE) };
+        }
     }
 
     /// Replays transitions in the order the GPU runs them from the states
@@ -1785,6 +1829,20 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         drop(reading);
+        // Lanes that gave up waiting for a 64-bit atomic's lock: their
+        // updates may be lost (`victory_shader::emit`, "Atomic locks").
+        let gave_up = crate::shadow::take_gave_up();
+        if gave_up > 0 {
+            let before = GAVE_UP.fetch_add(gave_up, Ordering::Relaxed);
+            let total = before + gave_up;
+            if before == 0 || before.ilog2() != total.ilog2() {
+                tracing::warn!(
+                    gave_up,
+                    total,
+                    "lanes gave up waiting for a 64-bit atomic's lock and went on without it, so their updates may be lost (#240)"
+                );
+            }
+        }
         {
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
@@ -3109,15 +3167,48 @@ impl Batch {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
+        let how = if self.rest { crate::watch::Take::Resting } else { crate::watch::Take::All };
+        let work = std::mem::take(&mut self.refreshes);
+        // Several copies' refreshes on helper threads at once, each copy's
+        // ranges in order on one of them (`crate::shadow::parallel_copies`).
+        let requested: usize = work.iter().flat_map(|(_, ranges)| ranges.iter()).map(|(from, to)| to - from).sum();
+        let done: Vec<Vec<(usize, usize, usize, u64)>> = if crate::shadow::parallel_copies()
+            && work.len() >= 2
+            && requested >= crate::shadow::PARALLEL_REFRESH_MIN_BYTES
+        {
+            let results: Vec<Mutex<Vec<(usize, usize, usize, u64)>>> = (0..work.len()).map(|_| Mutex::default()).collect();
+            crate::texture::in_parallel(work.len(), |i| {
+                let (shadow, ranges) = &work[i];
+                let out: Vec<_> = ranges
+                    .iter()
+                    .map(|(from, to)| {
+                        let started = std::time::Instant::now();
+                        let copied = shadow.update_as(from, to - from, how);
+                        (from, to, copied, started.elapsed().as_micros() as u64)
+                    })
+                    .collect();
+                *results[i].lock().unwrap_or_else(|e| e.into_inner()) = out;
+            });
+            results.into_iter().map(|r| r.into_inner().unwrap_or_else(|e| e.into_inner())).collect()
+        } else {
+            work.iter()
+                .map(|(shadow, ranges)| {
+                    ranges
+                        .iter()
+                        .map(|(from, to)| {
+                            let started = std::time::Instant::now();
+                            let copied = shadow.update_as(from, to - from, how);
+                            (from, to, copied, started.elapsed().as_micros() as u64)
+                        })
+                        .collect()
+                })
+                .collect()
+        };
         let mut total = 0;
-        for (shadow, ranges) in self.refreshes.drain(..) {
+        for ((shadow, _), done) in work.into_iter().zip(done) {
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
             let (start, len) = shadow.range();
-            for (from, to) in ranges.iter() {
-                let started = std::time::Instant::now();
-                let how = if self.rest { crate::watch::Take::Resting } else { crate::watch::Take::All };
-                let copied = shadow.update_as(from, to - from, how);
-                let us = started.elapsed().as_micros() as u64;
+            for (from, to, copied, us) in done {
                 #[cfg(feature = "diagnostics")]
                 {
                     crate::copystat::range(from, to - from, us, 0);
