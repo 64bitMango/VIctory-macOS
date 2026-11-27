@@ -24,6 +24,7 @@ pub(crate) struct GraphicsState {
     sample_mask: u32,
     rasterizer: D3D12_RASTERIZER_DESC,
     depth: D3D12_DEPTH_STENCIL_DESC,
+    depth_bounds: bool,
     /// Input elements, their names pointing into `names`.
     inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
     names: Vec<CString>,
@@ -75,6 +76,7 @@ impl Default for GraphicsState {
                 BackFace: keep,
                 ..Default::default()
             },
+            depth_bounds: false,
             inputs: Vec::new(),
             names: Vec::new(),
             strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
@@ -152,20 +154,13 @@ impl GraphicsState {
                 8 => self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned(),
                 9 => self.sample_mask = data.cast::<u32>().read_unaligned(),
                 10 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
-                11 => self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned(),
+                11 => {
+                    self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned();
+                    self.depth_bounds = false;
+                }
                 21 => {
-                    // shortcut: the depth bounds test is dropped (the host
-                    // pipeline uses the plain description); bring it back
-                    // with a stream if a title enables it.
                     let d = data.cast::<D3D12_DEPTH_STENCIL_DESC1>().read_unaligned();
-                    if d.DepthBoundsTestEnable.as_bool() {
-                        static SAID: std::sync::Once = std::sync::Once::new();
-                        SAID.call_once(|| {
-                            tracing::warn!(
-                                "a pipeline enables the depth bounds test, which its host pipeline leaves out: its draws pass at every depth"
-                            )
-                        });
-                    }
+                    self.depth_bounds = d.DepthBoundsTestEnable.as_bool();
                     self.depth = D3D12_DEPTH_STENCIL_DESC {
                         DepthEnable: d.DepthEnable,
                         DepthWriteMask: d.DepthWriteMask,
@@ -246,11 +241,12 @@ impl GraphicsState {
             })
             .collect();
         format!(
-            "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}",
+            "{:?} {} {:?} {:?} {} {inputs:?} {} {} {:?} {} {:?}",
             self.blend,
             self.sample_mask,
             self.rasterizer,
             self.depth,
+            self.depth_bounds,
             self.strip_cut.0,
             self.topology.0,
             self.targets,
@@ -799,15 +795,16 @@ impl HostPipeline {
             },
             _ => Vec::new(),
         };
+        let gs_code = D3D12_SHADER_BYTECODE {
+            pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
+            BytecodeLength: gs.len(),
+        };
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
             PS: code(1),
-            GS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
-                BytecodeLength: gs.len(),
-            },
+            GS: gs_code,
             BlendState: g.blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
@@ -833,13 +830,17 @@ impl HostPipeline {
         #[cfg(feature = "diagnostics")]
         tracing::info!(?shaders, pipeline = %name, %state, "preparing host graphics pipeline");
         let started = std::time::Instant::now();
-        let made = super::library::pipeline(
-            &name,
-            // SAFETY: the description points at live data.
-            |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
-            // SAFETY: as above.
-            || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
-        );
+        let made = if g.depth_bounds {
+            graphics_pipeline_with_depth_bounds(&host.device, &root, code(0), code(1), gs_code, g, &name)
+        } else {
+            super::library::pipeline(
+                &name,
+                // SAFETY: the description points at live data.
+                |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
+                // SAFETY: as above.
+                || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
+            )
+        };
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
@@ -883,61 +884,74 @@ fn host_topology(g: &GraphicsState) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
     }
 }
 
-/// A mesh pipeline from the title's graphics state: the pipeline-state
-/// stream form (no input layout).
-fn mesh_pipeline(
+/// Depth-stencil state in `D3D12_DEPTH_STENCIL_DESC1` form (for pipeline
+/// streams that enable the depth-bounds test).
+fn depth_stencil1(g: &GraphicsState) -> D3D12_DEPTH_STENCIL_DESC1 {
+    D3D12_DEPTH_STENCIL_DESC1 {
+        DepthEnable: g.depth.DepthEnable,
+        DepthWriteMask: g.depth.DepthWriteMask,
+        DepthFunc: g.depth.DepthFunc,
+        StencilEnable: g.depth.StencilEnable,
+        StencilReadMask: g.depth.StencilReadMask,
+        StencilWriteMask: g.depth.StencilWriteMask,
+        FrontFace: g.depth.FrontFace,
+        BackFace: g.depth.BackFace,
+        DepthBoundsTestEnable: g.depth_bounds.into(),
+    }
+}
+
+/// A graphics pipeline with `DepthBoundsTestEnable` set: `D3D12_GRAPHICS_PIPELINE_STATE_DESC`
+/// has no depth-bounds field, so this uses the pipeline-state stream form.
+fn graphics_pipeline_with_depth_bounds(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
-    ms: D3D12_SHADER_BYTECODE,
+    vs: D3D12_SHADER_BYTECODE,
     ps: D3D12_SHADER_BYTECODE,
+    gs: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
-    /// A stream subobject: its type, then its description, pointer-aligned.
     #[repr(C, align(8))]
     struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
     #[repr(C)]
     struct Stream {
         root: Sub<*mut std::ffi::c_void>,
-        ms: Sub<D3D12_SHADER_BYTECODE>,
+        vs: Sub<D3D12_SHADER_BYTECODE>,
         ps: Sub<D3D12_SHADER_BYTECODE>,
+        gs: Sub<D3D12_SHADER_BYTECODE>,
         blend: Sub<D3D12_BLEND_DESC>,
         mask: Sub<u32>,
         raster: Sub<D3D12_RASTERIZER_DESC>,
-        depth: Sub<D3D12_DEPTH_STENCIL_DESC>,
+        depth: Sub<D3D12_DEPTH_STENCIL_DESC1>,
+        input: Sub<D3D12_INPUT_LAYOUT_DESC>,
+        strip_cut: Sub<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>,
+        topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
         targets: Sub<D3D12_RT_FORMAT_ARRAY>,
         dsv: Sub<DXGI_FORMAT>,
         samples: Sub<DXGI_SAMPLE_DESC>,
-        topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
     }
     let mut stream = Stream {
-        root: Sub(
-            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
-            root.as_raw(),
-        ),
-        ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
+        root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+        vs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, vs),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
+        gs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, gs),
         blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
-        mask: Sub(
-            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
-            g.sample_mask,
-        ),
+        mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
-        depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
-        targets: Sub(
-            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
-            g.targets,
+        depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth_stencil1(g)),
+        input: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT,
+            D3D12_INPUT_LAYOUT_DESC {
+                pInputElementDescs: g.inputs.as_ptr(),
+                NumElements: g.inputs.len() as u32,
+            },
         ),
-        dsv: Sub(
-            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
-            g.depth_format,
-        ),
-        samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
-        // The type the host derives from the mesh shader anyway, given: a
-        // pipeline library compares descriptions with it, and loads none
-        // made from a stream without it.
+        strip_cut: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE, g.strip_cut),
         topology: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, host_topology(g)),
+        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
+        dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
+        samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
     };
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
         SizeInBytes: size_of::<Stream>(),
@@ -951,6 +965,110 @@ fn mesh_pipeline(
         // SAFETY: as above.
         || unsafe { device.CreatePipelineState(&desc) },
     )
+}
+
+/// A mesh pipeline from the title's graphics state: the pipeline-state
+/// stream form (no input layout).
+fn mesh_pipeline(
+    device: &ID3D12Device,
+    root: &ID3D12RootSignature,
+    ms: D3D12_SHADER_BYTECODE,
+    ps: D3D12_SHADER_BYTECODE,
+    g: &GraphicsState,
+    name: &str,
+) -> windows::core::Result<ID3D12PipelineState> {
+    fn build<D>(
+        device: &ID3D12Device,
+        root: &ID3D12RootSignature,
+        ms: D3D12_SHADER_BYTECODE,
+        ps: D3D12_SHADER_BYTECODE,
+        g: &GraphicsState,
+        name: &str,
+        depth_type: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE,
+        depth: D,
+    ) -> windows::core::Result<ID3D12PipelineState> {
+        use windows::core::Interface;
+        /// A stream subobject: its type, then its description, pointer-aligned.
+        #[repr(C, align(8))]
+        struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
+        #[repr(C)]
+        struct Stream<D> {
+            root: Sub<*mut std::ffi::c_void>,
+            ms: Sub<D3D12_SHADER_BYTECODE>,
+            ps: Sub<D3D12_SHADER_BYTECODE>,
+            blend: Sub<D3D12_BLEND_DESC>,
+            mask: Sub<u32>,
+            raster: Sub<D3D12_RASTERIZER_DESC>,
+            depth: Sub<D>,
+            targets: Sub<D3D12_RT_FORMAT_ARRAY>,
+            dsv: Sub<DXGI_FORMAT>,
+            samples: Sub<DXGI_SAMPLE_DESC>,
+            topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+        }
+        let mut stream = Stream {
+            root: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+                root.as_raw(),
+            ),
+            ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
+            ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            mask: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+                g.sample_mask,
+            ),
+            raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
+            depth: Sub(depth_type, depth),
+            targets: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+                g.targets,
+            ),
+            dsv: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+                g.depth_format,
+            ),
+            samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
+            // The type the host derives from the mesh shader anyway, given: a
+            // pipeline library compares descriptions with it, and loads none
+            // made from a stream without it.
+            topology: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, host_topology(g)),
+        };
+        let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
+            SizeInBytes: size_of::<Stream<D>>(),
+            pPipelineStateSubobjectStream: (&raw mut stream).cast(),
+        };
+        let device = device.cast::<ID3D12Device2>()?;
+        super::library::pipeline(
+            name,
+            // SAFETY: the stream holds whole subobjects pointing at live data.
+            |library, name| unsafe { library.LoadPipeline(name, &desc) },
+            // SAFETY: as above.
+            || unsafe { device.CreatePipelineState(&desc) },
+        )
+    }
+    if g.depth_bounds {
+        build(
+            device,
+            root,
+            ms,
+            ps,
+            g,
+            name,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1,
+            depth_stencil1(g),
+        )
+    } else {
+        build(
+            device,
+            root,
+            ms,
+            ps,
+            g,
+            name,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL,
+            g.depth,
+        )
+    }
 }
 
 /// The bytes of shader code (none for an absent stage).
@@ -1107,5 +1225,47 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    #[test]
+    fn depth_bounds_test_is_kept_from_depth_stencil1_subobject() {
+        #[repr(C)]
+        struct Sub1(u32, D3D12_DEPTH_STENCIL_DESC1);
+        #[repr(C)]
+        struct Sub0(u32, D3D12_DEPTH_STENCIL_DESC);
+
+        let mut g = GraphicsState::default();
+        assert!(!g.depth_bounds);
+        let without = g.describe();
+
+        let sub1 = Sub1(
+            21,
+            D3D12_DEPTH_STENCIL_DESC1 {
+                DepthEnable: true.into(),
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                DepthFunc: D3D12_COMPARISON_FUNC_GREATER_EQUAL,
+                DepthBoundsTestEnable: true.into(),
+                ..Default::default()
+            },
+        );
+        // SAFETY: `sub1` is a whole subobject of type 21.
+        unsafe { g.read(21, (&raw const sub1).cast()) };
+        assert!(g.depth_bounds);
+        assert!(depth_stencil1(&g).DepthBoundsTestEnable.as_bool());
+        assert_ne!(g.describe(), without);
+
+        let sub0 = Sub0(
+            11,
+            D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: true.into(),
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                DepthFunc: D3D12_COMPARISON_FUNC_GREATER_EQUAL,
+                ..Default::default()
+            },
+        );
+        // SAFETY: `sub0` is a whole subobject of type 11.
+        unsafe { g.read(11, (&raw const sub0).cast()) };
+        assert!(!g.depth_bounds);
+        assert!(!depth_stencil1(&g).DepthBoundsTestEnable.as_bool());
     }
 }
