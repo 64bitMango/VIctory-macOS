@@ -1,0 +1,57 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit's reviews. Its approval, with passing CI, merges a pull request
+# (.github/workflows/automerge.yml).
+language: en-US
+reviews:
+  profile: chill
+  high_level_summary: true
+  poem: false
+  in_progress_fortune: false
+  review_status: true
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+  path_filters:
+    - "!Cargo.lock"
+  auto_approvals:
+    enabled: true
+    # The author may not approve their own pull request by command.
+    allow_author_approval: false
+    max_merge_risk: high
+    overrides:
+      # Always the maintainer's: CI, the policy check, build config,
+      # dependencies, tools/ and this file. Renames match both paths.
+      - enabled: false
+        paths:
+          - ".github/**"
+          - ".coderabbit.yaml"
+          - ".githooks/**"
+          - ".cargo/**"
+          - "xtask/**"
+          - "tools/**"
+          - "setup.sh"
+          - "rust-toolchain.toml"
+          - "**/Cargo.toml"
+          - "Cargo.toml"
+          - "Cargo.lock"
+  merge_risk_instructions: >-
+    Docs and test-only changes are minimal risk. Changes to the shader
+    translator (crates/victory-shader), the GPU layer (crates/victory-gpu),
+    the PE loader's code patching (crates/victory-loader) or lock-free tables
+    are at least moderate: they can silently drop draws, views or copies, or
+    alias stale data. Anything that weakens the asset policy is critical.
+  path_instructions:
+    - path: "**"
+      instructions: |
+        VIctory for macOS runs Xbox Series applications on Apple Silicon Macs through Wine, Rosetta 2 and D3DMetal. Review for correctness first: wrong GPU state, data races in lock-free code, unsound unsafe blocks, x86 instruction encoding, and changes that silently drop work (draws, views, copies) or alias stale data. Performance claims should come with numbers from matched runs.
+        - Nothing from the application is ever committed. That means no executables, DLLs, shaders, textures, audio, keys, dumps, decrypted files or screenshots of application content. It also covers hex or base64 blobs inside text files. `cargo xtask policy` enforces this with a file-name allowlist. Flag any change that adds such data or widens the allowlist or its `EXCEPTIONS`.
+        - Nothing from Apple's Game Porting Toolkit (D3DMetal and the like) may be committed.
+        - Every `unsafe` block needs a `// SAFETY:` comment that says why it is sound.
+        - Behaviour changes need a test. GPU and shader behaviour is best tested under Wine with D3DMetal; Windows-only tests skip themselves without a device.
+        - A deliberate simplification is marked with a `shortcut:` comment. Removing one should implement what it describes, not just delete the comment.
+        - Lock-free tables that reuse slots must not let an old record resolve to a new entry: check generation widths and wraparound.
+        - A feature that depends on host support (for example D3D12 options) needs a fallback when the host reports it unsupported.
+        - Commit subjects are short and say what changed, such as `fix(gpu): keep the clamp's budget per list`.
+chat:
+  auto_reply: true

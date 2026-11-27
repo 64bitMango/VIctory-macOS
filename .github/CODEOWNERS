@@ -1,4 +1,4 @@
-# The maintainer is asked to review every change. Greptile's approval with
+# The maintainer is asked to review every change. CodeRabbit's approval with
 # passing CI merges most of them (.github/workflows/automerge.yml); changes
 # to CI, the policy check, build config, dependencies and tools/ always wait
 # for the maintainer.
