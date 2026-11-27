@@ -992,8 +992,7 @@ fn mesh_pipeline(
     fn build<D>(
         device: &ID3D12Device,
         root: &ID3D12RootSignature,
-        ms: D3D12_SHADER_BYTECODE,
-        ps: D3D12_SHADER_BYTECODE,
+        [ms, ps]: [D3D12_SHADER_BYTECODE; 2],
         g: &GraphicsState,
         name: &str,
         depth_type: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE,
@@ -1062,8 +1061,7 @@ fn mesh_pipeline(
         build(
             device,
             root,
-            ms,
-            ps,
+            [ms, ps],
             g,
             name,
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1,
@@ -1073,8 +1071,7 @@ fn mesh_pipeline(
         build(
             device,
             root,
-            ms,
-            ps,
+            [ms, ps],
             g,
             name,
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL,
@@ -1323,12 +1320,18 @@ uint ps() : SV_Target { return 1; }
             }
         };
         let root = crate::compute::root_signature(&host.device, &[]).unwrap();
-        let mut g = GraphicsState::default();
-        g.depth_bounds = true;
-        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        g.targets.NumRenderTargets = 1;
-        g.targets.RTFormats[0] = DXGI_FORMAT_R32_UINT;
-        g.depth_format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        let mut rtvs = [DXGI_FORMAT_UNKNOWN; 8];
+        rtvs[0] = DXGI_FORMAT_R32_UINT;
+        let g = GraphicsState {
+            depth_bounds: true,
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            targets: D3D12_RT_FORMAT_ARRAY {
+                RTFormats: rtvs,
+                NumRenderTargets: 1,
+            },
+            depth_format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+            ..GraphicsState::default()
+        };
 
         if host.depth_bounds {
             let empty_gs = D3D12_SHADER_BYTECODE::default();
